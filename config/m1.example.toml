@@ -1,0 +1,14 @@
+# M1 accepts only a local synthetic fixture database.
+# Replace these absolute paths with paths on the machine running backupctl.
+timeout_seconds = 300
+
+[source]
+host = "127.0.0.1"
+port = 55432
+user = "postgres"
+database = "backupctl_fixture_m1"
+client_bin_dir = "/usr/lib/postgresql/16/bin"
+# password_file = "/absolute/path/to/0600/pgpass"
+
+[storage]
+root = "/tmp/backupctl-m1-data"

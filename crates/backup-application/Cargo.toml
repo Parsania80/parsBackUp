@@ -1,0 +1,10 @@
+[package]
+name = "backup-application"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+backup-domain = { path = "../backup-domain" }
+sha2.workspace = true
+uuid.workspace = true

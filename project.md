@@ -260,6 +260,8 @@ The following milestones are implementation handoffs. Paths are planned. Each mi
 - **Acceptance/DoD:** restored synthetic fixture can be read by native tools; only fully written/checksummed archive is listed complete; version and tool path recorded. Plaintext output remains development-only.
 - **Pitfalls:** `pg_dump` warnings, filesystem atomicity, permissions. **Portfolio:** Rust systems code, process supervision.
 
+**M1 status (2026-09-26):** Implemented for synthetic local fixture databases in the five-crate Rust workspace. The CLI create/list/inspect path, checksum-validated staged publication, same-major client preflight, and independent restore smoke checks pass on PostgreSQL 16–18. PostgreSQL 16 failure checks cover missing synthetic confirmation, simulated write error, empty output, timeout, client-version mismatch, and config-error redaction. Plaintext M1 artifacts remain development-only; encrypted/signed v1 and restore orchestration remain M4 and M2 work respectively. See [M1 guide](docs/development/m1-local-backup.md).
+
 ### M2 — Safe full restore and verification
 
 - **Objective/why:** prove backups are usable. **Prerequisites:** M1.

@@ -1,0 +1,9 @@
+[package]
+name = "backup-postgres"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+backup-application = { path = "../backup-application" }
+backup-domain = { path = "../backup-domain" }

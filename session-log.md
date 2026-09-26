@@ -17,3 +17,15 @@
 - Stopped and removed the temporary container. Checked 15 project/M0 files for broken local Markdown links and trailing whitespace; `git diff --check` passed.
 
 **Next implementation gate:** M1 creates the Rust workspace and local synthetic-data backup path. The first real-data artifact cannot be published until M4 implements encrypted and signed artifact v1. M1/M2 must run the fixture/privilege matrix on PostgreSQL 16, 17, and 18 with matching client binaries.
+
+## 2026-09-26 — M1 synthetic local backup
+
+**Request:** Begin M1 Rust workspace and synthetic-data local backup.
+
+**Implemented:** Added a five-crate Rust workspace (`backup-domain`, `backup-application`, `backup-postgres`, `backup-local`, `backupctl`), an explicit synthetic-use configuration guard, version-matched native `pg_dump -Fc --no-subscriptions`, bounded subprocess output and timeout, local staged publication with fsync/checksum/completion marker, and CLI `config check`, `backup create`, `backup list`, and `backup inspect`. Added a reproducible Docker smoke script, example TOML, README, and M1 operator guide. The artifact format is explicitly `m1-development-plaintext`, separate from future encrypted/signed v1.
+
+**Verification:** `cargo fmt --all`, `cargo test --workspace`, and `cargo clippy --workspace --all-targets -- -D warnings` passed. The Docker script passed on PostgreSQL 16, 17, and 18 with matching native clients: create/list/inspect followed by an independent `pg_restore --exit-on-error` into a fresh database and fixture assertions. On PostgreSQL 16 it also verified rejection of missing synthetic confirmation, simulated write error, empty output, timeout, mismatched client major, and a malformed config containing a runtime-generated sentinel without echoing that value. Failed backup attempts did not publish another artifact or leave an ordinary staged directory.
+
+**Final QA:** Re-ran the PostgreSQL 16–18 Docker matrix after disabling implicit default `.pgpass` use. Checked 18 source/document files for broken local links and trailing whitespace, confirmed `git diff --check`, and confirmed temporary M1 containers were removed.
+
+**Scope remaining:** M1 has no restore command, encryption, signing, SQLite catalog, scheduler, remote storage, or production-data support. An actual full-filesystem disk-exhaustion event was not induced; the write-failure path was simulated. The public repository license is not yet selected, so Cargo does not declare one.

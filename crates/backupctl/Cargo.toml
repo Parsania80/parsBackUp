@@ -1,0 +1,15 @@
+[package]
+name = "backupctl"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+backup-application = { path = "../backup-application" }
+backup-domain = { path = "../backup-domain" }
+backup-local = { path = "../backup-local" }
+backup-postgres = { path = "../backup-postgres" }
+clap.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+uuid.workspace = true
