@@ -81,7 +81,7 @@ crates/
 deploy/ docs/ tests/
 ```
 
-The dependency direction is interface → application → domain; infrastructure implements application ports. A `DatabaseEngine` port owns capability discovery, backup planning/execution, and restore planning/execution. Keep engine-specific PostgreSQL selection and restore controls in typed PostgreSQL requests, not a lowest-common-denominator global interface. `ArtifactStore`, `Catalog`, `KeyProvider`, `Clock`, and `JobRunner` are separate ports where multiple implementations or deterministic tests justify them. The UI consumes the API; neither CLI nor API duplicates use-case rules. Avoid distributed queues or microservices until measured scaling requires them.
+The dependency direction is interface → application → domain; infrastructure implements application ports. A `DatabaseEngine` port owns capability discovery, backup planning/execution, and restore planning/execution. Keep engine-specific PostgreSQL selection and restore controls in typed PostgreSQL requests, not a lowest-common-denominator global interface. `ArtifactStore`, `Catalog`, `RecipientProvider`, `IdentityProvider`, `Signer`, `Verifier`, `Clock`, and `JobRunner` are separate ports where multiple implementations or deterministic tests justify them. The UI consumes the API; neither CLI nor API duplicates use-case rules. Avoid distributed queues or microservices until measured scaling requires them.
 
 | Execution option | Pros | Cons | Decision |
 | --- | --- | --- | --- |
@@ -99,21 +99,21 @@ Ports should stream bounded chunks; no use case loads a whole archive into memor
 
 ## 7. Backup artifact design
 
-**Published artifact v1:** `artifacts/<opaque-id>/public.json`, `manifest.age`, `payload.age`, and a completion marker. `payload.age` decrypts to a native PostgreSQL custom archive. `public.json` contains only format version, opaque ID, recipient hint, encrypted file sizes, and ciphertext checksums; it is untrusted until verified. The encrypted manifest contains ID, PostgreSQL/client/application versions, redacted source fingerprint, profile snapshot/hash, requested/resolved scope, TOC digest/summary, compression, timestamps, byte counts, duration, verification level, ciphertext digest, compatibility warnings, and status. It never copies passwords, connection strings, raw SQL, or key material into fields. The PostgreSQL archive itself may contain secrets.
+**Published artifact v1:** `artifacts/<opaque-id>/public.json`, `manifest.age`, `payload.age`, `signature.ed25519`, and a completion marker. `payload.age` decrypts to a native PostgreSQL custom archive. `public.json` contains only format version, opaque ID, recipient/signer IDs, encrypted file sizes, and ciphertext checksums; it is untrusted until verified. The encrypted manifest contains ID, PostgreSQL/client/application versions, redacted source fingerprint, profile snapshot/hash, requested/resolved scope, TOC digest/summary, compression, timestamps, byte counts, duration, verification level, ciphertext digest, compatibility warnings, and status. It never copies passwords, connection strings, raw SQL, or key material into fields. The PostgreSQL archive itself may contain secrets.
 
-The decrypted manifest binds its ID and the SHA-256 digest of `payload.age`. On read: authenticate/decrypt manifest; compare ID with path/public header; check payload digest; authenticate the entire payload before restore. A public header is a discovery aid, not security truth. Stage privately on the same filesystem, fsync files and directory, atomically publish, then write the completion marker; a missing marker or mismatch is incomplete. SQLite indexes validated manifests and job state; recovery with the decryption identity rebuilds it. M1 plaintext output is synthetic-data development output only, never a public artifact. Freeze published v1 at M4 after interoperability and corruption tests. Readers accept known versions, reject unknown critical fields, and never rewrite immutable artifacts in place. Future remote storage commits payload, encrypted manifest, public header, then marker. Offline rollback/deletion still needs independent inventory, immutability, or signatures.
+The decrypted manifest binds its ID and the SHA-256 digest of `payload.age`. On read: verify a detached Ed25519 signature against an independently trusted public key over ID and both ciphertext digests; authenticate/decrypt manifest; compare ID with path/public header; check payload digest; authenticate the entire payload before restore. A public header is a discovery aid, not security truth. Stage privately on the same filesystem, fsync files and directory, atomically publish, then write the completion marker; a missing marker or mismatch is incomplete. SQLite indexes validated manifests and job state; recovery with the decryption identity rebuilds it. M1 plaintext output is synthetic-data development output only, never a public artifact. Freeze published v1 at M4 after interoperability and corruption tests. Readers accept known versions, reject unknown critical fields, and never rewrite immutable artifacts in place. Future remote storage commits payload, encrypted manifest, public header, then marker. Offline rollback/deletion still needs independent inventory or immutability; a signature does not reject an older valid artifact.
 
 ## 8. Security model
 
 **Decision:** compress before encryption because ciphertext does not compress meaningfully. Use `pg_dump -Fc` with zstd if the source-major client supports it, otherwise gzip; record the exact method and do not double-compress. Use the maintained Rust [`age` crate](https://docs.rs/age/latest/age/) and its standard streaming format with an X25519 recipient. Age provides per-file data keys, recipient wrapping, authenticated streaming, and truncation detection. Finish the stream writer and authenticate a complete read before passing plaintext to `pg_restore`; do not design custom AEAD framing. [Age streaming API](https://docs.rs/age/latest/age/struct.Encryptor.html).
 
-The initial provider reads a service-owned age identity file, mode 0600, outside the artifact store; configure the public recipient separately and maintain an offline recovery copy. A recipient/identity provider boundary permits later OS keyring, Vault, and cloud KMS integration. In v1, rotation decrypts and re-encrypts to a new recipient as a new validated artifact generation; do not promise cheap header-only rewrap. Password mode is deferred: standard age passphrase recipients use scrypt, whereas the earlier proposed Argon2id KEK would require another envelope format. If added, use age's standard passphrase mode with a human-provided secret, never an argv value. SHA-256 detects accidental corruption; age authenticates encrypted content; independent signatures need a separate signing key and trust policy. Encryption cannot prevent deletion or exfiltration from a compromised live host. Plaintext restore staging uses a private capacity-checked directory and best-effort removal, with SSD deletion limits documented.
+The initial provider reads a service-owned age identity file, mode 0600, outside the artifact store; configure the public recipient separately and maintain an offline recovery copy. A recipient/identity provider boundary permits later OS keyring, Vault, and cloud KMS integration. In v1, rotation decrypts and re-encrypts to a new recipient as a new validated artifact generation; do not promise cheap header-only rewrap. Password mode is deferred: standard age passphrase recipients use scrypt, whereas the earlier proposed Argon2id KEK would require another envelope format. If added, use age's standard passphrase mode with a human-provided secret, never an argv value. SHA-256 detects accidental corruption; age authenticates encrypted content but its public recipient does not authenticate the sender. Published v1 therefore requires a detached Ed25519 signature from a distinct signing key outside the artifact store, with its verifying key trusted independently. See [ADR 0001](docs/architecture/adr-0001-foundations.md). Encryption and signatures cannot prevent deletion, rollback of an older valid artifact, or exfiltration from a compromised live host. Plaintext restore staging uses a private capacity-checked directory and best-effort removal, with SSD deletion limits documented.
 
 PostgreSQL credentials: prefer peer auth for local operation or a dedicated `PGPASSFILE` with mode 0600; require TLS verification for remote connections. The [PostgreSQL password-file documentation](https://www.postgresql.org/docs/current/libpq-pgpass.html) describes permission rules. No credentials in profiles, manifests, argv, logs, error messages, or environment inherited by unrelated children. Document minimum privileges by operation and test them: dump needs CONNECT/USAGE/SELECT or equivalent on selected objects; full cluster globals and some restore operations can require elevated privileges. Decline a requested feature when its privilege requirement cannot be met safely. `pg_dump` warns that restoring dumps can execute code selected by a source superuser; treat untrusted artifacts as executable input and require trusted origin/review before restore. [Source](https://www.postgresql.org/docs/18/app-pgdump.html).
 
 ## 9. Threat model
 
-Create `docs/security/threat-model.md` in milestone 0, then update it at encryption, API, and release gates. Each entry records attacker, asset, attack, impact, mitigation, and residual risk.
+Maintain [the M0 threat model](docs/security/threat-model.md) at encryption, API, and release gates. Each entry records attacker, asset, attack, impact, mitigation, and residual risk.
 
 | Attacker / asset | Attack and impact | Mitigation |
 | --- | --- | --- |
@@ -122,7 +122,7 @@ Create `docs/security/threat-model.md` in milestone 0, then update it at encrypt
 | Stolen database credential / source | Unauthorized reads or modifications | Least-privilege dump role, TLS, credential rotation, connection audit. |
 | Malicious local user / artifact store | Path traversal, symlink swap, overwrite | Private dirs, relative opaque IDs, `openat`-style no-follow handling, ownership checks, atomic publication. |
 | Malicious API client / jobs | Restore/deletion abuse, replay, resource exhaustion | AuthN/AuthZ by operation, idempotency keys, quotas/rate limits, audit, explicit restore approval token. |
-| Tampering storage provider / backups | Replace/delete/replay old artifacts | AEAD and bound manifest, immutable IDs, catalog reconciliation, protected copies; independent signatures later. |
+| Tampering storage provider / backups | Replace/delete/replay old artifacts | Required Ed25519 origin signature detects replacement; independent inventory/immutable copies and audit address deletion or replay. |
 | Crafted identifier or filename / process | Command injection or arbitrary file access | Typed inputs, argv arrays, no shell, canonical source-object resolution, fixed tool paths. |
 | Compromised backup SQL / target | Execute malicious SQL on restore | Trust boundary and review, isolated target, restricted restore role, preflight; never auto-restore unknown artifacts. |
 | Operator mistake / production | Destructive overwrite or incompatible restore | Target fingerprint, dry-run plan, explicit digest confirmation, default new database, version/extension checks. |
@@ -214,7 +214,7 @@ Structured JSON logs for service and readable CLI output, with timestamps, job/b
 
 ## 20. Testing strategy
 
-Unit tests cover profile validation, state transitions, retention invariants, manifest parsing, and plan digests. Integration tests run real PostgreSQL containers across supported majors and fixtures containing every content-inventory category, including large objects, extensions, partitions, RLS, roles, and globals where privileges allow. Round-trip restores into clean and populated targets validate schema, row counts/checksums, sequences, ownership/ACLs, constraints, and expected warnings. CLI contract tests cover JSON/exit codes; API tests cover authorization/idempotency; storage/crypto tests cover truncation, bit flips, wrong keys, reordered chunks, and key rotation. Fault injection covers crash, disk full, subprocess kill, SQLite failure, and interrupted restore. Property tests target selection normalization, retention safety, and path/manifest parsing. Security tests exercise path traversal, symlink races, argv injection, and secret redaction. Mock ports for fast logic tests, but do not replace real PostgreSQL restore tests.
+Unit tests cover profile validation, state transitions, retention invariants, manifest parsing, and plan digests. Integration tests run real PostgreSQL containers across supported majors and fixtures containing every content-inventory category, including large objects, extensions, partitions, RLS, roles, and globals where privileges allow. Round-trip restores into clean and populated targets validate schema, row counts/checksums, sequences, ownership/ACLs, constraints, and expected warnings. CLI contract tests cover JSON/exit codes; API tests cover authorization/idempotency; storage/crypto tests cover truncation, bit flips, wrong keys, reordered chunks, invalid signatures, manifest/payload swaps, and key rotation. Fault injection covers crash, disk full, subprocess kill, SQLite failure, and interrupted restore. Property tests target selection normalization, retention safety, and path/manifest parsing. Security tests exercise path traversal, symlink races, argv injection, and secret redaction. Mock ports for fast logic tests, but do not replace real PostgreSQL restore tests.
 
 Verification levels: `checksum` means bytes match stored digest; `archive` means `pg_restore --list` parses after decryption; `restore-tested` means isolated full restore and validation. No level alone guarantees future restore on a different version/host. Schedule recurring restore drills and record their result.
 
@@ -247,15 +247,15 @@ The following milestones are implementation handoffs. Paths are planned. Each mi
 - **Objective/why:** turn PostgreSQL content and threat assumptions into testable contracts before writing the engine.
 - **Prerequisites:** none. **Architecture/files:** `ARCHITECTURE.md`, `docs/postgres/content-matrix.md`, `docs/security/threat-model.md`, `docs/backup-format/manifest-v1.md`, ADRs.
 - **APIs/DB/CLI:** versioned manifest and capability sketches; no DB migration or CLI command.
-- **Tests/security/docs:** fixture plan per object category and version, restore-trust boundary, privilege matrix, source citations.
-- **Acceptance/DoD:** supported version matrix, test fixtures, artifact spec, and open decisions reviewed; no unsupported restore claim.
+- **Tests/security/docs:** synthetic fixtures and versioned test matrix, restore-trust boundary, privilege matrix, source citations; runtime validation follows in M1/M2.
+- **Acceptance/DoD:** supported version matrix, fixture SQL and assertions, artifact spec, threat model, and decisions recorded; no unsupported runtime restore claim.
 - **Pitfalls:** assuming all PostgreSQL versions or extension ecosystems behave alike. **Portfolio:** database internals, architecture, threat modeling.
 
 ### M1 — Local full backup and inspect
 
 - **Objective/why:** establish a complete, durable local logical artifact. **Prerequisites:** M0.
 - **Architecture/files:** domain/application/PostgreSQL/local crates, `backupctl`, integration fixtures.
-- **APIs/DB/CLI:** `DatabaseEngine::backup`, `ArtifactStore::stage/commit`, manifest v1; SQLite not required yet; `backup create/list/inspect`, `config check`.
+- **APIs/DB/CLI:** `DatabaseEngine::backup`, `ArtifactStore::stage/commit`, development-only artifact record (not published v1); SQLite not required yet; `backup create/list/inspect`, `config check`.
 - **Tests/security/docs:** real `pg_dump -Fc`, zero-byte/disk-full/kill failures, redacted process invocation, local backup guide.
 - **Acceptance/DoD:** restored synthetic fixture can be read by native tools; only fully written/checksummed archive is listed complete; version and tool path recorded. Plaintext output remains development-only.
 - **Pitfalls:** `pg_dump` warnings, filesystem atomicity, permissions. **Portfolio:** Rust systems code, process supervision.
@@ -281,10 +281,10 @@ The following milestones are implementation handoffs. Paths are planned. Each mi
 ### M4 — Encryption, keys, and artifact integrity
 
 - **Objective/why:** protect stolen backups and detect alteration. **Prerequisites:** M2; M3 profiles may proceed separately.
-- **Architecture/files:** crypto crate using age, identity/recipient provider, published artifact v1 reader/writer, security/key recovery docs.
+- **Architecture/files:** crypto crate using age and Ed25519, identity/recipient/signing providers, published artifact v1 reader/writer, security/key recovery docs.
 - **APIs/DB/CLI:** streaming encrypt/decrypt and identity ports; no DB migration; `key status`, `backup verify` levels. Rotation creates a new validated encrypted generation.
-- **Tests/security/docs:** AEAD vectors, truncation/reorder/bit-flip/wrong-key cases, no secret leakage, key-loss/rotation drill.
-- **Acceptance/DoD:** plaintext never enters published store; wrong key, tampering, truncation, and manifest/payload swaps fail before restore; recovery key procedure tested; artifact v1 frozen.
+- **Tests/security/docs:** age interoperability, Ed25519 signature vectors, truncation/reorder/bit-flip/wrong-key and artifact-swap cases, no secret leakage, key-loss/rotation drill.
+- **Acceptance/DoD:** plaintext never enters published store; wrong key, tampering, bad signature, truncation, and manifest/payload swaps fail before restore; decryption and signing key recovery procedures tested; artifact v1 frozen.
 - **Pitfalls:** identity loss, finishing age streams, manifest/payload binding, temporary plaintext. **Portfolio:** applied cryptography.
 
 ### M5 — Catalog, jobs, concurrency, retention
@@ -334,7 +334,7 @@ The following milestones are implementation handoffs. Paths are planned. Each mi
 
 ## 27. Cross-cutting acceptance criteria
 
-A production release requires: one complete artifact reconstructs a representative database on a supported target; verification reports its exact level; encrypted backup is unreadable without a separately stored key; backup interruption cannot produce a complete record; catalog can be rebuilt from artifacts; destructive restore and prune require explicit authorized plans; service connection credentials never appear in logs or service metadata, and native artifacts that may contain database-held credentials are encrypted; package install/upgrade preserve data and keys; and a documented restore drill has been performed on every supported PostgreSQL major. A feature is done only when its docs, threat review, and failure tests match its actual behavior.
+A production release requires: one complete artifact reconstructs a representative database on a supported target; verification reports its exact level; encrypted backup is unreadable without a separately stored identity and its origin signature verifies against an independently trusted key; backup interruption cannot produce a complete record; catalog can be rebuilt from artifacts; destructive restore and prune require explicit authorized plans; service connection credentials never appear in logs or service metadata, and native artifacts that may contain database-held credentials are encrypted; package install/upgrade preserve data and keys; and a documented restore drill has been performed on every supported PostgreSQL major. A feature is done only when its docs, threat review, and failure tests match its actual behavior.
 
 ## 28. Architectural decisions
 
@@ -343,7 +343,7 @@ A production release requires: one complete artifact reconstructs a representati
 3. Initial source support: PostgreSQL 16–18. Require a configured source-major client binary; same-major restore only until cross-major pairs pass fixture tests. Initial packages: Debian 13 and Ubuntu 24.04 LTS on amd64. Versioned clients come from the distribution or official PostgreSQL Apt repository. [PostgreSQL version policy](https://www.postgresql.org/support/versioning/), [Debian repository](https://www.postgresql.org/download/linux/debian/), [Ubuntu repository](https://www.postgresql.org/download/linux/ubuntu/).
 4. Local filesystem and SQLite first; the catalog is rebuildable from encrypted manifests with a recovery identity.
 5. TOML profiles, JSON API and public artifact fields, encrypted private metadata.
-6. Published encryption uses the standard Rust `age` crate and X25519 recipient, with identity outside the artifact store. No custom AEAD framing. [Age crate](https://docs.rs/age/latest/age/).
+6. Published encryption uses the standard Rust `age` crate and X25519 recipient, plus a detached Ed25519 origin signature; private keys are outside the artifact store. No custom AEAD framing. [Age crate](https://docs.rs/age/latest/age/).
 7. Fresh-target restore by default; destructive work requires a bound plan confirmation. Subscriptions are excluded and global objects are documented manual prerequisites initially.
 8. systemd timer for Debian scheduling; no internal scheduler in MVP.
 9. No physical/PITR or host-loss recovery claim from local logical backup.
@@ -356,13 +356,13 @@ The original eight questions have design resolutions. The remaining checks are e
 | Former question | Resolution | Gate before support claim |
 | --- | --- | --- |
 | Versions/packages | PostgreSQL 16–18, same-major restore, Debian 13 and Ubuntu 24.04 amd64, matching client | Package CI and real fixture restores for every supported combination. |
-| Encryption | Standard streaming `age` format with X25519 recipient | Tamper, truncation, swap, interoperability, and recovery-key drills. |
+| Encryption | Standard streaming `age` format with X25519 recipient | Tamper, truncation, swap, signature, interoperability, and recovery-key drills. |
 | Archive format | `-Fc` first; `-Fd` only if measured backup window requires parallelism | Benchmark 1 GB and 10+ GB datasets. |
 | Privileged objects | Preflight extensions/FDWs; exclude subscriptions by default | Non-superuser fixtures; reject unsupported plans. |
 | Globals | Manual prerequisite initially; later separate opt-in `pg_dumpall --globals-only --no-role-passwords` | Privilege and secret-content review. |
 | RPO/RTO | No universal guarantee; example daily backup, 26-hour stale alert, weekly restore drill | Measure last-restorable-snapshot age and restore duration; require off-host copy before host-loss claim. |
 | Partitions/large objects | Selected parent includes children; filtered large objects excluded or all included explicitly | Versioned selection and restore fixtures. |
-| Artifact v1 | Opaque ID, `public.json`, `manifest.age`, `payload.age`, validated binding | Versioned reader, corruption/replay tests, remote-store review before freeze. |
+| Artifact v1 | Opaque ID, `public.json`, `manifest.age`, `payload.age`, `signature.ed25519`, validated binding | Versioned reader, corruption/replay tests, remote-store review before freeze. |
 
 **Security correction:** PostgreSQL user mappings may contain passwords, and subscription connection strings may contain passwords. The native archive is sensitive even when the service manifest contains no secrets. Encrypt before publishing an artifact with real data; `--no-subscriptions` does not remove all possible embedded credentials. [User mappings](https://www.postgresql.org/docs/18/sql-createusermapping.html), [subscription catalog](https://www.postgresql.org/docs/18/catalog-pg-subscription.html), [`pg_dump`](https://www.postgresql.org/docs/18/app-pgdump.html).
 
