@@ -1,0 +1,71 @@
+# M3 adds named profiles to the M2 configuration. Profiles are optional:
+# without --profile, `backup create` behaves exactly as it did in M2.
+# Replace these absolute paths with paths on the machine running backupctl.
+timeout_seconds = 300
+
+# Cluster role, attribute, and membership metadata is still exported with each
+# backup. A selective archive carries it too, but a partial-section restore
+# never applies it; see docs/development/m3-profiles-selective.md.
+export_globals = true
+
+[source]
+host = "127.0.0.1"
+port = 55432
+user = "postgres"
+database = "backupctl_fixture_m1"
+client_bin_dir = "/usr/lib/postgresql/16/bin"
+# password_file = "/absolute/path/to/0600/pgpass"
+
+[storage]
+root = "/tmp/backupctl-m3-data"
+
+# Whole database, including its large objects. This is the only shape that can
+# archive a database holding large objects: pg_dump's --large-objects writes
+# every one of them, never a per-selection subset.
+[[profile]]
+name = "daily-full"
+database = "backupctl_fixture_m1"
+large_objects = true
+
+# Two application schemas and everything in them. A --schema selection carries
+# the standalone sequences, functions, and types inside those schemas, so this
+# shape stays self-contained while both sides of aux.orders -> app.accounts
+# remain in scope.
+[[profile]]
+name = "app-schemas"
+database = "backupctl_fixture_m1"
+schemas = ["app", "aux"]
+
+# Structure only: DDL with no rows. Setting large_objects = true here would be
+# refused, since a schema-only dump carries no object bytes.
+[[profile]]
+name = "app-schema-only"
+database = "backupctl_fixture_m1"
+mode = "schema-only"
+schemas = ["app"]
+
+# Exact table names. A --table selection never carries the column types,
+# sequence defaults, parent relations, or trigger functions those tables
+# reference, so the resolver refuses this profile unless every referenced
+# object is named too. A partitioned parent expands to its whole family before
+# pg_dump runs, which is what makes the resulting archive restorable alone.
+[[profile]]
+name = "events-only"
+database = "backupctl_fixture_m1"
+tables = ["app.partitioned_events"]
+
+# Excluded names are exact as well. Excluding a table the remaining selection
+# still depends on fails closed, exactly like an out-of-scope dependency.
+[[profile]]
+name = "app-without-tenants"
+database = "backupctl_fixture_m1"
+schemas = ["app", "aux"]
+exclude_tables = ["app.tenant_rows"]
+
+# Extension member objects can be dropped from the archive only with a
+# PostgreSQL 17 or newer client; the same profile is refused on major 16.
+[[profile]]
+name = "app-no-hstore"
+database = "backupctl_fixture_m1"
+schemas = ["app", "aux"]
+exclude_extensions = ["hstore"]

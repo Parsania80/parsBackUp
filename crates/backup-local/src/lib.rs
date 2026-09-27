@@ -410,6 +410,8 @@ mod tests {
             globals_size_bytes: None,
             verification_level: None,
             verified_unix_ms: None,
+            scope: None,
+            toc_sha256: None,
         }
     }
 
@@ -542,6 +544,8 @@ mod tests {
             client_version: "pg_restore (PostgreSQL) 16.4".to_string(),
             target_database: "backupctl_fixture_dr".to_string(),
             security: RestoreSecurityPolicy::dr_full(),
+            sections: backup_domain::RestoreSections::full(),
+            artifact_scope: None,
             created_unix_ms: now,
             expires_unix_ms: now + 900_000,
         };

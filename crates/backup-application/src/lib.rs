@@ -1,8 +1,10 @@
 use anyhow::{Context, Result, bail};
 use backup_domain::{
-    Config, DEV_FORMAT, DevelopmentManifest, RestorePlan, RestoreSecurityPolicy, Source,
-    VERIFY_ARCHIVE, VERIFY_CHECKSUM, VERIFY_RESTORE_TESTED,
+    ArtifactScope, Config, DEV_FORMAT, DevelopmentManifest, DumpOptions, Profile,
+    ResolvedSelection, RestorePlan, RestoreSections, RestoreSecurityPolicy, Source, VERIFY_ARCHIVE,
+    VERIFY_CHECKSUM, VERIFY_RESTORE_TESTED,
 };
+use sha2::Digest as _;
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
@@ -18,9 +20,30 @@ pub struct EngineInfo {
 
 pub trait DatabaseAdapter {
     fn preflight(&self, source: &Source, timeout: Duration) -> Result<EngineInfo>;
-    fn dump_to(&self, source: &Source, output: &Path, timeout: Duration) -> Result<()>;
+    /// Read the live catalog and turn a profile's requested names into the
+    /// exact object set a dump would write, including anything it references
+    /// from outside that set.
+    fn resolve_selection(
+        &self,
+        source: &Source,
+        profile: &Profile,
+        timeout: Duration,
+    ) -> Result<ResolvedSelection>;
+    fn dump_to(
+        &self,
+        source: &Source,
+        output: &Path,
+        options: &DumpOptions,
+        timeout: Duration,
+    ) -> Result<()>;
     fn dump_globals(&self, source: &Source, output: &Path, timeout: Duration) -> Result<()>;
-    fn inspect_archive(&self, source: &Source, archive: &Path, timeout: Duration) -> Result<()>;
+    /// Returns the archive table of contents, one entry per line.
+    fn inspect_archive(
+        &self,
+        source: &Source,
+        archive: &Path,
+        timeout: Duration,
+    ) -> Result<Vec<String>>;
     fn database_exists(&self, source: &Source, database: &str, timeout: Duration) -> Result<bool>;
     fn role_conflicts(
         &self,
@@ -30,12 +53,23 @@ pub trait DatabaseAdapter {
     ) -> Result<Vec<String>>;
     fn apply_globals(&self, source: &Source, globals: &Path, timeout: Duration) -> Result<()>;
     fn create_database(&self, source: &Source, database: &str, timeout: Duration) -> Result<()>;
+    /// Create namespaces the archive assumes to exist (table-selected dumps
+    /// carry no CREATE SCHEMA entries). Implementations must validate every
+    /// name before issuing DDL.
+    fn create_schemas(
+        &self,
+        source: &Source,
+        database: &str,
+        schemas: &[String],
+        timeout: Duration,
+    ) -> Result<()>;
     fn restore_to_database(
         &self,
         source: &Source,
         database: &str,
         archive: &Path,
         security: RestoreSecurityPolicy,
+        sections: RestoreSections,
         timeout: Duration,
     ) -> Result<()>;
 }
@@ -83,6 +117,20 @@ pub fn now_unix_ms() -> Result<u128> {
         .as_millis())
 }
 
+/// SHA-256 over the archive table of contents. The payload digest binds the
+/// bytes; this binds the content set, so `verify --level archive` can prove the
+/// archive still lists what the manifest recorded rather than merely being
+/// unread-but-intact.
+pub fn toc_digest(lines: &[String]) -> Result<String> {
+    if lines.is_empty() {
+        bail!("archive table of contents is empty");
+    }
+    Ok(format!(
+        "{:x}",
+        sha2::Sha256::digest(lines.join("\n").as_bytes())
+    ))
+}
+
 pub struct BackupService<E, S> {
     engine: E,
     store: S,
@@ -93,10 +141,78 @@ impl<E: DatabaseAdapter, S: ArtifactStore> BackupService<E, S> {
         Self { engine, store }
     }
 
-    pub fn create(&self, config: &Config) -> Result<DevelopmentManifest> {
+    /// Resolve a profile against the live catalog and refuse a selection that
+    /// pg_dump could not restore on its own. `create` uses this before writing
+    /// anything, so a dry run reports exactly what a backup would contain.
+    pub fn resolve(
+        &self,
+        config: &Config,
+        profile_name: Option<&str>,
+    ) -> Result<(EngineInfo, ResolvedSelection)> {
         config.validate()?;
         let timeout = Duration::from_secs(config.timeout_seconds);
         let info = self.engine.preflight(&config.source, timeout)?;
+        let profile = match profile_name {
+            Some(name) => Some(config.profile(name)?),
+            None => None,
+        };
+        let resolved = match profile {
+            Some(profile) => self
+                .engine
+                .resolve_selection(&config.source, profile, timeout)?,
+            None => ResolvedSelection {
+                whole_database: true,
+                ..Default::default()
+            },
+        };
+        if !resolved.dangling.is_empty() {
+            let named = resolved
+                .dangling
+                .iter()
+                .map(|reference| {
+                    format!(
+                        "{} depends on {} ({})",
+                        reference.dependent, reference.referenced, reference.kind
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("; ");
+            let who = match profile {
+                Some(profile) => format!("profile {}", profile.name),
+                None => "this selection".to_string(),
+            };
+            bail!(
+                "{who} is not self-contained: {named}. pg_dump does not write objects from outside \
+                 the selection, so this archive could not restore into an empty database on its \
+                 own; widen the selection or restore into a database that already holds those objects"
+            );
+        }
+        Ok((info, resolved))
+    }
+
+    pub fn create(
+        &self,
+        config: &Config,
+        profile_name: Option<&str>,
+    ) -> Result<DevelopmentManifest> {
+        let timeout = Duration::from_secs(config.timeout_seconds);
+        let (info, resolved) = self.resolve(config, profile_name)?;
+        let profile = match profile_name {
+            Some(name) => Some(config.profile(name)?),
+            None => None,
+        };
+        let none_extensions: Vec<String> = Vec::new();
+        let exclude_extensions = match profile {
+            Some(profile) => &profile.exclude_extensions,
+            None => &none_extensions,
+        };
+        let options = DumpOptions {
+            major: info.source_major,
+            mode: profile.map(|profile| profile.mode).unwrap_or_default(),
+            selection: &resolved,
+            large_objects: profile.map(|profile| profile.large_objects),
+            exclude_extensions,
+        };
         let id = Uuid::new_v4();
         let stage = self.store.begin(
             id,
@@ -105,11 +221,13 @@ impl<E: DatabaseAdapter, S: ArtifactStore> BackupService<E, S> {
             },
         )?;
         self.engine
-            .dump_to(&config.source, stage.payload_path(), timeout)
+            .dump_to(&config.source, stage.payload_path(), &options, timeout)
             .context("PostgreSQL dump failed; staged artifact was not published")?;
-        self.engine
+        let toc = self
+            .engine
             .inspect_archive(&config.source, stage.payload_path(), timeout)
             .context("PostgreSQL archive inspection failed; artifact was not published")?;
+        let toc_sha256 = toc_digest(&toc)?;
         let (size_bytes, sha256) = self.store.measure(&stage)?;
         let mut globals_sha256 = None;
         let mut globals_size_bytes = None;
@@ -148,6 +266,8 @@ impl<E: DatabaseAdapter, S: ArtifactStore> BackupService<E, S> {
             globals_size_bytes,
             verification_level: None,
             verified_unix_ms: None,
+            scope: profile.map(|profile| ArtifactScope::from_profile(profile, &resolved)),
+            toc_sha256: Some(toc_sha256),
         };
         manifest.validate_shape()?;
         self.store.publish(stage, &manifest)?;
@@ -185,7 +305,7 @@ impl<E: DatabaseAdapter, S: ArtifactStore> VerifyService<E, S> {
 
     pub fn verify(&self, config: &Config, id: Uuid, level: &str) -> Result<VerifyReport> {
         if !matches!(level, VERIFY_CHECKSUM | VERIFY_ARCHIVE) {
-            bail!("verification level must be checksum or archive in M2");
+            bail!("verification level must be checksum or archive");
         }
         let timeout = Duration::from_secs(config.timeout_seconds);
         // Opening the artifact already recomputes payload and globals digests
@@ -193,9 +313,18 @@ impl<E: DatabaseAdapter, S: ArtifactStore> VerifyService<E, S> {
         let artifact = self.store.open(id)?;
         let manifest = artifact.manifest();
         if level == VERIFY_ARCHIVE {
-            self.engine
+            let toc = self
+                .engine
                 .inspect_archive(&config.source, artifact.payload_path(), timeout)
                 .context("archive table of contents failed to parse")?;
+            let digest = toc_digest(&toc)?;
+            if let Some(recorded) = &manifest.toc_sha256
+                && recorded != &digest
+            {
+                bail!(
+                    "archive table of contents does not match the manifest; the payload was replaced or re-dumped"
+                );
+            }
         }
         Ok(VerifyReport {
             artifact_id: id,
@@ -213,6 +342,13 @@ pub struct RestoreService<E, S> {
     store: S,
 }
 
+#[derive(Debug)]
+pub struct RestoreOutcome {
+    pub plan: RestorePlan,
+    /// The artifact's verification level after this run.
+    pub verification_level: String,
+}
+
 impl<E: DatabaseAdapter, S: ArtifactStore> RestoreService<E, S> {
     pub fn new(engine: E, store: S) -> Self {
         Self { engine, store }
@@ -224,8 +360,13 @@ impl<E: DatabaseAdapter, S: ArtifactStore> RestoreService<E, S> {
         artifact_id: Uuid,
         target: &str,
         security: RestoreSecurityPolicy,
+        sections: RestoreSections,
     ) -> Result<RestorePlan> {
         config.validate()?;
+        sections.validate()?;
+        // Fail on the contradiction between sections and security before any
+        // environment probe, so the refusal names the real reason.
+        sections.check_security(&security)?;
         let timeout = Duration::from_secs(config.timeout_seconds);
         let info = self.engine.preflight(&config.source, timeout)?;
         let artifact = self.store.open(artifact_id)?;
@@ -234,9 +375,7 @@ impl<E: DatabaseAdapter, S: ArtifactStore> RestoreService<E, S> {
             bail!("restore policy requires roles but the backup contains no globals security file");
         }
         if manifest.source_major != info.source_major {
-            bail!(
-                "client major does not match the backup source major; M2 supports same-major restore only"
-            );
+            bail!("client major does not match the backup source major; same-major restore only");
         }
         if target == manifest.database {
             bail!("restore target must differ from the backup source database");
@@ -245,7 +384,7 @@ impl<E: DatabaseAdapter, S: ArtifactStore> RestoreService<E, S> {
             .engine
             .database_exists(&config.source, target, timeout)?
         {
-            bail!("target database already exists; M2 restores only into a new database");
+            bail!("target database already exists; restore only creates a new database");
         }
         if security.roles {
             let conflicts = self.engine.role_conflicts(
@@ -272,6 +411,8 @@ impl<E: DatabaseAdapter, S: ArtifactStore> RestoreService<E, S> {
             client_version: info.dump_client_version,
             target_database: target.to_string(),
             security,
+            sections,
+            artifact_scope: manifest.scope.as_ref().map(|scope| scope.profile.clone()),
             created_unix_ms: created,
             expires_unix_ms: created + PLAN_TTL.as_millis(),
         };
@@ -280,7 +421,12 @@ impl<E: DatabaseAdapter, S: ArtifactStore> RestoreService<E, S> {
         Ok(plan)
     }
 
-    pub fn run(&self, config: &Config, plan_id: Uuid, confirm_target: &str) -> Result<RestorePlan> {
+    pub fn run(
+        &self,
+        config: &Config,
+        plan_id: Uuid,
+        confirm_target: &str,
+    ) -> Result<RestoreOutcome> {
         let timeout = Duration::from_secs(config.timeout_seconds);
         let plan = self
             .store
@@ -332,6 +478,17 @@ impl<E: DatabaseAdapter, S: ArtifactStore> RestoreService<E, S> {
         self.engine
             .create_database(&config.source, &plan.target_database, timeout)
             .context("target database creation failed")?;
+        // A table-selected archive restores its relations but never creates
+        // their namespaces; prepare them so the restore targets an otherwise
+        // empty database, matching the schema-selection behavior.
+        if let Some(scope) = artifact.manifest().scope.as_ref() {
+            let required = scope.restore_required_schemas();
+            if !required.is_empty() {
+                self.engine
+                    .create_schemas(&config.source, &plan.target_database, &required, timeout)
+                    .context("target schema preparation failed")?;
+            }
+        }
         // Steps 4-6: schema/data, then ownership and privileges from the
         // archive's own ALTER OWNER/GRANT entries (skipped per policy).
         let restored = self.engine.restore_to_database(
@@ -339,6 +496,7 @@ impl<E: DatabaseAdapter, S: ArtifactStore> RestoreService<E, S> {
             &plan.target_database,
             artifact.payload_path(),
             plan.security,
+            plan.sections,
             timeout,
         );
         if let Err(error) = restored {
@@ -346,6 +504,18 @@ impl<E: DatabaseAdapter, S: ArtifactStore> RestoreService<E, S> {
                 "database restore failed: {error:#}; target {} may be partially modified and was left in place for operator inspection",
                 plan.target_database
             );
+        }
+        if !plan.sections.is_full() {
+            // A section-limited restore proves nothing about the rest of the
+            // archive, so the artifact keeps its recorded verification level.
+            return Ok(RestoreOutcome {
+                plan,
+                verification_level: artifact
+                    .manifest()
+                    .verification_level
+                    .clone()
+                    .unwrap_or_else(|| "none".to_string()),
+            });
         }
         // Record restore-tested verification on the artifact (additive field
         // update; payload and digests are unchanged).
@@ -356,6 +526,9 @@ impl<E: DatabaseAdapter, S: ArtifactStore> RestoreService<E, S> {
         self.store
             .rewrite_manifest(&artifact, &updated)
             .context("restore succeeded but verification marking failed")?;
-        Ok(plan)
+        Ok(RestoreOutcome {
+            plan,
+            verification_level: VERIFY_RESTORE_TESTED.to_string(),
+        })
     }
 }
