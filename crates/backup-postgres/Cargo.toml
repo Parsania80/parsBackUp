@@ -7,3 +7,4 @@ edition.workspace = true
 anyhow.workspace = true
 backup-application = { path = "../backup-application" }
 backup-domain = { path = "../backup-domain" }
+uuid.workspace = true

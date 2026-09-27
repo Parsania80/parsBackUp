@@ -74,6 +74,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "serde",
+ "serde_json",
+ "sha2",
  "uuid",
 ]
 
@@ -96,6 +98,7 @@ dependencies = [
  "anyhow",
  "backup-application",
  "backup-domain",
+ "uuid",
 ]
 
 [[package]]

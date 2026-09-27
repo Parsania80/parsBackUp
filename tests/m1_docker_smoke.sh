@@ -42,7 +42,7 @@ for major in 16 17 18; do
         -d backupctl_fixture_m1 < tests/fixtures/postgres/core.sql >/dev/null
 
     mkdir -p "$test_root/bin"
-    for tool in pg_dump pg_restore psql; do
+    for tool in pg_dump pg_dumpall pg_restore psql createdb; do
         printf '#!/bin/sh\nexec /usr/bin/docker exec %s %s "$@"\n' \
             "$container_name" "$tool" > "$test_root/bin/$tool"
         chmod 700 "$test_root/bin/$tool"
@@ -88,7 +88,7 @@ PY
             exit 1
         fi
         mkdir -p "$test_root/badbin"
-        cp "$test_root/bin/psql" "$test_root/bin/pg_restore" "$test_root/badbin/"
+        cp "$test_root/bin/psql" "$test_root/bin/pg_restore" "$test_root/bin/pg_dumpall" "$test_root/bin/createdb" "$test_root/badbin/"
         cat > "$test_root/bad.toml" <<CONFIG
 timeout_seconds = 1
 

@@ -1,0 +1,19 @@
+# M2 accepts only a local synthetic fixture database.
+# Replace these absolute paths with paths on the machine running backupctl.
+timeout_seconds = 300
+
+# Export cluster role, attribute, and membership metadata with each backup.
+# globals.sql is plaintext until M4 encryption and contains no password
+# verifiers: the export uses pg_dumpall --roles-only --no-role-passwords.
+export_globals = true
+
+[source]
+host = "127.0.0.1"
+port = 55432
+user = "postgres"
+database = "backupctl_fixture_m1"
+client_bin_dir = "/usr/lib/postgresql/16/bin"
+# password_file = "/absolute/path/to/0600/pgpass"
+
+[storage]
+root = "/tmp/backupctl-m2-data"

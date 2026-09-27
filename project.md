@@ -271,6 +271,8 @@ The following milestones are implementation handoffs. Paths are planned. Each mi
 - **Acceptance/DoD:** new-target restore succeeds and validates; destructive target requires bound confirmation; failure reports partial state.
 - **Pitfalls:** `pg_restore` can execute untrusted SQL and partial failure may leave objects. **Portfolio:** recovery engineering.
 
+**M2 status (2026-09-27):** Implemented for synthetic fixtures. `backup verify --level checksum|archive`, `restore plan`/`restore run` with an explicit `RestoreSecurityPolicy` (`dr` restores roles, memberships, ownership, and privileges; `portable` restores contents only), and JSON plans under `<storage-root>/plans/` with a 15-minute expiry and a `--confirm-target` equality check. Role, attribute, and membership metadata comes from opt-in `pg_dumpall --roles-only --no-role-passwords`, so no password verifier can enter an artifact and restored roles need an operator-assigned password; database-level `GRANT ... ON DATABASE` and tablespaces remain cluster prerequisites. Partial restore failure leaves the target in place and is reported. The Docker matrix passes on PostgreSQL 16–18 for DR restore, portable restore, plan expiry/binding, and tamper detection. See [M2 guide](docs/development/m2-restore-verify.md).
+
 ### M3 — Profiles and selective logical operations
 
 - **Objective/why:** support explicit scope without false dependency promises. **Prerequisites:** M2.
@@ -361,7 +363,7 @@ The original eight questions have design resolutions. The remaining checks are e
 | Encryption | Standard streaming `age` format with X25519 recipient | Tamper, truncation, swap, signature, interoperability, and recovery-key drills. |
 | Archive format | `-Fc` first; `-Fd` only if measured backup window requires parallelism | Benchmark 1 GB and 10+ GB datasets. |
 | Privileged objects | Preflight extensions/FDWs; exclude subscriptions by default | Non-superuser fixtures; reject unsupported plans. |
-| Globals | Manual prerequisite initially; later separate opt-in `pg_dumpall --globals-only --no-role-passwords` | Privilege and secret-content review. |
+| Globals | Delivered in M2 as opt-in `pg_dumpall --roles-only --no-role-passwords`; verifiers and database-level ACLs stay manual prerequisites | Privilege and secret-content review. |
 | RPO/RTO | No universal guarantee; example daily backup, 26-hour stale alert, weekly restore drill | Measure last-restorable-snapshot age and restore duration; require off-host copy before host-loss claim. |
 | Partitions/large objects | Selected parent includes children; filtered large objects excluded or all included explicitly | Versioned selection and restore fixtures. |
 | Artifact v1 | Opaque ID, `public.json`, `manifest.age`, `payload.age`, `signature.ed25519`, validated binding | Versioned reader, corruption/replay tests, remote-store review before freeze. |

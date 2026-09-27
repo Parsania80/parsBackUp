@@ -5,7 +5,7 @@ This milestone implements only full logical `pg_dump -Fc` backup, local artifact
 ## Requirements
 
 - Rust toolchain supporting edition 2024.
-- PostgreSQL 16, 17, or 18 server and the matching versioned `pg_dump`, `pg_restore`, and `psql` binaries in one absolute directory. The CLI rejects a client/server major mismatch.
+- PostgreSQL 16, 17, or 18 server and the matching versioned `pg_dump`, `pg_dumpall`, `pg_restore`, `psql`, and `createdb` binaries in one absolute directory (the Debian `postgresql-client-NN` package provides all five). The CLI rejects a client/server major mismatch or a missing tool.
 - A disposable database whose name begins `backupctl_fixture_`, populated from [`core.sql`](../../tests/fixtures/postgres/core.sql). The service only accepts a local socket or loopback address.
 - Optional password file outside the repository with mode 0600. M1 never accepts a password in TOML or the command line.
 

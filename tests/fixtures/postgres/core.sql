@@ -66,3 +66,17 @@ INSERT INTO app.documents
 SELECT 1, lo_from_bytea(0, decode('666978747572652d6c6f', 'hex'));
 CREATE TEXT SEARCH CONFIGURATION app.simple_copy (COPY = pg_catalog.simple);
 ALTER DEFAULT PRIVILEGES IN SCHEMA app GRANT SELECT ON TABLES TO PUBLIC;
+
+-- Synthetic security fixture. All credentials are fake and live only in a
+-- disposable container; password verifiers must never enter a backup.
+CREATE ROLE backupctl_fixture_alice LOGIN;
+CREATE ROLE backupctl_fixture_bob LOGIN;
+CREATE ROLE backupctl_fixture_reporting NOLOGIN;
+ALTER ROLE backupctl_fixture_alice PASSWORD 'fake-verifier-for-tests-only';
+ALTER ROLE backupctl_fixture_bob PASSWORD 'fake-verifier-for-tests-only';
+GRANT backupctl_fixture_reporting TO backupctl_fixture_alice;
+GRANT CONNECT ON DATABASE backupctl_fixture_m1 TO backupctl_fixture_reporting;
+ALTER SCHEMA app OWNER TO backupctl_fixture_alice;
+ALTER TABLE app.audit_events OWNER TO backupctl_fixture_alice;
+GRANT SELECT, INSERT, UPDATE ON app.accounts TO backupctl_fixture_bob;
+GRANT SELECT ON aux.orders TO backupctl_fixture_reporting;
