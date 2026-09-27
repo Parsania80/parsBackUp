@@ -1,15 +1,16 @@
 use anyhow::{Context, Result, bail};
 use backup_domain::{
-    ArtifactScope, Config, DEV_FORMAT, DevelopmentManifest, DumpOptions, Profile,
-    ResolvedSelection, RestorePlan, RestoreSections, RestoreSecurityPolicy, Source, VERIFY_ARCHIVE,
-    VERIFY_CHECKSUM, VERIFY_RESTORE_TESTED,
+    ARCHIVE_COMPRESSION, ARCHIVE_FORMAT, ArtifactScope, BACKUP_STATUS, Config, DEV_FORMAT,
+    DevelopmentManifest, DumpOptions, Profile, ResolvedSelection, RestorePlan, RestoreSections,
+    RestoreSecurityPolicy, Source, VERIFICATION_NONE, VERIFY_ARCHIVE, VERIFY_CHECKSUM,
+    VERIFY_RESTORE_TESTED,
 };
 use sha2::Digest as _;
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
-pub const PLAN_TTL: Duration = Duration::from_secs(900);
+pub const PLAN_TTL: Duration = Duration::from_secs(backup_domain::PLAN_TTL_SECONDS);
 
 #[derive(Clone, Debug)]
 pub struct EngineInfo {
@@ -255,12 +256,12 @@ impl<E: DatabaseAdapter, S: ArtifactStore> BackupService<E, S> {
             source_version: info.source_version,
             dump_client_version: info.dump_client_version,
             application_version: env!("CARGO_PKG_VERSION").to_string(),
-            archive_format: "custom".to_string(),
-            compression: "gzip".to_string(),
+            archive_format: ARCHIVE_FORMAT.to_string(),
+            compression: ARCHIVE_COMPRESSION.to_string(),
             created_unix_ms,
             size_bytes,
             sha256,
-            status: "complete".to_string(),
+            status: BACKUP_STATUS.to_string(),
             security_globals: config.export_globals,
             globals_sha256,
             globals_size_bytes,
@@ -514,7 +515,7 @@ impl<E: DatabaseAdapter, S: ArtifactStore> RestoreService<E, S> {
                     .manifest()
                     .verification_level
                     .clone()
-                    .unwrap_or_else(|| "none".to_string()),
+                    .unwrap_or_else(|| VERIFICATION_NONE.to_string()),
             });
         }
         // Record restore-tested verification on the artifact (additive field

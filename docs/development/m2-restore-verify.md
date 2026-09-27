@@ -48,7 +48,7 @@ If `pg_restore` fails partway, the command reports that the target was left in p
 ## Sensitive metadata and known limitations
 
 - The export uses `pg_dumpall --roles-only --no-role-passwords`, so no SCRAM or MD5 verifier ever enters the artifact. The adapter re-checks the file for a `PASSWORD` clause and refuses to apply it, and the smoke test asserts a fake sentinel password and `SCRAM-SHA-256` never appear in the store or CLI output. **Consequence: restored roles exist with their attributes but cannot authenticate until an operator assigns a password.** This is a deliberate M2 limitation, not a workaround; recovering verifiers would require direct `pg_authid` access, which this project does not attempt.
-- `globals.sql` is plaintext on disk until M4 encryption and holds role names and attributes, which are themselves information. File modes are 0600/0700; the directory is not a secret boundary.
+- `globals.sql` is plaintext on disk until M4a encryption and holds role names and attributes, which are themselves information. File modes are 0600/0700; the directory is not a secret boundary.
 - Only roles, attributes, and memberships are exported. Database-level `GRANT ... ON DATABASE`, tablespaces, `ALTER DEFAULT PRIVILEGES` in other databases, and shared descriptors are **not** reconstructed and must be treated as cluster prerequisites.
 - Ownership and privileges are restored only for objects inside the dumped database.
 - One database per artifact, no scheduling, retention, deletion, remote storage, encryption, or concurrent-operation locking yet.

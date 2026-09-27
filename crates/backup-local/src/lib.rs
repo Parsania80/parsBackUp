@@ -1,15 +1,18 @@
+mod layout;
+
 use anyhow::{Context, Result, bail};
 use backup_application::{ArtifactHandle, ArtifactStore, StageHandle, WriteOptions};
 use backup_domain::{DevelopmentManifest, RestorePlan};
+use layout::{
+    ARTIFACTS_DIR, COMPLETE_MARKER, GLOBALS_FILE, MANIFEST_FILE, MANIFEST_TMP_FILE,
+    MAX_MANIFEST_BYTES, MAX_PLAN_BYTES, PAYLOAD_FILE, PLAN_SUFFIX, PLANS_DIR, STAGING_DIR,
+};
 use sha2::{Digest, Sha256};
 use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
-
-const MAX_MANIFEST_BYTES: u64 = 64 * 1024;
-const MAX_PLAN_BYTES: u64 = 64 * 1024;
 
 pub struct LocalStore {
     root: PathBuf,
@@ -69,7 +72,7 @@ impl LocalStore {
         }
         fs::create_dir_all(&root).context("create storage root")?;
         ensure_real_dir(&root)?;
-        for name in ["staging", "artifacts", "plans"] {
+        for name in [STAGING_DIR, ARTIFACTS_DIR, PLANS_DIR] {
             let dir = root.join(name);
             if !dir.exists() {
                 DirBuilder::new().mode(0o700).create(&dir)?;
@@ -78,7 +81,7 @@ impl LocalStore {
         }
         // A restart here implies any previous process died mid-dump; staged
         // data was never published and must not linger (single-owner store).
-        let staging = root.join("staging");
+        let staging = root.join(STAGING_DIR);
         for entry in fs::read_dir(&staging)? {
             let path = entry?.path();
             if path.is_dir() {
@@ -90,21 +93,21 @@ impl LocalStore {
     }
 
     fn artifact_dir(&self, id: Uuid) -> PathBuf {
-        self.root.join("artifacts").join(id.to_string())
+        self.root.join(ARTIFACTS_DIR).join(id.to_string())
     }
 
     fn plan_path(&self, id: Uuid) -> PathBuf {
-        self.root.join("plans").join(format!("{id}.json"))
+        self.root.join(PLANS_DIR).join(format!("{id}{PLAN_SUFFIX}"))
     }
 
     fn load_artifact(&self, id: Uuid) -> Result<LocalArtifact> {
         let dir = self.artifact_dir(id);
         ensure_real_dir(&dir)?;
-        let marker = dir.join("complete");
+        let marker = dir.join(COMPLETE_MARKER);
         ensure_regular_file(&marker)?;
-        let manifest_path = dir.join("manifest.json");
+        let manifest_path = dir.join(MANIFEST_FILE);
         ensure_regular_file(&manifest_path)?;
-        let payload_path = dir.join("payload.dump");
+        let payload_path = dir.join(PAYLOAD_FILE);
         ensure_regular_file(&payload_path)?;
         let mut bytes = Vec::new();
         File::open(&manifest_path)?
@@ -122,7 +125,7 @@ impl LocalStore {
         if size != manifest.size_bytes || digest != manifest.sha256 {
             bail!("payload checksum or size mismatch");
         }
-        let globals_path = dir.join("globals.sql");
+        let globals_path = dir.join(GLOBALS_FILE);
         let globals = if manifest.security_globals {
             ensure_regular_file(&globals_path)?;
             let (gsize, gdigest) = hash_file(&globals_path)?;
@@ -151,12 +154,12 @@ impl ArtifactStore for LocalStore {
     type Artifact = LocalArtifact;
 
     fn begin(&self, id: Uuid, options: &WriteOptions) -> Result<Self::Stage> {
-        let dir = self.root.join("staging").join(id.to_string());
+        let dir = self.root.join(STAGING_DIR).join(id.to_string());
         DirBuilder::new()
             .mode(0o700)
             .create(&dir)
             .context("create private staging directory")?;
-        let payload = dir.join("payload.dump");
+        let payload = dir.join(PAYLOAD_FILE);
         OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -164,7 +167,7 @@ impl ArtifactStore for LocalStore {
             .open(&payload)
             .context("create private payload file")?;
         let globals = if options.with_globals {
-            let path = dir.join("globals.sql");
+            let path = dir.join(GLOBALS_FILE);
             OpenOptions::new()
                 .write(true)
                 .create_new(true)
@@ -222,7 +225,7 @@ impl ArtifactStore for LocalStore {
             }
             File::open(stage.globals.as_ref().expect("checked above"))?.sync_all()?;
         }
-        let tmp_manifest = stage.dir.join("manifest.json.tmp");
+        let tmp_manifest = stage.dir.join(MANIFEST_TMP_FILE);
         let mut file = OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -231,15 +234,15 @@ impl ArtifactStore for LocalStore {
         serde_json::to_writer_pretty(&mut file, manifest)?;
         file.write_all(b"\n")?;
         file.sync_all()?;
-        fs::rename(&tmp_manifest, stage.dir.join("manifest.json"))?;
+        fs::rename(&tmp_manifest, stage.dir.join(MANIFEST_FILE))?;
         File::open(&stage.dir)?.sync_all()?;
         let final_dir = self.artifact_dir(stage.id);
         if final_dir.exists() {
             bail!("artifact ID already exists");
         }
         fs::rename(&stage.dir, &final_dir).context("publish staged artifact")?;
-        File::open(self.root.join("artifacts"))?.sync_all()?;
-        let marker = final_dir.join("complete");
+        File::open(self.root.join(ARTIFACTS_DIR))?.sync_all()?;
+        let marker = final_dir.join(COMPLETE_MARKER);
         let marker_file = OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -252,7 +255,7 @@ impl ArtifactStore for LocalStore {
 
     fn list(&self) -> Result<Vec<DevelopmentManifest>> {
         let mut manifests = Vec::new();
-        for entry in fs::read_dir(self.root.join("artifacts"))? {
+        for entry in fs::read_dir(self.root.join(ARTIFACTS_DIR))? {
             let entry = entry?;
             let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
                 continue;
@@ -260,7 +263,7 @@ impl ArtifactStore for LocalStore {
             let Ok(id) = Uuid::parse_str(&name) else {
                 continue;
             };
-            if !entry.path().join("complete").exists() {
+            if !entry.path().join(COMPLETE_MARKER).exists() {
                 continue;
             }
             manifests.push(
@@ -296,7 +299,7 @@ impl ArtifactStore for LocalStore {
         }
         manifest.validate_shape()?;
         let dir = self.artifact_dir(manifest.id);
-        let tmp = dir.join("manifest.json.tmp");
+        let tmp = dir.join(MANIFEST_TMP_FILE);
         let mut file = OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -305,7 +308,7 @@ impl ArtifactStore for LocalStore {
         serde_json::to_writer_pretty(&mut file, manifest)?;
         file.write_all(b"\n")?;
         file.sync_all()?;
-        fs::rename(&tmp, dir.join("manifest.json"))?;
+        fs::rename(&tmp, dir.join(MANIFEST_FILE))?;
         File::open(&dir)?.sync_all()?;
         Ok(())
     }
@@ -320,7 +323,7 @@ impl ArtifactStore for LocalStore {
         serde_json::to_writer_pretty(&mut file, plan)?;
         file.write_all(b"\n")?;
         file.sync_all()?;
-        File::open(self.root.join("plans"))?.sync_all()?;
+        File::open(self.root.join(PLANS_DIR))?.sync_all()?;
         Ok(())
     }
 

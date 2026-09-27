@@ -1,194 +1,25 @@
+//! The `backupctl` entry point: parse the configuration, dispatch one command,
+//! and print either the human report (see `report`) or the JSON of the same
+//! result. Argument types live in `cli`; nothing here computes domain rules.
+
+mod cli;
+mod report;
+
+use crate::cli::{
+    BackupCommand, Cli, ConfigCommand, Output, ProfileCommand, RestoreCommand, SecurityPreset,
+    TopCommand, VerifyLevel, sections_from, selection_json,
+};
+use crate::report::{
+    print_backup_created, print_inspect, print_plan, print_profile_scope, print_restore,
+    print_selection, print_verify,
+};
 use anyhow::{Context, Result, anyhow, bail};
 use backup_application::{BackupService, RestoreService, VerifyService};
-use backup_domain::{
-    Config, Profile, ResolvedSelection, RestoreSections, RestoreSecurityPolicy, VERIFY_ARCHIVE,
-    VERIFY_CHECKSUM,
-};
+use backup_domain::{Config, RestoreSecurityPolicy, VERIFY_ARCHIVE, VERIFY_CHECKSUM};
 use backup_local::LocalStore;
 use backup_postgres::PostgresAdapter;
-use clap::{Parser, Subcommand, ValueEnum};
-use std::path::PathBuf;
+use clap::Parser;
 use std::process::ExitCode;
-use uuid::Uuid;
-
-#[derive(Parser)]
-#[command(
-    name = "backupctl",
-    version,
-    about = "Synthetic-data PostgreSQL backup development CLI"
-)]
-struct Cli {
-    #[arg(long, global = true)]
-    config: Option<PathBuf>,
-    #[arg(long, global = true, value_enum, default_value_t = Output::Human)]
-    output: Output,
-    #[command(subcommand)]
-    command: TopCommand,
-}
-
-#[derive(Clone, Copy, ValueEnum)]
-enum Output {
-    Human,
-    Json,
-}
-
-#[derive(Subcommand)]
-enum TopCommand {
-    Config {
-        #[command(subcommand)]
-        command: ConfigCommand,
-    },
-    Profile {
-        #[command(subcommand)]
-        command: ProfileCommand,
-    },
-    Backup {
-        #[command(subcommand)]
-        command: BackupCommand,
-    },
-    Restore {
-        #[command(subcommand)]
-        command: RestoreCommand,
-    },
-}
-
-#[derive(Subcommand)]
-enum ConfigCommand {
-    Check,
-}
-
-#[derive(Subcommand)]
-enum ProfileCommand {
-    /// Check a profile against the configured database and report the exact
-    /// object set it resolves to without writing an artifact.
-    Validate { name: String },
-    /// List the configured profiles.
-    List,
-}
-
-#[derive(Clone, Copy, ValueEnum)]
-enum VerifyLevel {
-    Checksum,
-    Archive,
-}
-
-#[derive(Clone, Copy, ValueEnum)]
-enum SecurityPreset {
-    /// Restore roles, ownership, and privileges from the security metadata.
-    Dr,
-    /// Contents only: skip roles, ownership, and privileges.
-    Portable,
-}
-
-#[derive(Clone, Copy, ValueEnum)]
-enum Section {
-    PreData,
-    Data,
-    PostData,
-}
-
-#[derive(Subcommand)]
-enum BackupCommand {
-    Create {
-        #[arg(long)]
-        confirm_synthetic: bool,
-        /// Select a configured profile; omitting it dumps the whole database.
-        #[arg(long)]
-        profile: Option<String>,
-        /// Resolve and report the scope, then stop without writing anything.
-        #[arg(long)]
-        dry_run: bool,
-    },
-    List,
-    Inspect {
-        id: Uuid,
-    },
-    Verify {
-        id: Uuid,
-        #[arg(long, value_enum, default_value_t = VerifyLevel::Archive)]
-        level: VerifyLevel,
-    },
-}
-
-#[derive(Subcommand)]
-enum RestoreCommand {
-    Plan {
-        id: Uuid,
-        #[arg(long)]
-        target: String,
-        #[arg(long, value_enum, default_value_t = SecurityPreset::Dr)]
-        security: SecurityPreset,
-        /// Restrict the restore to archive sections; repeatable.
-        #[arg(long = "section", value_enum)]
-        sections: Vec<Section>,
-    },
-    Run {
-        plan: Uuid,
-        #[arg(long)]
-        confirm_target: String,
-    },
-}
-
-fn sections_from(selected: &[Section]) -> RestoreSections {
-    if selected.is_empty() {
-        return RestoreSections::full();
-    }
-    let mut sections = RestoreSections {
-        pre_data: false,
-        data: false,
-        post_data: false,
-    };
-    for section in selected {
-        match section {
-            Section::PreData => sections.pre_data = true,
-            Section::Data => sections.data = true,
-            Section::PostData => sections.post_data = true,
-        }
-    }
-    sections
-}
-
-fn selection_json(selection: &ResolvedSelection) -> serde_json::Value {
-    serde_json::json!({
-        "whole_database": selection.whole_database,
-        "resolved_schemas": selection.schemas,
-        "resolved_tables": selection.tables,
-        "excluded_schemas": selection.exclude_schemas,
-        "excluded_tables": selection.exclude_tables,
-        "extension_members": selection.extension_members,
-    })
-}
-
-fn print_list(label: &str, values: &[String]) {
-    if !values.is_empty() {
-        println!("{label}: {}", values.join(", "));
-    }
-}
-
-fn print_selection(selection: &ResolvedSelection) {
-    if selection.whole_database {
-        println!("scope: whole database");
-        return;
-    }
-    print_list("schemas", &selection.schemas);
-    print_list("relations", &selection.tables);
-    print_list("excluded schemas", &selection.exclude_schemas);
-    print_list("excluded relations", &selection.exclude_tables);
-    print_list("extension members", &selection.extension_members);
-}
-
-fn print_profile_scope(profile: &Profile) {
-    println!("profile: {}", profile.name);
-    println!("database: {}", profile.database);
-    let mode = serde_json::to_value(profile.mode).unwrap_or_default();
-    println!("mode: {}", mode.as_str().unwrap_or_default());
-    print_list("requested schemas", &profile.schemas);
-    print_list("requested tables", &profile.tables);
-    print_list("excluded schemas", &profile.exclude_schemas);
-    print_list("excluded tables", &profile.exclude_tables);
-    print_list("excluded extensions", &profile.exclude_extensions);
-    println!("large objects: {}", profile.large_objects);
-}
 
 fn main() -> ExitCode {
     match run() {
@@ -301,25 +132,7 @@ fn run() -> Result<()> {
                     if json {
                         println!("{}", serde_json::to_string_pretty(&manifest)?);
                     } else {
-                        println!("created synthetic development backup {}", manifest.id);
-                        println!("database: {}", manifest.database);
-                        println!("bytes: {}", manifest.size_bytes);
-                        if let Some(scope) = &manifest.scope {
-                            println!("profile: {}", scope.profile);
-                            println!("resolved schemas: {}", scope.resolved_schemas.join(", "));
-                            println!("resolved relations: {}", scope.resolved_tables.join(", "));
-                            if scope.large_objects {
-                                println!("large objects: every one in the database");
-                            }
-                        }
-                        println!(
-                            "security metadata: {}",
-                            if manifest.security_globals {
-                                "globals.sql (roles and memberships, no password verifiers)"
-                            } else {
-                                "none"
-                            }
-                        );
+                        print_backup_created(&manifest);
                     }
                 }
                 BackupCommand::List => {
@@ -337,31 +150,7 @@ fn run() -> Result<()> {
                     if json {
                         println!("{}", serde_json::to_string_pretty(&manifest)?);
                     } else {
-                        println!("id: {}", manifest.id);
-                        println!("format: {}", manifest.format);
-                        println!("database: {}", manifest.database);
-                        println!("source major: {}", manifest.source_major);
-                        println!("client: {}", manifest.dump_client_version);
-                        println!("bytes: {}", manifest.size_bytes);
-                        println!("sha256: {}", manifest.sha256);
-                        println!("security globals: {}", manifest.security_globals);
-                        if let Some(scope) = &manifest.scope {
-                            println!("profile: {}", scope.profile);
-                            println!("whole database: {}", scope.whole_database);
-                            println!("resolved schemas: {}", scope.resolved_schemas.join(", "));
-                            println!("resolved relations: {}", scope.resolved_tables.join(", "));
-                            println!("extension members: {}", scope.extension_members.join(", "));
-                        }
-                        println!(
-                            "table of contents: {}",
-                            manifest.toc_sha256.unwrap_or_else(|| "none".to_string())
-                        );
-                        println!(
-                            "verification: {}",
-                            manifest
-                                .verification_level
-                                .unwrap_or_else(|| "none".to_string())
-                        );
+                        print_inspect(manifest);
                     }
                 }
                 BackupCommand::Verify { id, level } => {
@@ -385,19 +174,7 @@ fn run() -> Result<()> {
                             }))?
                         );
                     } else {
-                        println!(
-                            "artifact {} verified at level {}",
-                            report.artifact_id, report.level
-                        );
-                        println!(
-                            "payload: {} bytes {}",
-                            report.payload_size_bytes, report.payload_sha256
-                        );
-                        if let (Some(size), Some(sha)) =
-                            (report.globals_size_bytes, &report.globals_sha256)
-                        {
-                            println!("globals: {size} bytes {sha}");
-                        }
+                        print_verify(&report);
                     }
                 }
             }
@@ -427,27 +204,7 @@ fn run() -> Result<()> {
                             }))?
                         );
                     } else {
-                        println!("restore plan {} (digest {})", plan.id, plan.digest());
-                        println!(
-                            "artifact: {} ({})",
-                            plan.artifact_id, plan.artifact_database
-                        );
-                        if let Some(profile) = &plan.artifact_scope {
-                            println!("backup profile scope: {profile}");
-                        }
-                        println!("target: {} (new database)", plan.target_database);
-                        println!(
-                            "security: roles={} ownership={} privileges={}",
-                            plan.security.roles, plan.security.ownership, plan.security.privileges
-                        );
-                        println!(
-                            "sections: pre-data={} data={} post-data={}",
-                            plan.sections.pre_data, plan.sections.data, plan.sections.post_data
-                        );
-                        println!(
-                            "expires in 15 minutes; run with --confirm-target {}",
-                            plan.target_database
-                        );
+                        print_plan(&plan);
                     }
                 }
                 RestoreCommand::Run {
@@ -469,16 +226,7 @@ fn run() -> Result<()> {
                             }))?
                         );
                     } else {
-                        println!(
-                            "restored {} into {}",
-                            executed.plan.artifact_id, executed.plan.target_database
-                        );
-                        println!("verification level: {}", executed.verification_level);
-                        if !executed.plan.sections.is_full() {
-                            println!(
-                                "warning: only part of the archive was replayed, so this run does not prove the artifact restores completely"
-                            );
-                        }
+                        print_restore(&executed);
                     }
                 }
             }
