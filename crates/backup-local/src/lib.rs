@@ -728,6 +728,20 @@ pub fn generate_key_pair(
             );
         }
     }
+    // The configured location is the operator's own directory, and a first run is the
+    // normal case, so it is created here rather than left as a write error. It is
+    // private because it will hold the identity: the same reason the key itself is 0600.
+    for path in [identity_file, recipient_file] {
+        let Some(parent) = path.parent() else {
+            continue;
+        };
+        if !parent.exists() {
+            DirBuilder::new()
+                .mode(0o700)
+                .recursive(true)
+                .create(parent)?;
+        }
+    }
     let identity = KeyFile::create_identity(identity_file)?;
     KeyFile::write_recipient(recipient_file, identity.recipient())?;
     key_status(identity_file, recipient_file)
@@ -770,6 +784,7 @@ mod tests {
     use super::*;
     use backup_crypto::protocol::SUITE_HYBRID;
     use backup_domain::{DEV_FORMAT, PLAN_FORMAT, RestoreSecurityPolicy};
+    use std::os::unix::fs::PermissionsExt;
 
     fn temp_root() -> PathBuf {
         std::env::temp_dir().join(format!("backupctl-store-test-{}", Uuid::new_v4()))
@@ -1167,6 +1182,24 @@ mod tests {
         // loads under exactly the rules `with_keys` applies.
         assert!(LocalStore::with_keys(root.clone(), &identity, &recipient).is_ok());
         fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Generating into a location the operator has not created yet is the normal
+    /// first run, and the directory that will hold the identity is private.
+    #[test]
+    fn generation_creates_a_private_parent() {
+        let dir = temp_keys();
+        let identity = dir.join("nested/deeper/identity.key");
+        let recipient = dir.join("nested/deeper/recipient.key");
+        let (identity_status, _) = generate_key_pair(&identity, &recipient).unwrap();
+
+        let parent = identity.parent().unwrap();
+        assert_eq!(
+            fs::metadata(parent).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(identity_status.mode, 0o600);
         fs::remove_dir_all(dir).unwrap();
     }
 
