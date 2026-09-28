@@ -1,0 +1,32 @@
+# M4a adds an [encryption] block to the M3 configuration. It is the only way to
+# turn encryption on: there is no per-run flag to forget. Without this block every
+# artifact is written in the plaintext layout the M1-M3 guides describe.
+# Replace these absolute paths with paths on the machine running backupctl.
+timeout_seconds = 300
+
+# Cluster role and membership metadata. With [encryption] below it is sealed as
+# globals.age instead of written as globals.sql.
+export_globals = true
+
+[source]
+host = "127.0.0.1"
+port = 55432
+user = "postgres"
+database = "backupctl_fixture_m1"
+client_bin_dir = "/usr/lib/postgresql/16/bin"
+# password_file = "/absolute/path/to/0600/pgpass"
+
+[storage]
+root = "/tmp/backupctl-m4a-data"
+
+# Both paths must be absolute and must live outside the storage root: an encrypted
+# archive in a directory that also holds the identity that opens it is a plaintext
+# archive with extra steps. `config check` and `key generate` both refuse otherwise.
+#
+# Create them with `backupctl --config this-file.toml key generate`, which writes the
+# identity at mode 0600 and its public recipient half at 0644, and never overwrites an
+# existing file. A backup host that may only write needs the recipient_file and nothing
+# else; verifying or restoring needs both.
+[encryption]
+identity_file = "/var/lib/backupctl-keys/identity.key"
+recipient_file = "/var/lib/backupctl-keys/recipient.key"

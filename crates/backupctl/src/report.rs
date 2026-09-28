@@ -7,11 +7,42 @@ use backup_application::{RestoreOutcome, VerifyReport};
 use backup_domain::{
     DevelopmentManifest, Profile, ResolvedSelection, RestorePlan, VERIFICATION_NONE,
 };
+use backup_local::KeyStatus;
 
 fn print_list(label: &str, values: &[String]) {
     if !values.is_empty() {
         println!("{label}: {}", values.join(", "));
     }
+}
+
+/// Both key files, plus the public recipient they share. Reaching the same recipient
+/// from an identity file and a recipient file is how an operator proves a pair belongs
+/// together, and this is the only key material that is safe to print.
+pub(crate) fn print_keys(identity: &KeyStatus, recipient: &KeyStatus) {
+    println!("suite: {}", identity.suite);
+    println!(
+        "identity: {} (mode {:04o})",
+        identity.path.display(),
+        identity.mode
+    );
+    println!(
+        "recipient: {} (mode {:04o})",
+        recipient.path.display(),
+        recipient.mode
+    );
+    // The seed is never printed, and the recipient is: it is the public half both files
+    // carry, and the value an operator copies to a host that may only write backups. It
+    // is shown as a fingerprint because a 1216-byte key is a file to move, not a line to
+    // read; `--output json` carries it whole.
+    let fingerprint = identity
+        .recipient_hex
+        .chars()
+        .take(identity.recipient_hex.len().min(32))
+        .collect::<String>();
+    println!(
+        "recipient key: {fingerprint}… ({} hex characters, --output json for the full value)",
+        identity.recipient_hex.len()
+    );
 }
 
 pub(crate) fn print_selection(selection: &ResolvedSelection) {

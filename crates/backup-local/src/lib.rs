@@ -14,7 +14,8 @@ use backup_application::{
     ArtifactHandle, ArtifactStore, PayloadSink, PlaintextView, StageHandle, StagedBytes,
     WriteOptions,
 };
-use backup_crypto::keystore::{IdentityProvider, KeyFile, KeyRole};
+pub use backup_crypto::keystore::KeyStatus;
+use backup_crypto::keystore::{IdentityProvider, KeyFile, KeyRole, status as read_key_file};
 use backup_crypto::stream::{EncryptSink, decrypt, decrypt_with_limit};
 use backup_domain::{AGE_FORMAT, DevelopmentManifest, RestorePlan};
 use layout::{
@@ -218,15 +219,7 @@ impl LocalStore {
         identity_file: impl AsRef<Path>,
         recipient_file: impl AsRef<Path>,
     ) -> Result<Self> {
-        let identity = KeyFile::load(identity_file, KeyRole::Identity)?;
-        let recipient = KeyFile::load(recipient_file, KeyRole::Recipient)?;
-        if recipient.recipient() != identity.recipient() {
-            bail!(
-                "recipient key file {} is not the recipient of identity key file {}",
-                recipient.path().display(),
-                identity.path().display()
-            );
-        }
+        let (identity, recipient) = load_pair(identity_file.as_ref(), recipient_file.as_ref())?;
         Self::open(
             root,
             Some(StoreKeys {
@@ -681,6 +674,65 @@ impl ArtifactStore for LocalStore {
     }
 }
 
+/// Loads both halves of a configured key pair and refuses a pair that cannot open
+/// the artifacts it seals.
+fn load_pair(identity_file: &Path, recipient_file: &Path) -> Result<(KeyFile, KeyFile)> {
+    let identity = KeyFile::load(identity_file, KeyRole::Identity)?;
+    let recipient = KeyFile::load(recipient_file, KeyRole::Recipient)?;
+    if recipient.recipient() != identity.recipient() {
+        bail!(
+            "recipient key file {} is not the recipient of identity key file {}",
+            recipient.path().display(),
+            identity.path().display()
+        );
+    }
+    Ok((identity, recipient))
+}
+
+/// Reports the two configured key files: path, role, suite, permission bits, and the
+/// public recipient. Nothing secret is in the result, which is what makes this safe to
+/// run on a host that may only write backups.
+///
+/// The files are loaded with the store's own rules before their status is read, so a
+/// pair this reports as usable is a pair `with_keys` will accept.
+pub fn key_status(
+    identity_file: impl AsRef<Path>,
+    recipient_file: impl AsRef<Path>,
+) -> Result<(KeyStatus, KeyStatus)> {
+    let (identity, recipient) = load_pair(identity_file.as_ref(), recipient_file.as_ref())?;
+    Ok((
+        read_key_file(identity.path(), KeyRole::Identity)?,
+        read_key_file(recipient.path(), KeyRole::Recipient)?,
+    ))
+}
+
+/// Generates the identity and publishes its recipient half, in one deliberate step.
+///
+/// Neither file is created unless neither already exists: an identity whose recipient
+/// was never written cannot be encrypted to, and an operator who re-runs the command
+/// after a half-finished attempt would silently generate an unrelated second key.
+pub fn generate_key_pair(
+    identity_file: impl AsRef<Path>,
+    recipient_file: impl AsRef<Path>,
+) -> Result<(KeyStatus, KeyStatus)> {
+    let identity_file = identity_file.as_ref();
+    let recipient_file = recipient_file.as_ref();
+    // Checked through the symlink so a dangling link is treated as the occupied path
+    // it is, rather than as free space to write into.
+    for path in [identity_file, recipient_file] {
+        if fs::symlink_metadata(path).is_ok() {
+            bail!(
+                "refusing to overwrite the existing key file {}; a new key orphans every \
+                 artifact encrypted to the current one",
+                path.display()
+            );
+        }
+    }
+    let identity = KeyFile::create_identity(identity_file)?;
+    KeyFile::write_recipient(recipient_file, identity.recipient())?;
+    key_status(identity_file, recipient_file)
+}
+
 fn ensure_real_dir(path: &Path) -> Result<()> {
     let meta = fs::symlink_metadata(path)?;
     if meta.file_type().is_symlink() || !meta.is_dir() {
@@ -1083,5 +1135,80 @@ mod tests {
         fs::write(&path, serde_json::to_vec_pretty(&expired).unwrap()).unwrap();
         assert!(store.load_plan(plan.id).is_err());
         fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A generated pair reports the public recipient and the modes that make the
+    /// identity usable, and what it reports is what `with_keys` accepts.
+    #[test]
+    fn a_generated_pair_reports_public_facts_and_opens_the_store() {
+        let dir = temp_keys();
+        fs::create_dir_all(&dir).unwrap();
+        let identity = dir.join("identity.key");
+        let recipient = dir.join("recipient.key");
+        let (identity_status, recipient_status) = generate_key_pair(&identity, &recipient).unwrap();
+
+        assert_eq!(identity_status.mode, 0o600);
+        assert_eq!(recipient_status.mode, 0o644);
+        assert_eq!(identity_status.suite, SUITE_HYBRID);
+        assert_eq!(
+            identity_status.recipient_hex, recipient_status.recipient_hex,
+            "status is how an operator proves the two files match"
+        );
+        // The recipient is the 1216-byte public key; an identity-length seed here would
+        // mean the report carried secret material.
+        assert_eq!(identity_status.recipient_hex.len(), 2432);
+        assert_eq!(
+            key_status(&identity, &recipient).unwrap().0.recipient_hex,
+            identity_status.recipient_hex
+        );
+
+        let root = temp_root();
+        // A pair that reports these facts is a pair the store accepts: `key_status`
+        // loads under exactly the rules `with_keys` applies.
+        assert!(LocalStore::with_keys(root.clone(), &identity, &recipient).is_ok());
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Generating over a key would orphan every artifact sealed to it, so neither
+    /// file is touched when the other already exists.
+    #[test]
+    fn generation_refuses_an_occupied_path_before_writing() {
+        let dir = temp_keys();
+        fs::create_dir_all(&dir).unwrap();
+        let identity = dir.join("identity.key");
+        let recipient = dir.join("recipient.key");
+        let (first, _) = generate_key_pair(&identity, &recipient).unwrap();
+
+        let error = format!(
+            "{:#}",
+            generate_key_pair(&identity, &recipient).err().unwrap()
+        );
+        assert!(error.contains("refusing to overwrite"), "got: {error}");
+
+        // An occupied recipient with a free identity is refused the same way: writing a
+        // new identity there would seal artifacts nobody can open.
+        fs::remove_file(&identity).unwrap();
+        let error = format!(
+            "{:#}",
+            generate_key_pair(&identity, &recipient).err().unwrap()
+        );
+        assert!(error.contains("refusing to overwrite"), "got: {error}");
+        assert!(
+            !identity.exists(),
+            "a refused generation must not leave an unusable identity behind"
+        );
+
+        // The refusal left the original recipient intact, so the pair still resolves to
+        // the key it was generated with.
+        assert_eq!(
+            KeyFile::load(&recipient, KeyRole::Recipient)
+                .unwrap()
+                .recipient()
+                .to_string(),
+            first.recipient_hex
+        );
+
+        fs::remove_dir_all(dir).unwrap();
     }
 }

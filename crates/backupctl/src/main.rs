@@ -6,17 +6,17 @@ mod cli;
 mod report;
 
 use crate::cli::{
-    BackupCommand, Cli, ConfigCommand, Output, ProfileCommand, RestoreCommand, SecurityPreset,
-    TopCommand, VerifyLevel, sections_from, selection_json,
+    BackupCommand, Cli, ConfigCommand, KeyCommand, Output, ProfileCommand, RestoreCommand,
+    SecurityPreset, TopCommand, VerifyLevel, key_json, sections_from, selection_json,
 };
 use crate::report::{
-    print_backup_created, print_inspect, print_plan, print_profile_scope, print_restore,
-    print_selection, print_verify,
+    print_backup_created, print_inspect, print_keys, print_plan, print_profile_scope,
+    print_restore, print_selection, print_verify,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use backup_application::{BackupService, RestoreService, VerifyService};
 use backup_domain::{Config, RestoreSecurityPolicy, VERIFY_ARCHIVE, VERIFY_CHECKSUM};
-use backup_local::LocalStore;
+use backup_local::{LocalStore, generate_key_pair, key_status};
 use backup_postgres::PostgresAdapter;
 use clap::Parser;
 use std::process::ExitCode;
@@ -67,6 +67,33 @@ fn run() -> Result<()> {
                 println!("{{\"valid\":true,\"mode\":\"synthetic-only\"}}");
             } else {
                 println!("configuration valid (synthetic-only mode)");
+            }
+        }
+        TopCommand::Key { command } => {
+            let encryption = config.encryption.as_ref().ok_or_else(|| {
+                anyhow!(
+                    "the configuration has no [encryption] block; key commands act on its \
+                     identity_file and recipient_file paths"
+                )
+            })?;
+            let (identity, recipient) = match command {
+                KeyCommand::Generate => {
+                    generate_key_pair(&encryption.identity_file, &encryption.recipient_file)?
+                }
+                KeyCommand::Status => {
+                    key_status(&encryption.identity_file, &encryption.recipient_file)?
+                }
+            };
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "identity": key_json("identity", &identity),
+                        "recipient": key_json("recipient", &recipient),
+                    }))?
+                );
+            } else {
+                print_keys(&identity, &recipient);
             }
         }
         TopCommand::Profile { command } => match command {

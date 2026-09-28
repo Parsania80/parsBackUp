@@ -3,6 +3,7 @@
 //! readable on its own.
 
 use backup_domain::{ResolvedSelection, RestoreSections};
+use backup_local::KeyStatus;
 use clap::{Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 use uuid::Uuid;
@@ -34,6 +35,10 @@ pub(crate) enum TopCommand {
         #[command(subcommand)]
         command: ConfigCommand,
     },
+    Key {
+        #[command(subcommand)]
+        command: KeyCommand,
+    },
     Profile {
         #[command(subcommand)]
         command: ProfileCommand,
@@ -51,6 +56,16 @@ pub(crate) enum TopCommand {
 #[derive(Subcommand)]
 pub(crate) enum ConfigCommand {
     Check,
+}
+
+/// Both commands act on the `[encryption]` paths in the configuration, never on paths
+/// typed at the prompt: a key the store will not load is worse than no key at all.
+#[derive(Subcommand)]
+pub(crate) enum KeyCommand {
+    /// Generate the configured identity and publish its recipient half.
+    Generate,
+    /// Report the configured key files without decrypting or printing secret material.
+    Status,
 }
 
 #[derive(Subcommand)]
@@ -152,5 +167,18 @@ pub(crate) fn selection_json(selection: &ResolvedSelection) -> serde_json::Value
         "excluded_schemas": selection.exclude_schemas,
         "excluded_tables": selection.exclude_tables,
         "extension_members": selection.extension_members,
+    })
+}
+
+/// A key file as an operator sees it in `--output json`: public facts only. The
+/// recipient is the public half, so publishing it is the point of the report; no field
+/// here can carry the identity seed.
+pub(crate) fn key_json(label: &'static str, status: &KeyStatus) -> serde_json::Value {
+    serde_json::json!({
+        "path": status.path.display().to_string(),
+        "role": label,
+        "suite": status.suite,
+        "mode": format!("{:04o}", status.mode),
+        "recipient": status.recipient_hex,
     })
 }

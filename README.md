@@ -1,10 +1,12 @@
 # backupctl
 
-A Rust PostgreSQL backup platform under development. The current M3 CLI creates **plaintext backups of synthetic local fixture databases only**, optionally through a named profile whose scope is resolved against the live catalog, verifies them, and restores them fully or section by section, either as a full DR rebuild (roles, memberships, ownership, privileges) or as a contents-only portable restore. A selective backup is refused when the selection would depend on objects `pg_dump` does not write. It does not yet provide encrypted production artifacts, scheduling, or an API. The [roadmap](project.md) defines the milestones and release limits.
+A Rust PostgreSQL backup platform under development. The current CLI creates backups of **synthetic local fixture databases only**, optionally through a named profile whose scope is resolved against the live catalog, verifies them, and restores them fully or section by section, either as a full DR rebuild (roles, memberships, ownership, privileges) or as a contents-only portable restore. A selective backup is refused when the selection would depend on objects `pg_dump` does not write. A store that configures an `[encryption]` block seals every artifact it writes with a hybrid ML-KEM-768 + X25519 age recipient, so payload plaintext never enters the store; those artifacts are still unsigned, so real data must wait for M4b. It does not yet provide scheduling or an API. The [roadmap](project.md) defines the milestones and release limits.
 
 ## Current commands
 
 ```text
+backupctl --config /absolute/path/to/m4a.toml key generate
+backupctl --config /absolute/path/to/m4a.toml key status
 backupctl --config /absolute/path/to/m3.toml config check
 backupctl --config /absolute/path/to/m3.toml profile list
 backupctl --config /absolute/path/to/m3.toml profile validate PROFILE_NAME
