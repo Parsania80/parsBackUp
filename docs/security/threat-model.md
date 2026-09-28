@@ -10,7 +10,7 @@ Assets: source database data and credentials; backup payload and private metadat
 
 | ID | Attacker; asset | Attack and impact | Required mitigation; residual risk | Test/gate |
 | --- | --- | --- | --- | --- |
-| T01 | Backup-file thief; data | Copies archive now and decrypts it later, including possible database-held credentials | Encrypt payload/private manifest with a hybrid X25519 + ML-KEM-768 recipient; private identity outside store. Both a classical break and a lattice break must land to read a long-lived artifact. A compromised running host can still expose plaintext. | E05/E06, M4a |
+| T01 | Backup-file thief; data | Copies archive now and decrypts it later, including possible database-held credentials | Encrypt payload/private manifest with the hybrid `mlkem768x25519-v0` recipient (ML-KEM-768 first, then X25519) inside age's authenticated stream; private identity outside store. Both a classical break and a lattice break must land to read a long-lived artifact. A compromised running host can still expose plaintext. | E05/E06, M4a |
 | T02 | Storage editor; integrity/origin | Replaces both age files with attacker-created ciphertext for public recipient, or claims a weaker suite | Detached hybrid Ed25519 + ML-DSA-65 signature over ID and both ciphertext hashes, trusted verifier outside artifact, with the recorded suite required to match the accepted list. Signing-key compromise still permits forgery. | E05, M4b |
 | T03 | Storage editor; recoverability | Deletes or replays an older valid signed artifact | Independent inventory, alerting, protected/off-host copies and later immutable store. Local v1 alone cannot prevent host-loss/deletion/rollback. | E10, M5+ |
 | T04 | Local user; filesystem | Path traversal, malicious filename, symlink race, unauthorized deletion | Opaque validated ID, directory ownership/mode, no-follow file operations, atomic stage/commit, least-privilege service account. | E09, M1/M4 |
@@ -33,6 +33,7 @@ PostgreSQL explicitly warns that restoring a dump can execute code selected by a
 
 - No real-data artifact is published before M4a encryption **and** M4b origin signing are implemented and verified.
 - A new write never selects a classical-only recipient or signature suite, and a reader never accepts a suite outside its configured accepted list; neither infers the suite from key sizes.
+- A published artifact carries exactly one recipient stanza, the hybrid one. The writer refuses a configuration that would also wrap the same file key to a classical-only recipient, because age will accept such a mixed header and either identity would then decrypt alone, cancelling T01's mitigation.
 - No service password or signing/decryption private key is stored in the repository, profile, public header, private manifest, logs, or backup store.
 - Verification labels are distinct: ciphertext/signed-artifact integrity, archive readability, and actual isolated restore success.
 - A verified signature does not authorize restore; the actor and target still need authorization and an explicit plan.

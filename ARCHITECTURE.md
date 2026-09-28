@@ -23,7 +23,7 @@ CLI / scheduler / future API -> application -> domain
 - Application: plan/create/inspect/verify/restore use cases, orchestration, cancellation, audit decision. It depends on ports, not subprocess or filesystem modules.
 - PostgreSQL adapter: source and destination preflight, native tool version selection, safe argv construction, TOC inspection, capability/limitation reporting. It owns PostgreSQL-specific selection and restore flags.
 - Storage adapter: staged writes, durable commit, read, inventory, quarantine, deletion; no profile or SQL decisions.
-- Crypto adapter: age recipient/identity access, streaming encryption/decryption with a hybrid X25519 + ML-KEM-768 recipient, detached hybrid Ed25519 + ML-DSA-65 signing/verification, and complete authentication; it reports the suite it used and knows nothing about databases. See the [hybrid rationale](docs/security/post-quantum-hybrid.md).
+- Crypto adapter: age recipient/identity access, streaming encryption/decryption with our own hybrid `mlkem768x25519` recipient (ML-KEM-768 first, then X25519) inside age's standard authenticated stream, so a v1 artifact is decryptable by `backupctl` alone, detached hybrid Ed25519 + ML-DSA-65 signing/verification, and complete authentication; it reports the suite it used and knows nothing about databases. See the [hybrid rationale](docs/security/post-quantum-hybrid.md).
 - Catalog adapter (M5): index and job/audit state. Published artifacts remain discoverable with the recovery identity after catalog loss.
 - Interfaces: parse/present requests only; they cannot bypass application preflight or authorization.
 
