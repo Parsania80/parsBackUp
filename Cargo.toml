@@ -5,6 +5,7 @@ members = [
   "crates/backup-application",
   "crates/backup-postgres",
   "crates/backup-local",
+  "crates/backup-crypto",
   "crates/backupctl",
 ]
 
@@ -20,3 +21,19 @@ serde_json = "1.0"
 sha2 = "0.10"
 toml = "1.1"
 uuid = { version = "1.26", features = ["v4", "serde"] }
+
+# Pinned as a set, not individually: a custom age recipient implements traits
+# from `age` using `age_core`'s re-exported `hpke`/`rand`/`secrecy` types, so any
+# version drift between them is a type error at the trait boundary rather than a
+# compilable mismatch. Update all of these together, against the versions the
+# chosen `age` release resolves to.
+age = "=0.12.1"
+age-core = "=0.12.0"
+base64 = "0.22"
+hkdf = "0.12"
+hpke = "0.12"
+ml-kem = { version = "0.2", features = ["deterministic"] }
+rand = "0.8"
+sha3 = "0.10"
+typenum = "1"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
