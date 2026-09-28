@@ -25,8 +25,8 @@ use crate::globals::{
 };
 use crate::tools::{
     ARG_DBNAME, ARG_HOST, ARG_NO_PASSWORD, ARG_PORT, ARG_USERNAME, CREATEDB, PG_DUMP, PG_DUMPALL,
-    PG_RESTORE, PSQL, PSQL_QUERY_ARGS, base_command, cluster_command, isolated_command, run, tool,
-    tool_version,
+    PG_RESTORE, PSQL, PSQL_QUERY_ARGS, base_command, cluster_command, isolated_command, run,
+    run_streaming, tool, tool_version,
 };
 use anyhow::{Context, Result, bail};
 use backup_application::{DatabaseAdapter, EngineInfo};
@@ -35,6 +35,7 @@ use backup_domain::{
     RestoreSections, RestoreSecurityPolicy, SUPPORTED_MAJOR_RANGE, SUPPORTED_MAJORS, Source,
 };
 use std::fs;
+use std::io::Read;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::time::Duration;
@@ -100,24 +101,21 @@ impl DatabaseAdapter for PostgresAdapter {
         })
     }
 
-    fn dump_to(
+    fn dump_stream(
         &self,
         source: &Source,
-        output: &Path,
         options: &DumpOptions,
         timeout: Duration,
+        consume: &mut dyn FnMut(&mut dyn Read) -> Result<()>,
     ) -> Result<()> {
         let dump = tool(source, PG_DUMP)?;
         let mut command = base_command(&dump, source);
         for argument in dump_arguments(options)? {
             command.arg(argument);
         }
-        command.arg(format!("--file={}", output.display()));
-        let result = run(command, timeout, None).context("run pg_dump")?;
-        if result.stderr.iter().any(|b| !b.is_ascii_whitespace()) {
-            bail!("pg_dump emitted a warning; artifact was not published");
-        }
-        Ok(())
+        // No `--file` argument: pg_dump writes the archive to its standard output, and
+        // the caller's sink is the only thing that ever holds it.
+        run_streaming(command, PG_DUMP, timeout, consume)
     }
 
     fn resolve_selection(
@@ -230,20 +228,20 @@ impl DatabaseAdapter for PostgresAdapter {
         Ok(selection)
     }
 
-    fn dump_globals(&self, source: &Source, output: &Path, timeout: Duration) -> Result<()> {
+    fn dump_globals_stream(
+        &self,
+        source: &Source,
+        timeout: Duration,
+        consume: &mut dyn FnMut(&mut dyn Read) -> Result<()>,
+    ) -> Result<()> {
         let dumpall = tool(source, PG_DUMPALL)?;
         let mut command = cluster_command(&dumpall, source);
-        // --no-role-passwords keeps password verifiers out of the artifact;
-        // plaintext artifacts are development-only until M4 encryption.
+        // --no-role-passwords is what keeps password verifiers out of the artifact; it
+        // is the reason in both modes, encrypted or not.
         // --roles-only avoids tablespaces and database attributes, which
         // belong to later cluster-object milestones.
         command.args(["--roles-only", "--no-role-passwords", "--no-sync"]);
-        command.arg(format!("--file={}", output.display()));
-        let result = run(command, timeout, None).context("run pg_dumpall globals export")?;
-        if result.stderr.iter().any(|b| !b.is_ascii_whitespace()) {
-            bail!("pg_dumpall emitted a warning; artifact was not published");
-        }
-        Ok(())
+        run_streaming(command, PG_DUMPALL, timeout, consume)
     }
 
     fn inspect_archive(

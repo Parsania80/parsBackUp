@@ -15,6 +15,13 @@ artifacts/<opaque-uuid>/
 
 `payload.age` is a binary `age-encryption.org/v1` file whose plaintext is one PostgreSQL `pg_dump -Fc` archive. `manifest.age` is a separate such file whose plaintext is a UTF-8 JSON manifest. Both encrypt to the configured recipient. Age's Rust implementation supports streaming and requires finishing the stream writer to make a complete decryptable file. [Age crate](https://docs.rs/age/latest/age/), [stream writer](https://docs.rs/age/latest/age/struct.Encryptor.html).
 
+**The M4a development artifact is this same stream carried by the M1 directory shape.** Its `format` tag is `m4a-development-age`, its manifest stays a plaintext JSON file, and only the two payload names change: `payload.age`, plus `globals.age` when `export_globals` is on. A store configured without an `[encryption]` block keeps writing `payload.dump` and `globals.sql` under `m1-development-plaintext`, so encryption is a property of the deployment rather than of the format. Two manifest fields carry what a ciphertext cannot reveal:
+
+- `recipient_suite` names the suite the payload was sealed under, and a reader must refuse a suite it is not allowed to open *before* handing anything to `pg_restore`.
+- `payload_plaintext_bytes` records the size the payload decrypts to, which is the bound the decrypt itself runs under; a payload that inflates past its own manifest is refused while streaming. It is recorded because the published size no longer tells anyone how much plaintext to expect.
+
+Decrypted bytes exist only transiently, in a mode-0700 `scratch/` directory under the storage root that the operation which needed them owns and removes; like `staging/`, it is purged at startup. An artifact directory holding both `payload.dump` and `payload.age` is refused rather than resolved by guesswork: the manifest's `format` names the files it binds, so a stray sibling means either a tampered manifest or a dump that leaked plaintext.
+
 The recipient stanza is ours and the authenticated stream is age's; this is the container decision recorded in [ADR 0001](../architecture/adr-0001-foundations.md). A v1 artifact carries exactly one recipient stanza:
 
 ```text

@@ -1,7 +1,7 @@
 use crate::profile::{Profile, SelectionMode};
 use crate::protocol::{
-    ARCHIVE_COMPRESSION, ARCHIVE_FORMAT, BACKUP_STATUS, DEV_FORMAT, DIGEST_HEX_LEN, FIXTURE_PREFIX,
-    SUPPORTED_MAJORS, VERIFY_ARCHIVE, VERIFY_RESTORE_TESTED,
+    AGE_FORMAT, ARCHIVE_COMPRESSION, ARCHIVE_FORMAT, BACKUP_STATUS, DEV_FORMAT, DIGEST_HEX_LEN,
+    FIXTURE_PREFIX, RECIPIENT_SUITES, SUPPORTED_MAJORS, VERIFY_ARCHIVE, VERIFY_RESTORE_TESTED,
 };
 use crate::selection::ResolvedSelection;
 use anyhow::{Result, bail};
@@ -109,11 +109,19 @@ pub struct DevelopmentManifest {
     /// pre-M3 artifact is.
     pub scope: Option<ArtifactScope>,
     pub toc_sha256: Option<String>,
+    /// The suite the payload key was agreed under, or absent for an artifact whose
+    /// payload is plaintext. A reader must take this from the manifest rather than
+    /// guess from file sizes or stanza counts.
+    pub recipient_suite: Option<String>,
+    /// Plaintext archive bytes, recorded so a restore can bound how much it is
+    /// willing to write before it has decrypted anything. Present exactly when
+    /// `recipient_suite` is.
+    pub payload_plaintext_bytes: Option<u64>,
 }
 
 impl DevelopmentManifest {
     pub fn validate_shape(&self) -> Result<()> {
-        if self.format != DEV_FORMAT
+        if (self.format != DEV_FORMAT && self.format != AGE_FORMAT)
             || !self.synthetic_only
             || !self.database.starts_with(FIXTURE_PREFIX)
             || !SUPPORTED_MAJORS.contains(&self.source_major)
@@ -125,6 +133,23 @@ impl DevelopmentManifest {
             || !self.sha256.bytes().all(|b| b.is_ascii_hexdigit())
         {
             bail!("invalid development manifest");
+        }
+        // The format tag and the recorded suite are two views of one fact, so a
+        // manifest that disagrees with itself is corrupt rather than ambiguous.
+        let encrypted = self.format == AGE_FORMAT;
+        if encrypted != self.recipient_suite.is_some() {
+            bail!("an artifact records a recipient suite exactly when its payload is encrypted");
+        }
+        if encrypted != self.payload_plaintext_bytes.is_some() {
+            bail!("an encrypted artifact must record the plaintext size it decrypts to");
+        }
+        if let Some(suite) = &self.recipient_suite
+            && !RECIPIENT_SUITES.contains(&suite.as_str())
+        {
+            bail!("manifest records unsupported recipient suite {suite}");
+        }
+        if self.payload_plaintext_bytes == Some(0) {
+            bail!("manifest plaintext payload size must not be zero");
         }
         let globals_present = self.globals_sha256.is_some() || self.globals_size_bytes.is_some();
         if self.security_globals != globals_present {
@@ -165,6 +190,51 @@ mod tests {
     use super::*;
     use crate::fixture;
     use crate::is_safe_created_schema_name;
+    use backup_crypto::protocol::SUITE_HYBRID;
+
+    /// A manifest states its encryption instead of leaving it to be inferred: the
+    /// format tag, the suite, and the recorded plaintext size are one fact written in
+    /// three places, so a manifest that disagrees with itself must not load.
+    #[test]
+    fn encrypted_manifests_record_the_suite_they_were_written_with() {
+        let mut manifest = fixture::manifest_fixture();
+        assert!(manifest.validate_shape().is_ok());
+
+        manifest.format = AGE_FORMAT.to_string();
+        let error = manifest.validate_shape().unwrap_err().to_string();
+        assert!(error.contains("recipient suite"), "{error}");
+
+        manifest.recipient_suite = Some(SUITE_HYBRID.to_string());
+        let error = manifest.validate_shape().unwrap_err().to_string();
+        assert!(error.contains("plaintext size"), "{error}");
+
+        manifest.payload_plaintext_bytes = Some(4096);
+        assert!(manifest.validate_shape().is_ok());
+
+        manifest.payload_plaintext_bytes = Some(0);
+        assert!(manifest.validate_shape().is_err());
+        manifest.payload_plaintext_bytes = Some(4096);
+
+        // A suite outside the accepted list is refused by name rather than worked
+        // around by guessing from key sizes. `x25519` is age's classical suite: legal
+        // in the contract's vocabulary, never written by this build.
+        manifest.recipient_suite = Some("x25519".to_string());
+        let error = manifest.validate_shape().unwrap_err().to_string();
+        assert!(error.contains("x25519"), "{error}");
+
+        // The plaintext format cannot carry a suite either.
+        let mut marked = fixture::manifest_fixture();
+        marked.recipient_suite = Some(SUITE_HYBRID.to_string());
+        assert!(marked.validate_shape().is_err());
+    }
+
+    /// The suite names a manifest may record and the names the crypto adapter writes
+    /// must not drift apart: an unlisted suite makes every new artifact unreadable.
+    #[test]
+    fn recorded_suites_are_the_suites_the_crypto_adapter_writes() {
+        assert_eq!(RECIPIENT_SUITES.len(), 1);
+        assert_eq!(RECIPIENT_SUITES[0], SUITE_HYBRID);
+    }
 
     #[test]
     fn manifest_globals_and_verification_fields_are_consistent() {

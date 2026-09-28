@@ -1,11 +1,12 @@
 use anyhow::{Context, Result, bail};
 use backup_domain::{
-    ARCHIVE_COMPRESSION, ARCHIVE_FORMAT, ArtifactScope, BACKUP_STATUS, Config, DEV_FORMAT,
-    DevelopmentManifest, DumpOptions, Profile, ResolvedSelection, RestorePlan, RestoreSections,
-    RestoreSecurityPolicy, Source, VERIFICATION_NONE, VERIFY_ARCHIVE, VERIFY_CHECKSUM,
-    VERIFY_RESTORE_TESTED,
+    AGE_FORMAT, ARCHIVE_COMPRESSION, ARCHIVE_FORMAT, ArtifactScope, BACKUP_STATUS, Config,
+    DEV_FORMAT, DevelopmentManifest, DumpOptions, Profile, ResolvedSelection, RestorePlan,
+    RestoreSections, RestoreSecurityPolicy, Source, VERIFICATION_NONE, VERIFY_ARCHIVE,
+    VERIFY_CHECKSUM, VERIFY_RESTORE_TESTED,
 };
 use sha2::Digest as _;
+use std::io::{self, Read, Write};
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
@@ -30,14 +31,28 @@ pub trait DatabaseAdapter {
         profile: &Profile,
         timeout: Duration,
     ) -> Result<ResolvedSelection>;
-    fn dump_to(
+    /// Runs `pg_dump` and hands its standard output to `consume`.
+    ///
+    /// There is deliberately no output path here: the adapter that talks to
+    /// PostgreSQL does not get to decide whether plaintext reaches a disk, and the
+    /// only way to make that a property of the tool rather than of each call site is
+    /// to keep the bytes in a stream the caller owns. A dump that fails or warns
+    /// returns an error before `consume` has been given anything to finish.
+    fn dump_stream(
         &self,
         source: &Source,
-        output: &Path,
         options: &DumpOptions,
         timeout: Duration,
+        consume: &mut dyn FnMut(&mut dyn Read) -> Result<()>,
     ) -> Result<()>;
-    fn dump_globals(&self, source: &Source, output: &Path, timeout: Duration) -> Result<()>;
+    /// The `pg_dumpall` equivalent of [`DatabaseAdapter::dump_stream`], for the
+    /// cluster role metadata.
+    fn dump_globals_stream(
+        &self,
+        source: &Source,
+        timeout: Duration,
+        consume: &mut dyn FnMut(&mut dyn Read) -> Result<()>,
+    ) -> Result<()>;
     /// Returns the archive table of contents, one entry per line.
     fn inspect_archive(
         &self,
@@ -84,6 +99,37 @@ pub trait StageHandle {
     fn globals_path(&self) -> Option<&Path>;
 }
 
+/// What one staged file holds once its writer is finished.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StagedBytes {
+    /// Plaintext bytes absorbed, which for an encrypted file is not the number of
+    /// bytes published.
+    pub plaintext_bytes: u64,
+    /// The recipient suite the bytes were sealed under, or `None` when the store
+    /// published them as plaintext.
+    pub recipient_suite: Option<&'static str>,
+}
+
+/// The writer for one staged file.
+///
+/// The store, not the service, decides whether the bytes land as plaintext or as an
+/// authenticated ciphertext, because the store is what an attacker can read. This is
+/// the only place the two cases differ, and both must be finished before publication:
+/// a stream that was never completed leaves nothing publishable behind.
+pub trait PayloadSink: Write {
+    /// Completes the stream and reports what was staged. Publishing a stage whose
+    /// sink was not finished must fail.
+    fn finish(&mut self) -> Result<StagedBytes>;
+}
+
+/// A file a PostgreSQL client tool may be pointed at, as plaintext.
+///
+/// The implementor owns any temporary decrypted copy behind that path and removes it
+/// on drop, so a restore cannot leave plaintext in the artifact store.
+pub trait PlaintextView {
+    fn path(&self) -> &Path;
+}
+
 pub trait ArtifactHandle {
     fn id(&self) -> Uuid;
     fn manifest(&self) -> &DevelopmentManifest;
@@ -94,14 +140,33 @@ pub trait ArtifactHandle {
 pub trait ArtifactStore {
     type Stage: StageHandle;
     type Artifact: ArtifactHandle;
+    type Plaintext: PlaintextView;
 
     fn begin(&self, id: Uuid, options: &WriteOptions) -> Result<Self::Stage>;
+    /// The writer for the staged payload file.
+    ///
+    /// `'a` is shared between the store and the stage: sealing a stream also marks the
+    /// stage publishable, so the sink has to outlive the call while the stage does.
+    fn payload_sink<'a>(&'a self, stage: &'a Self::Stage) -> Result<Box<dyn PayloadSink + 'a>>;
+    /// The writer for the staged globals file, when the stage declares one.
+    fn globals_sink<'a>(&'a self, stage: &'a Self::Stage) -> Result<Box<dyn PayloadSink + 'a>>;
     fn measure(&self, stage: &Self::Stage) -> Result<(u64, String)>;
     fn measure_globals(&self, stage: &Self::Stage) -> Result<(u64, String)>;
     fn publish(&self, stage: Self::Stage, manifest: &DevelopmentManifest) -> Result<()>;
     fn list(&self) -> Result<Vec<DevelopmentManifest>>;
     fn inspect(&self, id: Uuid) -> Result<DevelopmentManifest>;
     fn open(&self, id: Uuid) -> Result<Self::Artifact>;
+    /// The payload as a plaintext file, decrypting it into private storage when the
+    /// artifact is an age ciphertext.
+    fn plaintext_payload(&self, artifact: &Self::Artifact) -> Result<Self::Plaintext>;
+    /// The staged payload as plaintext, for the table-of-contents digest taken before
+    /// publication. A stage holds no manifest yet, so the caller's own recorded
+    /// plaintext size is the only bound available; this view is bounded by the
+    /// format's own limit instead.
+    fn plaintext_staged_payload(&self, stage: &Self::Stage) -> Result<Self::Plaintext>;
+    /// The globals file as plaintext, same contract as
+    /// [`ArtifactStore::plaintext_payload`].
+    fn plaintext_globals(&self, artifact: &Self::Artifact) -> Result<Self::Plaintext>;
     fn rewrite_manifest(
         &self,
         artifact: &Self::Artifact,
@@ -221,34 +286,60 @@ impl<E: DatabaseAdapter, S: ArtifactStore> BackupService<E, S> {
                 with_globals: config.export_globals,
             },
         )?;
-        self.engine
-            .dump_to(&config.source, stage.payload_path(), &options, timeout)
-            .context("PostgreSQL dump failed; staged artifact was not published")?;
+        let staged = {
+            let mut payload_sink = self.store.payload_sink(&stage)?;
+            self.engine
+                .dump_stream(&config.source, &options, timeout, &mut |stream| {
+                    io::copy(stream, &mut payload_sink)?;
+                    Ok(())
+                })
+                .context("PostgreSQL dump failed; staged artifact was not published")?;
+            payload_sink
+                .finish()
+                .context("payload stream was never finished; staged artifact was not published")?
+        };
+        // The published file is the ciphertext, so its size cannot prove the dump
+        // produced anything: an empty archive still encrypts to an age header.
+        if staged.plaintext_bytes == 0 {
+            bail!("pg_dump produced an empty archive");
+        }
+        let inspected = self.store.plaintext_staged_payload(&stage)?;
         let toc = self
             .engine
-            .inspect_archive(&config.source, stage.payload_path(), timeout)
+            .inspect_archive(&config.source, inspected.path(), timeout)
             .context("PostgreSQL archive inspection failed; artifact was not published")?;
         let toc_sha256 = toc_digest(&toc)?;
         let (size_bytes, sha256) = self.store.measure(&stage)?;
         let mut globals_sha256 = None;
         let mut globals_size_bytes = None;
         if config.export_globals {
+            let mut globals_sink = self.store.globals_sink(&stage)?;
             self.engine
-                .dump_globals(
-                    &config.source,
-                    stage
-                        .globals_path()
-                        .context("staged globals file expected")?,
-                    timeout,
-                )
+                .dump_globals_stream(&config.source, timeout, &mut |stream| {
+                    io::copy(stream, &mut globals_sink)?;
+                    Ok(())
+                })
                 .context("PostgreSQL globals export failed; staged artifact was not published")?;
+            let globals_staged = globals_sink
+                .finish()
+                .context("globals stream was never finished; staged artifact was not published")?;
+            if globals_staged.plaintext_bytes == 0 {
+                bail!("pg_dumpall produced an empty globals file");
+            }
             let (gsize, gsha) = self.store.measure_globals(&stage)?;
             globals_size_bytes = Some(gsize);
             globals_sha256 = Some(gsha);
         }
+        // Whether the artifact is encrypted is a fact the store reported through its
+        // sink, not a flag the service carries: the format tag follows that report.
+        let encrypted = staged.recipient_suite.is_some();
         let created_unix_ms = now_unix_ms()?;
         let manifest = DevelopmentManifest {
-            format: DEV_FORMAT.to_string(),
+            format: if encrypted {
+                AGE_FORMAT.to_string()
+            } else {
+                DEV_FORMAT.to_string()
+            },
             id,
             synthetic_only: true,
             database: config.source.database.clone(),
@@ -269,6 +360,8 @@ impl<E: DatabaseAdapter, S: ArtifactStore> BackupService<E, S> {
             verified_unix_ms: None,
             scope: profile.map(|profile| ArtifactScope::from_profile(profile, &resolved)),
             toc_sha256: Some(toc_sha256),
+            recipient_suite: staged.recipient_suite.map(str::to_string),
+            payload_plaintext_bytes: encrypted.then_some(staged.plaintext_bytes),
         };
         manifest.validate_shape()?;
         self.store.publish(stage, &manifest)?;
@@ -314,9 +407,12 @@ impl<E: DatabaseAdapter, S: ArtifactStore> VerifyService<E, S> {
         let artifact = self.store.open(id)?;
         let manifest = artifact.manifest();
         if level == VERIFY_ARCHIVE {
+            // The tool boundary reads plaintext, so an encrypted artifact is
+            // decrypted into private storage that this scope ends the view of.
+            let payload = self.store.plaintext_payload(&artifact)?;
             let toc = self
                 .engine
-                .inspect_archive(&config.source, artifact.payload_path(), timeout)
+                .inspect_archive(&config.source, payload.path(), timeout)
                 .context("archive table of contents failed to parse")?;
             let digest = toc_digest(&toc)?;
             if let Some(recorded) = &manifest.toc_sha256
@@ -388,13 +484,10 @@ impl<E: DatabaseAdapter, S: ArtifactStore> RestoreService<E, S> {
             bail!("target database already exists; restore only creates a new database");
         }
         if security.roles {
-            let conflicts = self.engine.role_conflicts(
-                &config.source,
-                artifact
-                    .globals_path()
-                    .context("artifact globals file expected")?,
-                timeout,
-            )?;
+            let globals = self.store.plaintext_globals(&artifact)?;
+            let conflicts = self
+                .engine
+                .role_conflicts(&config.source, globals.path(), timeout)?;
             if !conflicts.is_empty() {
                 bail!(
                     "DR role restore refused: these roles already exist in the cluster: {}; use the portable policy or remove them first",
@@ -451,12 +544,10 @@ impl<E: DatabaseAdapter, S: ArtifactStore> RestoreService<E, S> {
         // Step 1 of the DR order: security metadata validated (digest binding
         // happened in open()); re-check role conflicts at execution time.
         if plan.security.roles {
-            let globals = artifact
-                .globals_path()
-                .context("artifact globals file expected")?;
+            let globals = self.store.plaintext_globals(&artifact)?;
             let conflicts = self
                 .engine
-                .role_conflicts(&config.source, globals, timeout)?;
+                .role_conflicts(&config.source, globals.path(), timeout)?;
             if !conflicts.is_empty() {
                 bail!(
                     "DR role restore refused: these roles already exist in the cluster: {}",
@@ -466,7 +557,7 @@ impl<E: DatabaseAdapter, S: ArtifactStore> RestoreService<E, S> {
             // Step 2: roles, attributes, and memberships before any object
             // can be owned by or granted to them.
             self.engine
-                .apply_globals(&config.source, globals, timeout)
+                .apply_globals(&config.source, globals.path(), timeout)
                 .context("globals restore failed; cluster roles may be partially applied")?;
         }
         // Step 3: fresh target database; existence re-checked here.
@@ -491,11 +582,13 @@ impl<E: DatabaseAdapter, S: ArtifactStore> RestoreService<E, S> {
             }
         }
         // Steps 4-6: schema/data, then ownership and privileges from the
-        // archive's own ALTER OWNER/GRANT entries (skipped per policy).
+        // archive's own ALTER OWNER/GRANT entries (skipped per policy). The view is
+        // held for the length of the restore and its plaintext is removed after.
+        let payload = self.store.plaintext_payload(&artifact)?;
         let restored = self.engine.restore_to_database(
             &config.source,
             &plan.target_database,
-            artifact.payload_path(),
+            payload.path(),
             plan.security,
             plan.sections,
             timeout,

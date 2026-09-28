@@ -33,6 +33,8 @@ artifacts/<uuid>/complete      # publication marker
 
 M1 uses mode 0700 directories and mode 0600 created files. An interrupted process can leave a staging directory or an artifact without a completion marker; these are not listed as complete. M1 does not yet provide automatic stale-stage reconciliation, encrypted storage, restore execution, retention, or a daemon.
 
+A store configured with `[encryption]` keeps this shape but names its streams `payload.age` and `globals.age`, records `m4a-development-age` with the hybrid recipient suite in the manifest, and decrypts only into a transient mode-0700 `scratch/` directory; see [artifact v1](../backup-format/manifest-v1.md).
+
 ## Validation boundary
 
 Run the [fixture plan](../postgres/fixture-plan.md) on PostgreSQL 16–18 before claiming all supported majors. A full same-major restore into a fresh disposable database with [`assertions.sql`](../../tests/fixtures/postgres/assertions.sql) is the M1 artifact smoke test, but restore orchestration belongs to M2. The pre-M1 PostgreSQL 15 SQL smoke test does not satisfy the support matrix.

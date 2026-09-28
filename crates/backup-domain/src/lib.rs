@@ -18,7 +18,7 @@ mod selection;
 mod fixture;
 
 pub use artifact::{ArtifactScope, DevelopmentManifest};
-pub use config::{Config, Source, Storage};
+pub use config::{Config, Encryption, Source, Storage};
 pub use profile::{Profile, SelectionMode, is_safe_created_schema_name};
 pub use restore::{RestorePlan, RestoreSections, RestoreSecurityPolicy};
 pub use selection::{DanglingReference, DumpOptions, ResolvedSelection};

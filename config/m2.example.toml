@@ -3,8 +3,9 @@
 timeout_seconds = 300
 
 # Export cluster role, attribute, and membership metadata with each backup.
-# globals.sql is plaintext until M4 encryption and contains no password
-# verifiers: the export uses pg_dumpall --roles-only --no-role-passwords.
+# This store has no [encryption] block, so globals.sql is written in plaintext;
+# configuring [encryption] seals it as globals.age instead. Either way it contains
+# no password verifiers: the export uses pg_dumpall --roles-only --no-role-passwords.
 export_globals = true
 
 [source]

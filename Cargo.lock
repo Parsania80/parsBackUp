@@ -187,6 +187,7 @@ name = "backup-domain"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "backup-crypto",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -199,6 +200,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "backup-application",
+ "backup-crypto",
  "backup-domain",
  "serde_json",
  "sha2 0.10.9",

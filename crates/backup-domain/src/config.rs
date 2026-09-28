@@ -11,11 +11,29 @@ pub struct Config {
     pub storage: Storage,
     #[serde(default)]
     pub export_globals: bool,
+    /// Absent leaves artifacts plaintext, which is what a synthetic-only
+    /// deployment runs with. Present turns every write into an age stream and every
+    /// read into a decrypt, so a deployment opts in per store rather than per
+    /// backup: there is no flag that can be forgotten on one run.
+    #[serde(default)]
+    pub encryption: Option<Encryption>,
     /// Configured with `[[profile]]` blocks in the service TOML.
     #[serde(default, rename = "profile")]
     pub profiles: Vec<Profile>,
     #[serde(default = "default_timeout")]
     pub timeout_seconds: u64,
+}
+
+/// The two halves of the hybrid key pair, held as service-owned files. They are
+/// configured separately because a host that may only write backups needs the
+/// recipient and nothing else.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Encryption {
+    /// Private identity key file, mode 0600, required to verify or restore.
+    pub identity_file: PathBuf,
+    /// Public recipient key file, required to write a backup.
+    pub recipient_file: PathBuf,
 }
 
 fn default_timeout() -> u64 {
@@ -59,6 +77,20 @@ impl Config {
             && !path.is_absolute()
         {
             bail!("password_file must be an absolute path");
+        }
+        if let Some(encryption) = &self.encryption {
+            for path in [&encryption.identity_file, &encryption.recipient_file] {
+                if !path.is_absolute() {
+                    bail!("encryption key files must be absolute paths");
+                }
+                if path.starts_with(&self.storage.root) {
+                    bail!(
+                        "encryption key files must live outside the artifact store; {} is inside {}",
+                        path.display(),
+                        self.storage.root.display()
+                    );
+                }
+            }
         }
         if !(1..=3600).contains(&self.timeout_seconds) {
             bail!("timeout_seconds must be between 1 and 3600");
@@ -105,7 +137,31 @@ impl Config {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use crate::fixture;
+
+    /// Encryption is opt-in per store, and its key files have to live where a
+    /// leaked artifact store cannot reach them.
+    #[test]
+    fn encryption_configuration_names_two_absolute_files_outside_the_store() {
+        let mut base = fixture::config("backupctl_fixture_m1");
+        assert!(base.encryption.is_none());
+        base.encryption = Some(Encryption {
+            identity_file: PathBuf::from("/etc/backupctl/identity.key"),
+            recipient_file: PathBuf::from("/etc/backupctl/recipient.key"),
+        });
+        assert!(base.validate().is_ok());
+
+        let mut inside = base.clone();
+        inside.encryption.as_mut().unwrap().identity_file =
+            PathBuf::from("/tmp/backupctl-fixture-test/identity.key");
+        let error = inside.validate().unwrap_err().to_string();
+        assert!(error.contains("outside the artifact store"), "{error}");
+
+        let mut relative = base.clone();
+        relative.encryption.as_mut().unwrap().recipient_file = PathBuf::from("recipient.key");
+        assert!(relative.validate().is_err());
+    }
 
     #[test]
     fn only_local_fixture_sources_are_accepted() {

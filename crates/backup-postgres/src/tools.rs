@@ -10,6 +10,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -179,4 +180,158 @@ fn read_bounded(mut reader: impl Read) -> Result<Vec<u8>> {
         captured.extend_from_slice(&buffer[..n.min(remaining)]);
     }
     Ok(captured)
+}
+
+/// Runs a tool whose standard output *is* the artifact, streaming it into `consume`.
+///
+/// Unlike [`run`], nothing is buffered: the bytes go straight to a caller-owned sink, so
+/// a dump of any size costs one pipe buffer of memory. The child handle moves to a
+/// watchdog thread because a blocked pipe read cannot be interrupted from the consuming
+/// thread, and only a second thread can kill a tool that has stopped producing output.
+/// Closing the read end once `consume` returns makes a tool that is still writing fail on
+/// its next write instead of waiting out the deadline.
+pub(crate) fn run_streaming(
+    mut command: Command,
+    name: &'static str,
+    timeout: Duration,
+    consume: &mut dyn FnMut(&mut dyn Read) -> Result<()>,
+) -> Result<()> {
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("spawn {name}"))?;
+    let mut stdout = child.stdout.take().context("capture stdout")?;
+    let stderr = child.stderr.take().context("capture stderr")?;
+    let err_reader = thread::spawn(move || read_bounded(stderr));
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let deadline = Instant::now() + timeout;
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    let _ = sender.send(Ok(status));
+                    return;
+                }
+                Ok(None) => {
+                    if Instant::now() >= deadline {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        let _ = sender.send(Err(anyhow::anyhow!(
+                            "{name} timed out; output was not used"
+                        )));
+                        return;
+                    }
+                    thread::sleep(Duration::from_millis(50));
+                }
+                Err(error) => {
+                    let _ = sender.send(Err(error).context("wait for PostgreSQL client tool"));
+                    return;
+                }
+            }
+        }
+    });
+    let streamed = consume(&mut stdout);
+    drop(stdout);
+    let status = receiver
+        .recv()
+        .map_err(|_| anyhow::anyhow!("{name} did not report an exit status"))?;
+    let stderr = err_reader
+        .join()
+        .map_err(|_| anyhow::anyhow!("stderr reader failed"))??;
+    // The sink failing is the operator's problem; the tool exiting on a closed pipe is
+    // its consequence, so the first error is the one worth reporting.
+    streamed?;
+    let status = status?;
+    if !status.success() {
+        bail!("{name} failed with status {status}; output withheld to protect data");
+    }
+    if stderr.iter().any(|byte| !byte.is_ascii_whitespace()) {
+        bail!("{name} emitted a warning; artifact was not published");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The subject here is the pipe, not PostgreSQL, so `/bin/sh` stands in for a client
+    /// tool: it is the only way to test a watchdog that has to kill a process while
+    /// another thread is blocked reading it.
+    fn shell(script: &str) -> Command {
+        let mut command = Command::new("/bin/sh");
+        command.arg("-c").arg(script);
+        command
+    }
+
+    fn collect(script: &str, timeout: Duration) -> Result<Vec<u8>> {
+        let mut collected = Vec::new();
+        run_streaming(shell(script), "sh", timeout, &mut |stream| {
+            stream.read_to_end(&mut collected)?;
+            Ok(())
+        })?;
+        Ok(collected)
+    }
+
+    #[test]
+    fn streaming_is_not_bounded_by_the_capture_limit() {
+        // Thirty times `MAX_CAPTURE`: a dump the size of a real database has to survive
+        // this path, so the bound that protects captured output must not apply to it.
+        let bytes = collect(
+            "head -c 2097152 /dev/zero | tr '\\0' 'x'",
+            Duration::from_secs(30),
+        )
+        .unwrap();
+        assert_eq!(bytes.len(), 2 * 1024 * 1024);
+        assert!(bytes.iter().all(|byte| *byte == b'x'));
+    }
+
+    #[test]
+    fn a_refusing_consumer_is_the_reported_failure() {
+        // The consumer stops after one byte; the tool then dies on a closed pipe and
+        // exits nonzero, which is a consequence of the refusal rather than its cause.
+        let error = run_streaming(
+            shell("yes x"),
+            "sh",
+            Duration::from_secs(10),
+            &mut |stream| {
+                let mut byte = [0_u8; 1];
+                let _ = stream.read(&mut byte);
+                bail!("sink refused the stream");
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert_eq!(error, "sink refused the stream");
+    }
+
+    #[test]
+    fn a_stalled_producer_is_killed_at_the_deadline() {
+        // `exec` keeps the killed process the one holding the pipe open; a plain `sleep`
+        // would leave a grandchild writing to it past its own parent's death.
+        let started = Instant::now();
+        let error = collect("echo started; exec sleep 5", Duration::from_millis(300))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("timed out"), "{error}");
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "the deadline must cut the tool off, not the sleep"
+        );
+    }
+
+    #[test]
+    fn output_on_stderr_refuses_the_whole_stream() {
+        // A tool that warns about the bytes it produced cannot vouch for them, however
+        // complete those bytes look.
+        let error = collect("echo payload; echo noisy >&2", Duration::from_secs(10))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("emitted a warning; artifact was not published"),
+            "{error}"
+        );
+    }
 }

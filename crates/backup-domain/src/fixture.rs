@@ -22,6 +22,7 @@ pub(crate) fn config(database: &str) -> Config {
             root: PathBuf::from("/tmp/backupctl-fixture-test"),
         },
         export_globals: false,
+        encryption: None,
         timeout_seconds: 30,
         profiles: Vec::new(),
     }
@@ -81,5 +82,7 @@ pub(crate) fn manifest_fixture() -> DevelopmentManifest {
         verified_unix_ms: None,
         scope: None,
         toc_sha256: None,
+        recipient_suite: None,
+        payload_plaintext_bytes: None,
     }
 }

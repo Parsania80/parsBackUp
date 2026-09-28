@@ -13,6 +13,8 @@
 //! - **A finished stream or nothing.** `age`'s `StreamWriter::finish` writes the final
 //!   authenticated chunk; anything that stops before that point leaves a ciphertext
 //!   that fails to decrypt, which is the correct outcome for an incomplete backup.
+//!   [`EncryptSink`] exists so a caller that receives plaintext a chunk at a time
+//!   rather than as a reader still has to pass that step explicitly.
 
 use std::io::{self, Read};
 
@@ -46,20 +48,69 @@ where
     R: Read,
     W: io::Write,
 {
-    let encryptor = Encryptor::with_recipients(std::iter::once(recipient as &dyn Recipient))
-        .context("age could not wrap the file key for the configured recipient")?;
-    let mut stream = encryptor
-        .wrap_output(ciphertext)
-        .context("age header write failed")?;
-    let plaintext_bytes =
-        io::copy(&mut plaintext, &mut stream).context("payload stream failed while encrypting")?;
-    stream
-        .finish()
-        .context("age stream could not be finished; the ciphertext is truncated")?;
-    Ok(StreamOutcome {
-        plaintext_bytes,
-        suite: SUITE_HYBRID,
-    })
+    let mut sink = EncryptSink::new(recipient, ciphertext)?;
+    io::copy(&mut plaintext, &mut sink).context("payload stream failed while encrypting")?;
+    let (_ciphertext, outcome) = sink.finish()?;
+    Ok(outcome)
+}
+
+/// An [`encrypt`] whose plaintext arrives in pieces the caller does not own.
+///
+/// `pg_dump` hands over its standard output as a stream a caller can only read from
+/// inside its own loop, so the whole-reader form above does not fit. This type is the
+/// same age stream with an explicit finish step: dropping a sink that was never
+/// finished leaves a ciphertext that will not decrypt, so an interrupted dump cannot
+/// be mistaken for a backup.
+pub struct EncryptSink<W: io::Write> {
+    stream: age::stream::StreamWriter<W>,
+    plaintext_bytes: u64,
+}
+
+impl<W: io::Write> EncryptSink<W> {
+    /// Opens the stream, writing the age header — including the single recipient
+    /// stanza — into `ciphertext` before returning.
+    pub fn new(recipient: &HybridRecipient, ciphertext: W) -> Result<Self> {
+        let encryptor = Encryptor::with_recipients(std::iter::once(recipient as &dyn Recipient))
+            .context("age could not wrap the file key for the configured recipient")?;
+        let stream = encryptor
+            .wrap_output(ciphertext)
+            .context("age header write failed")?;
+        Ok(Self {
+            stream,
+            plaintext_bytes: 0,
+        })
+    }
+
+    /// Writes the final authenticated chunk and hands back the inner writer, so the
+    /// caller that owns the file can fsync it before publishing.
+    pub fn finish(self) -> Result<(W, StreamOutcome)> {
+        let Self {
+            stream,
+            plaintext_bytes,
+        } = self;
+        let ciphertext = stream
+            .finish()
+            .context("age stream could not be finished; the ciphertext is truncated")?;
+        Ok((
+            ciphertext,
+            StreamOutcome {
+                plaintext_bytes,
+                suite: SUITE_HYBRID,
+            },
+        ))
+    }
+}
+
+impl<W: io::Write> io::Write for EncryptSink<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let written = self.stream.write(buf)?;
+        self.plaintext_bytes += written as u64;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.stream.flush()
+    }
 }
 
 /// Decrypts an artifact payload with the bound from [`decrypt_with_limit`] set to
@@ -117,6 +168,7 @@ mod tests {
     use super::*;
     use age::x25519;
     use sha2::{Digest as _, Sha256};
+    use std::io::Write as _;
 
     /// Deterministic, high-entropy body: every chunk boundary gets exercised without
     /// the expected digest becoming a magic constant in the test.
@@ -154,6 +206,47 @@ mod tests {
             assert_eq!(opened.plaintext_bytes, len as u64);
             assert_eq!(opened.suite, SUITE_HYBRID);
         }
+    }
+
+    /// A dump is absorbed a chunk at a time, so the incremental form must round trip
+    /// whatever chunk sizes the producer happens to use — and a sink dropped without
+    /// `finish` must stay undecryptable instead of delivering a plausible tail.
+    #[test]
+    fn an_unfinished_incremental_sink_is_not_a_backup() {
+        let identity = HybridIdentity::generate();
+        let recipient = identity.to_recipient();
+        let plaintext = pseudo_random(200_000);
+
+        let mut ciphertext = Vec::new();
+        {
+            let mut sink = EncryptSink::new(&recipient, &mut ciphertext).unwrap();
+            for piece in plaintext.chunks(7777) {
+                sink.write_all(piece).unwrap();
+            }
+            let (_written, sealed) = sink.finish().unwrap();
+            assert_eq!(sealed.plaintext_bytes, plaintext.len() as u64);
+            assert_eq!(sealed.suite, SUITE_HYBRID);
+        }
+        let mut recovered = Vec::new();
+        decrypt(&identity, ciphertext.as_slice(), &mut recovered).unwrap();
+        assert_eq!(recovered, plaintext);
+
+        let mut truncated = Vec::new();
+        {
+            let mut sink = EncryptSink::new(&recipient, &mut truncated).unwrap();
+            sink.write_all(&plaintext).unwrap();
+        }
+        assert!(
+            !truncated.is_empty(),
+            "the header is written before any plaintext arrives"
+        );
+        let mut recovered = Vec::new();
+        let error = chain(decrypt(&identity, truncated.as_slice(), &mut recovered).unwrap_err());
+        assert!(
+            recovered.len() < plaintext.len(),
+            "the missing final chunk must not be released"
+        );
+        assert!(error.contains("decrypt"), "{error}");
     }
 
     /// The overhead the spike measured is a property of the format; a change here is

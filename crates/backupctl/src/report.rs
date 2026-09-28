@@ -43,6 +43,12 @@ pub(crate) fn print_backup_created(manifest: &DevelopmentManifest) {
     println!("created synthetic development backup {}", manifest.id);
     println!("database: {}", manifest.database);
     println!("bytes: {}", manifest.size_bytes);
+    // Which of the two payload shapes was written is the first thing an operator
+    // needs to know before deciding where to copy the artifact.
+    match &manifest.recipient_suite {
+        Some(suite) => println!("payload: encrypted with {suite}"),
+        None => println!("payload: plaintext"),
+    }
     if let Some(scope) = &manifest.scope {
         println!("profile: {}", scope.profile);
         println!("resolved schemas: {}", scope.resolved_schemas.join(", "));
@@ -54,9 +60,14 @@ pub(crate) fn print_backup_created(manifest: &DevelopmentManifest) {
     println!(
         "security metadata: {}",
         if manifest.security_globals {
-            "globals.sql (roles and memberships, no password verifiers)"
+            let name = if manifest.recipient_suite.is_some() {
+                "globals.age"
+            } else {
+                "globals.sql"
+            };
+            format!("{name} (roles and memberships, no password verifiers)")
         } else {
-            "none"
+            "none".to_string()
         }
     );
 }
@@ -68,6 +79,16 @@ pub(crate) fn print_inspect(manifest: DevelopmentManifest) {
     println!("source major: {}", manifest.source_major);
     println!("client: {}", manifest.dump_client_version);
     println!("bytes: {}", manifest.size_bytes);
+    println!(
+        "recipient suite: {}",
+        manifest
+            .recipient_suite
+            .as_deref()
+            .unwrap_or("none (plaintext payload)")
+    );
+    if let Some(plaintext_bytes) = manifest.payload_plaintext_bytes {
+        println!("plaintext bytes: {plaintext_bytes}");
+    }
     println!("sha256: {}", manifest.sha256);
     println!("security globals: {}", manifest.security_globals);
     if let Some(scope) = &manifest.scope {

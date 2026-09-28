@@ -33,6 +33,22 @@ fn main() -> ExitCode {
     }
 }
 
+/// Opens the configured store.
+///
+/// Encryption is a property of the configuration rather than of a command: a config
+/// without an `[encryption]` block writes the plaintext artifacts every earlier
+/// milestone expects, and one with it seals every artifact to the configured recipient.
+fn open_store(config: &Config) -> Result<LocalStore> {
+    match &config.encryption {
+        None => LocalStore::new(config.storage.root.clone()),
+        Some(encryption) => LocalStore::with_keys(
+            config.storage.root.clone(),
+            &encryption.identity_file,
+            &encryption.recipient_file,
+        ),
+    }
+}
+
 fn run() -> Result<()> {
     let cli = Cli::parse();
     let json = matches!(cli.output, Output::Json);
@@ -69,7 +85,7 @@ fn run() -> Result<()> {
                 let profile = config.profile(&name)?;
                 // The live probe needs the same wiring as a backup, so a
                 // profile is only truly valid against its configured database.
-                let store = LocalStore::new(config.storage.root.clone())?;
+                let store = open_store(&config)?;
                 let service = BackupService::new(PostgresAdapter, store);
                 let (info, selection) = service.resolve(&config, Some(&name))?;
                 if json {
@@ -89,7 +105,7 @@ fn run() -> Result<()> {
             }
         },
         TopCommand::Backup { command } => {
-            let store = LocalStore::new(config.storage.root.clone())?;
+            let store = open_store(&config)?;
             let service = BackupService::new(PostgresAdapter, store);
             match command {
                 BackupCommand::Create {
@@ -123,9 +139,9 @@ fn run() -> Result<()> {
                             "backup create requires --confirm-synthetic; never use this plaintext format for real data"
                         );
                     }
-                    if config.export_globals && !json {
+                    if config.export_globals && config.encryption.is_none() && !json {
                         eprintln!(
-                            "warning: globals.sql contains cluster role definitions (without password verifiers) and is plaintext until M4"
+                            "warning: globals.sql holds cluster role definitions (never password verifiers) in plaintext; configure [encryption] to seal it"
                         );
                     }
                     let manifest = service.create(&config, profile.as_deref())?;
@@ -154,7 +170,7 @@ fn run() -> Result<()> {
                     }
                 }
                 BackupCommand::Verify { id, level } => {
-                    let store = LocalStore::new(config.storage.root.clone())?;
+                    let store = open_store(&config)?;
                     let service = VerifyService::new(PostgresAdapter, store);
                     let level_name = match level {
                         VerifyLevel::Checksum => VERIFY_CHECKSUM,
@@ -180,7 +196,7 @@ fn run() -> Result<()> {
             }
         }
         TopCommand::Restore { command } => {
-            let store = LocalStore::new(config.storage.root.clone())?;
+            let store = open_store(&config)?;
             let service = RestoreService::new(PostgresAdapter, store);
             match command {
                 RestoreCommand::Plan {

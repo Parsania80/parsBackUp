@@ -9,3 +9,9 @@ serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 uuid.workspace = true
+
+# Test-only, and only to prove the suite names this crate validates are the names the
+# crypto adapter writes. A dependency in the other direction would let the storage
+# layer dictate manifest vocabulary.
+[dev-dependencies]
+backup-crypto = { path = "../backup-crypto" }

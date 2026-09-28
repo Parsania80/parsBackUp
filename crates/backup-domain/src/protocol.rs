@@ -7,6 +7,16 @@
 //! repeated as literals at each use site.
 
 pub const DEV_FORMAT: &str = "m1-development-plaintext";
+/// Manifest format tag for an artifact whose payload and globals files are age
+/// ciphertext. It is deliberately distinct from `DEV_FORMAT`: a reader that cannot
+/// decrypt has to reject the artifact instead of handing a ciphertext to
+/// `pg_restore`, and the format tag is what it branches on.
+pub const AGE_FORMAT: &str = "m4a-development-age";
+/// The recipient suites this build records in a manifest. A reader that refuses any
+/// suite outside this list is the artifact contract's suite-downgrade rule, so the
+/// values must stay equal to the names `backup-crypto` reports — checked by a test
+/// rather than by care.
+pub const RECIPIENT_SUITES: &[&str] = &["mlkem768x25519-v0"];
 pub const FIXTURE_PREFIX: &str = "backupctl_fixture_";
 pub const PLAN_FORMAT: &str = "m3-restore-plan";
 pub const VERIFY_CHECKSUM: &str = "checksum";
