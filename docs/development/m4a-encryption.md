@@ -10,8 +10,9 @@ Encryption is a property of the **deployment**, not of a run: a configuration wi
 artifacts the earlier guides describe. There is deliberately no `--encrypt` or `--no-encrypt`
 flag, because a flag is something a schedule forgets. Adding a `[signing]` block on top of
 this one moves the store to signed [artifact v1](../backup-format/manifest-v1.md), which
-seals the manifest as well and authenticates who wrote the artifact; this guide describes the
-encryption-only shape and what it does and does not prove.
+seals the manifest as well and authenticates who wrote the artifact — that shape is the
+[M4b signed store guide](m4b-signing.md); this guide describes the encryption-only shape and
+what it does and does not prove.
 
 ## Requirements
 
@@ -99,7 +100,8 @@ past its own manifest is refused rather than allowed to fill the disk.
    storage root. Keeping a secret the schedule never uses on the backup host is the cost of
    deferring that port split; it is listed as open work, not as a supported topology. The
    signing pair does have a working split (a host configured with `verifying_key_file` alone
-   is refused on `backup create`), so this limit is specific to `[encryption]`.
+   is refused on `backup create`, and its store never opens the recipient file at all — see
+   the [M4b signed store guide](m4b-signing.md)), so this limit is specific to `[encryption]`.
 4. **One key pair per configuration.** A v1 artifact records `recipient_id` and `signer_id`,
    so a generation is now visible in the bytes, but nothing tracks *which* key directory
    holds the halves for a given artifact: automated generation tracking belongs to M5's

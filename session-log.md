@@ -371,3 +371,57 @@ replay of an older valid signed artifact.
 `tests/m1_docker_smoke.sh`, `m2_`, `m3_` and `m4a_` re-run green on all three with the M4a
 paths still verifying. The documented `key status` secret check was re-run against a freshly
 generated four-file set (`grep -f` on both seeds over the JSON: no match).
+
+## 2026-10-01 — M4b operator guide, written against a live store rather than against the code
+
+`docs/development/m4b-signing.md` is the operator path for a signed store: which configuration
+writes which shape, the four-file `key generate`, the six files of one artifact with their real
+sizes and modes, what each verification level is permitted to touch, the DR host's two refusals
+and its restore, and the refusal text every tampering variant produces. Rather than transcribing
+the matrix's assertions, the guide was written from a **run**: a PostgreSQL 16 container, a writer
+configuration, a verify-only configuration, and one artifact at a time.
+
+**What the run showed that reading the code had not settled.**
+
+- **A mixed signed/unsigned store is now observed, not assumed.** The earlier entry's
+  "untested and stated as such" is closed for the read path. Through a signed configuration an
+  unsigned M4a artifact is listed honestly (`unsigned development artifact; no record without
+  keys`) and then refuses *every* read — `backup verify`, `backup inspect` — with the bare
+  `No such file or directory (os error 2)`, because the signed reader looks for the `public.json`
+  that shape never wrote. Through an `[encryption]`-only configuration the same store refuses at
+  discovery, with a sentence naming the mismatch (`is a signed v1 artifact; the signed reader
+  does, not the manifest.json reader`), and that refusal also stops `backup list`. The asymmetry
+  is documented as a limit with both messages quoted; it is still outside the matrix.
+- **A verify-only host does not need its recipient file.** Moving it away left
+  `backup verify --level signature` and the restore path working, while the identity and the
+  verifying key are both loaded before the store is touched and their absence is a refusal.
+  `key status` is the one command that reads the recipient, so the guide says which file is
+  needed by which command instead of repeating "both age files always".
+- **`key generate` on a verify-only host is a half-write.** The refusal that correctly stops a
+  signing secret from appearing on a DR box happens *after* the age pair has been created, so the
+  directory is left holding an identity and a recipient. Documented as such, because an operator
+  who assumed a clean failure would be reasoning about the wrong directory.
+- **The `--confirm-synthetic` guard, the DR-role refusal against a cluster that already has those
+  roles, and `export_globals = false` producing a five-file artifact** were each reproduced, and
+  the guide quotes the real output rather than a paraphrase.
+- **The two shipped limits reproduce live**, which is the strongest form either one can take in a
+  guide: editing `signature_suite` to `ed25519` in `public.json` prints
+  `origin: ed25519 signature by signer …` at signature level with exit 0 and is refused one step
+  later at checksum level, and deleting `complete` reports an errno and nothing about the marker.
+
+**Files:** new guide; README, [M4a guide](docs/development/m4a-encryption.md),
+[artifact v1](docs/backup-format/manifest-v1.md),
+[key lifecycle](docs/security/key-lifecycle.md) and [threat model](docs/security/threat-model.md)
+link to it, and the threat model's mixed-store paragraph became the observed behavior above.
+`project.md` records the guide in the M4b status bullet.
+
+**Verification performed:** every command block in the guide came from a real run on 2026-10-01
+against PostgreSQL 16 (`pg_dump`/`pg_dumpall`/`pg_restore`/`psql` in a container behind wrappers):
+four-file `key generate`, `key status` on writer and DR shapes, three writes (signed, signed
+without globals, unsigned into the same store), all three levels, `backup list` and `inspect` in
+both directions of the mixed store, a portable plan and run from the verify-only host, a
+wrong-database plan refused on `source_fingerprint` before its target existed, and ten tamper
+variants restored to pristine between cases. Both seeds were grepped out of every captured output
+(`grep -f` over `key status --output json`: no match), no `PGDMP` magic and no fixture role name
+reached the store, and `staging/` and `scratch/` were empty after every refusal. No Rust source
+changed, so `cargo fmt`/`clippy`/`test` results from the freeze stand.

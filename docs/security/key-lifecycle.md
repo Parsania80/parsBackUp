@@ -5,8 +5,10 @@ identity that opens it, and the `ed25519+ml-dsa-65` hybrid signing pair that pro
 it. Both are properties of a store and of its configuration, not per-run flags: encryption is
 on when the configuration carries an `[encryption]` block, signing when it also carries a
 `[signing]` block. See the
-[example config](../../config/m4a.example.toml) for the shape of both blocks and
-[the threat model](threat-model.md) for why both hybrid halves of each pair must be retained.
+[example config](../../config/m4a.example.toml) for the shape of both blocks,
+[the threat model](threat-model.md) for why both hybrid halves of each pair must be retained,
+and the [M4b signed store guide](../development/m4b-signing.md) for the commands these
+procedures assume.
 
 ## The unit is a generation
 

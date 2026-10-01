@@ -8,6 +8,9 @@ which records the two limits this contract ships with. Development-only M1 plain
 **not** v1. This document defines field and validation requirements, not Rust serialization
 code; the field list below is reconciled against `ArtifactManifest` and `PublicHeader` in
 `crates/backup-domain/src/artifact_v1.rs`, and a drift between the two is a contract change.
+The operator path for this shape — the commands, what each verification level may touch, the
+disaster-recovery host's refusal to write, and the exact refusal every tampering variant
+produces — is the [M4b signed store guide](../development/m4b-signing.md).
 
 ## Layout
 
