@@ -141,3 +141,121 @@
 **Verification performed:** the matrix passes on PostgreSQL 16, 17 and 18 (three containers per major, source on an isolated network, target on a fresh port with the test root bind-mounted at the same absolute path). `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings` and `cargo test --workspace` (70 tests, the new one being `generation_creates_a_private_parent`) were clean before the run, and only the shell script and documentation changed after them. The M2 and M3 matrices were not re-run in this increment.
 
 **Scope remaining for M4a:** the key-loss recovery and rotation drill, and the stock-`rage` divergence as a golden CLI assertion. M4b signing must land before any real-data artifact is published.
+
+## 2026-09-28 — M4a: the key lifecycle procedure, and the drill that found a leak
+
+**Request:** write the key-loss recovery and rotation procedure, then run it — the last item on the M4a list.
+
+**Design decision:** a **generation** is one key pair plus the configuration that names it, so rotation means a new key directory and a new config file rather than a rewritten key. This fell out of what was already built instead of adding to it: `key generate` refuses an occupied path, and `LocalStore` loads exactly one pair, so nothing in the codebase can present two generations at once. The alternative considered was an identity *list* in `[encryption]`, which would let one config read a whole store's history; it was declined because it is ergonomics the M5 catalog is meant to own, and it changes a config shape every example file and test asserts. The user asked that keeping one's own secret stay optional; that is what the generation model gives — the pair is a file you point at, not a value the tool holds.
+
+**Implemented:** `docs/security/key-lifecycle.md` (generation model, where the files live, the per-generation ledger, the offline copy, rotation, restoring an older generation, one copy lost versus every copy lost, and what M4a does not provide) and `tests/m4a_key_drill.sh`, which executes that document against real `pg_dump`, `pg_restore` and `psql` on PostgreSQL 16, 17 and 18.
+
+**The leak the drill found:** the run asserts that a refused read leaves `staging/` and `scratch/` empty, and it failed on a *successful* earlier step. `decrypt_to_scratch` created the scratch directory and its `payload.dump`, ran the decryption, and only then constructed the `LocalPlaintext` whose `Drop` removes the directory — so any decryption that failed (wrong identity, or a stream inflating past the recorded plaintext bound) returned its error with a half-written plaintext file still sitting in the storage root. The view now takes ownership of the directory before a single byte is decrypted, and `a_refused_decryption_leaves_no_scratch_behind` publishes an artifact under one pair and reads it with an unrelated pair, asserting the scratch directory is empty afterwards. The startup purge already swept such a directory after a crash, which is why six earlier encrypted tests never saw it: every test they wrote covered the success path.
+
+**What the drill proves, in order:** the offline copy is taken with modes preserved before anything rotates; `key generate` refuses to overwrite the pair it is replacing, so rotation cannot be destructive; generation 2 reports a different recipient than generation 1; both artifacts sit in one store and each configuration refuses the other's artifact at `--level archive`, so the separation is the header, not the directory; deleting the live identity makes *every* command through that configuration fail before it reads the store, including `backup inspect`, because the pair is loaded first; a recovered copy left world-readable is refused until `chmod 600`, which is why the copy step uses `-p`; the generation 1 artifact then restores into a fresh cluster configured only by the offline copy, with the tool reading nothing but `scratch/`; and when the offline copy is deleted too, the manifest is read directly to show the ciphertext still hashes to the recorded digest and is unreadable — the honest shape of total key loss is inert bytes, not corruption, and the current generation is untouched by it.
+
+**A limitation the drill surfaced:** an operator-supplied identity file is loaded happily — writing a seed by hand and running `key status` parses it and derives its recipient — but `key generate` is the only command that publishes a recipient file and it refuses an occupied identity path, so there is no CLI route to "keep this identity, tell me its recipient". Documented as a gap rather than worked around, because publishing a recipient from a hand-written identity is a small new command and inventing a file-editing procedure in the meantime would be the unsafe advice. That gap is closed by `key publish`, below.
+
+**Verification performed:** `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace` at 71 passing tests (13 in `backup-local` including the new one), `tests/m4a_docker_smoke.sh` re-run green on 16, 17 and 18 after the store change, and `tests/m4a_key_drill.sh` green on all three majors. The M2 and M3 matrices have still not been re-run since the encrypted write path landed.
+
+**Scope remaining for M4a:** the stock-`rage` divergence as a golden CLI assertion, and a decision on whether a command that publishes a recipient from an existing identity belongs in M4a or M5. M4b signing must land before any real-data artifact is published.
+
+## 2026-09-28 — M4a: `key publish`, so a secret can stay the operator's own
+
+**Request:** close the custom-secret gap the drill surfaced — derive and write the recipient half from an existing identity file.
+
+**Why in M4a:** the generation model already treats the pair as "a file you point at", and the user asked twice that keeping one's own secret stay optional. Without a publish command that option was only true for a key `backupctl` generated, because the writing side needs the recipient half and only `key generate` could produce one.
+
+**Implemented:** `backup_local::publish_recipient(identity_file, recipient_file)` beside the store that owns key files, so `backupctl` still imports no crypto crate. It checks the recipient path is free, then **loads the identity with `KeyFile::load`, the store's own loader**, and only then writes the public half. The order is the whole design: a seed that is world-readable, symlinked, or missing the suite marker is refused before anything is written, so the CLI never publishes a recipient for a key it would later refuse to restore with. The identity is opened read-only and never rewritten — editing a seed is the one action that makes every artifact sealed under it permanently unreadable. `refuse_occupied` and `ensure_private_parent` were extracted out of `generate_key_pair` so both commands share one definition of "free path" and "private directory". `KeyCommand::Publish` and the `main.rs` arm are the only CLI surface.
+
+**Tests:** three store tests — `publishing_writes_the_recipient_of_a_hand_written_identity` (fixed seed, asserts the identity bytes are unchanged afterwards, modes 0600/0644, a 2432-character recipient, and that `LocalStore::with_keys` then opens the pair), `publishing_refuses_an_occupied_recipient`, `publishing_refuses_an_identity_the_store_would_not_open` (a 0644 identity leaves no recipient file behind). `backup-local` now has 16 library tests and the workspace 74.
+
+**End-to-end proof:** step 8 added to `tests/m4a_key_drill.sh`: it writes an identity by hand from a fixed seed, shows `key status` refusing the pair while the recipient half is missing, publishes, `sha256sum`s the identity to show publishing read it without touching it, checks the recipient arrived at 0644, confirms a republish is refused, and then takes a backup, verifies it at `--level archive`, and portably restores it into a new cluster — all under a key pair the CLI did not generate. It also asserts the derived recipient is not generation 2's, so the public half came from this seed and not from the store's last pair. The seed is added to the drill's secret greps, which cover the store tree, every JSON and every captured stderr, so the run shows it reaching no stored byte and no command output. Green on PostgreSQL 16, 17 and 18.
+
+**Verification performed:** `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace` at 74 passing tests, `tests/m4a_docker_smoke.sh` re-run green on all three majors (required, since `backup-local` changed), and the drill green on all three. Docs updated: the "identity you did not generate" section of `docs/security/key-lifecycle.md` is now a supported procedure instead of a documented gap, and its limits list lost that bullet; `README.md` and `config/m4a.example.toml` name `key publish`.
+
+**Scope remaining for M4a:** the stock-`rage` divergence as a golden CLI assertion. M4b signing must land before any real-data artifact is published.
+
+## 2026-09-28 — M4a closed: the operator guide, and the limits it forced into words
+
+**Request:** close M4a — a commit-ready summary of its limits — then move to M4b signing design.
+
+**Why a guide rather than a status line:** M1, M2 and M3 each end with an operator-facing document in `docs/development/`, and M4a was described only across `ARCHITECTURE.md`, the key lifecycle procedure and the roadmap status. A summary written to be *read before trusting the tool* has to say what is not proven as loudly as what is, so it got its own file: `docs/development/m4a-encryption.md` (requirements, commands, a before/after table for what configuring `[encryption]` changes, a claims-to-evidence table, limitations, validation).
+
+**Re-running what the close depends on:** `tests/m2_docker_smoke.sh` and `tests/m3_docker_smoke.sh` were both re-run against PostgreSQL 16, 17 and 18 and pass unchanged — the last standing caveat from the encrypted write path. A keyless store still writes and restores exactly the M1–M3 layout, which is the regression these two runs exist to catch.
+
+**Two limits the writing exposed, both true of the code and neither previously stated:**
+1. A host that may only *write* backups still needs the identity file present. The key docs and the example config both said the two halves were configured separately so a backup host could hold only the recipient, but `LocalStore::with_keys` loads the pair before it touches the storage root, and the drill already proves what that means when the identity is missing: every command through the configuration is refused. Rather than let the sentence describe a topology nobody can deploy, both `docs/security/key-lifecycle.md` and the guide now state the limit and name the port split as the way it eventually gets fixed.
+2. `manifest.json` is plaintext JSON sitting beside the ciphertext, so the database name, resolved scope, timings, client versions and digests are not confidential in an M4a artifact. This is what [artifact v1](docs/backup-format/manifest-v1.md) already prescribes for the frozen format (`manifest.age` plus a bounded `public.json`), so it is an M4b/M1-shape consequence rather than a defect — but it is the limit an operator most needs before putting anything real in the store, and it was documented nowhere.
+
+**M4a close decisions:** the acceptance criteria are met in full — plaintext never enters the published store, wrong key/tampering/truncation fail before restore, the recipient suite and parameter set are recorded, decryption key recovery is drilled, and exactly one hybrid recipient stanza is enforced by the writer. The one item still open is the *test surface*, not the behavior: the stock-`rage` divergence is enforced by repository-level recipient tests but not yet as a golden CLI assertion. It moves to M4b with the rest of the interoperability fixture, because a golden CLI assertion belongs to a format that stops changing at M4b, and writing it now would freeze the M1 directory shape one milestone early.
+
+**Verification performed:** `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace` at 74 passing tests, M1/M2/M3/M4a-smoke/M4a-drill runs green on 16, 17 and 18. `project.md` marks M4a closed and links the guide; `README.md` links it and states the two new limits in its own summary line.
+
+## 2026-09-28 — M4b: the signing spike, and the decision to freeze v1 in one step
+
+**Request:** after closing M4a, design M4b. The operator accepted a spike first, then chose **full v1 in one step** over signing the current development shape.
+
+**Why the spike was not optional:** four things could not be read off the documentation — whether the hybrid signature is really the 3373 bytes the contract fixes, whether a signing key can be a raw seed like the age identity, whether secret wiping happens without asking for it, and whether the crate implements final FIPS 204 or the older round-3 encoding. The last one was the dangerous case: ML-DSA-65 was 3293 bytes before finalization, and the reader is designed to *derive* the expected signature length from the recorded suite.
+
+**Measured in `/tmp/m4b-hybrid-sign`:** `signature.hybrid` = 64 + **3309** = **3373**, so the contract's number stands. An ML-DSA-65 verifying key encodes to **1952** bytes and `SigningKey::from_seed`/`to_seed` round-trips a **32-byte** seed. `Signer::sign` is deterministic on both crates, so no entropy is needed to sign and a golden vector is possible. Secret wiping is **feature-gated**: `ml-dsa` does not implement `ZeroizeOnDrop` unless the `zeroize` feature is on, so the spike asserts the trait bound at compile time — a future feature removal breaks the build instead of silently dropping a security guarantee the operator named as mandatory. Mutating the signature at its first, middle, last and last-minus-eighth byte, signing a truncated tuple, and flipping an Ed25519 byte were all refused.
+
+**Dependency facts:** `ed25519-dalek` must be pinned at **2.2**, because 3.0 resolves `curve25519-dalek` 5.0 while `age`/`x25519-dalek` already lock 4.1.3 — pinning 2.2 keeps one copy of the curve in the binary. `ml-dsa` must stay `>= 0.1.1` for GHSA-5x2r-hc65-25f9 (hint-region malleability, fixed in `0.1.0-rc.4`).
+
+**Decision recorded:** [ADR 0002](docs/architecture/adr-0002-artifact-v1-and-signing.md). The reason option C was rejected is worth its own sentence: the signed tuple hashes `manifest.age`, so signing the plaintext `manifest.json` first would mean the freeze changes the signature input, and the contract treats a signature-input change as a new format version. The ADR also names the one place where authentication is indirect: `globals.age` is not in the tuple, and is bound through `globals_sha256` inside the signed manifest, which the store already checks.
+
+**Also from this discussion:** the operator set three conventions — deterministic signing, signing keys as raw-seed files like the M4a identity, and zeroization treated as mandatory rather than best effort. Three design choices remain open in the ADR (`[signing]` custody layout, derived versus configured key ids, whether unsigned M4a artifacts stay readable) and are listed with proposed defaults rather than decided silently.
+
+## 2026-09-28 — M4b task 1: the hybrid signer, and the key-file rules it inherited
+
+**Request:** accept the four remaining ADR defaults and start task #27 — the hybrid
+Ed25519 + ML-DSA-65 signer and verifier in `backup-crypto`.
+
+**What landed:** `crates/backup-crypto/src/signing.rs`. `HybridSigner` / `HybridVerifier` /
+`HybridSignature` over the contract tuple, `SigningKeyFile` with `load`, `create_signing`
+and `write_verifying`, and `SigningProvider` / `VerifyingProvider` ports mirroring the
+encryption side. The signing key file is marker + **128 hex** (Ed25519 seed ‖ ML-DSA-65
+seed, two independent 32-byte values); the verifying file is marker + **3968 hex**
+(32-byte Ed25519 key ‖ 1952-byte ML-DSA-65 key), so both families stay two-line files whose
+role is decided by length and marker, never by shape guessing.
+
+**The refactor the milestone forced:** a signing seed needs every protection an identity
+seed has — mode 0600, regular non-symlink, size cap, marker, exactly one line of exactly
+the right length — and a second copy of that sequence is how one family gets a weaker check
+than the other. So `keystore.rs` now exposes crate-internal `KeyFileRules` (label, marker,
+hex length, secret, size-message noun, suite) and `read_key_line` / `write_key_file` take
+rules instead of a `KeyRole`. `KeyRole` and `SigningRole` each map to two rule constants.
+Every existing error string is byte-for-byte what it was, which is what let the M4a drill
+pass untouched; `an_identity_file_is_not_a_signing_file` pins the cross-family refusals in
+both directions.
+
+**Three things only the implementing pass found:**
+1. `ed25519_dalek::VerifyingKey::from_bytes` does **not** reject a small-order key — it only
+   requires the bytes to decompress to a point, and the all-zero encoding does. The weak-key
+   rejection lives in `verify_strict`, i.e. at verify time. `HybridVerifier::from_bytes`
+   therefore calls `is_weak()` explicitly, so a hand-written verifying key file that could
+   verify nearly any message is refused when it is installed.
+2. The other half cannot be validated that way at all: FIPS 204 `pkDecode` accepts every
+   1952-byte string. So within this suite the only malformed verifying key a file can carry
+   is a classical one — which is worth knowing before anyone writes a "reject invalid PQ
+   keys" test that has no such input to feed it.
+3. The spike's claim that `ml-dsa`'s graph is disjoint from age's was wrong. The workspace
+   lock now resolves `signature` 3.0 beside age's 2.2, `sha2` 0.11 beside 0.10.9 and
+   `hybrid-array` 0.4 beside 0.2. `curve25519-dalek` (4.1.3) and `zeroize` (1.9.0) stayed
+   single, which is what the pin existed to protect. The trait-version split has a code
+   consequence: the two `Signer` traits are different types, so each leg is called by
+   qualified path rather than imported. ADR 0002's dependency row now says all of this.
+
+**Determinism, made a test:** `golden_signature_vector_is_stable` fixes a key
+(`0x11` seeds), the tuple, and the resulting signature's first 16 bytes plus the SHA-256 of
+all 3373 bytes. It passes twice in a run and across runs because neither scheme consults an
+RNG at sign time; the values are only ever to be re-derived by publishing a new suite name.
+
+**Verification performed:** `cargo fmt --all --check`, `cargo clippy --workspace
+--all-targets -- -D warnings` clean, `cargo test --workspace` at **87 passing tests** (up
+from 74; 14 of them in `signing`, covering exact length, one-half-only refusal, mutated
+signature at six offsets, wrong signer, wrong tuple, mode/symlink/marker/length refusals,
+no seed in `Debug` or errors, and the compile-time `ZeroizeOnDrop` bounds).
+`tests/m4a_key_drill.sh` re-run on PostgreSQL 16, 17 and 18 and green, which is the evidence
+that the shared key-file refactor changed no behavior the operator-facing procedure depends
+on. No artifact format changed yet: the v1 writer is task #30.

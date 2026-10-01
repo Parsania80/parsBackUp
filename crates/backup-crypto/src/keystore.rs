@@ -9,6 +9,11 @@
 //! These files live outside the artifact store on purpose. An encrypted archive in a
 //! directory that also contains the identity that opens it is a plaintext archive
 //! with extra steps.
+//!
+//! The read and write rules here are crate-internal (`read_key_line`, `write_key_file`,
+//! [`KeyFileRules`]) because the signing key files in [`crate::signing`] are held to
+//! exactly the same ones. A second family of keys written against a copy of those rules
+//! is how one family eventually gets a weaker check than the other.
 
 use std::fmt;
 use std::fs::{self, OpenOptions};
@@ -17,8 +22,8 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use crate::protocol::{
-    IDENTITY_MARKER, MAX_IDENTITY_HEX_CHARS, MAX_KEY_FILE_BYTES, PRIVATE_FILE_FORBIDDEN_MODE_BITS,
-    PUBLIC_KEY_BYTES, RECIPIENT_MARKER, SEED_BYTES, STANZA_TAG, SUITE_HYBRID,
+    IDENTITY_MARKER, MAX_KEY_FILE_BYTES, PRIVATE_FILE_FORBIDDEN_MODE_BITS, PUBLIC_KEY_BYTES,
+    RECIPIENT_MARKER, SEED_BYTES, STANZA_TAG, SUITE_HYBRID,
 };
 use crate::recipient::{HybridIdentity, HybridRecipient, hex};
 use anyhow::{Context as _, Result, bail};
@@ -33,19 +38,163 @@ pub enum KeyRole {
     Recipient,
 }
 
+/// Everything the shared key-file rules need to know about one kind of key file: how to
+/// name it in an error, which suite marker its first line must carry, how long its key
+/// line is, whether it is secret, and what to call the key in the size-limit message.
+///
+/// This exists so a second family of keys — the M4b signing pair — is validated by the
+/// same code rather than by a copy of it that can drift. Every check that protects an
+/// identity seed also protects a signing seed, and the checks worth skipping are exactly
+/// the ones a copy would eventually skip.
+pub(crate) struct KeyFileRules {
+    pub label: &'static str,
+    pub marker: &'static str,
+    pub hex_chars: usize,
+    pub secret: bool,
+    pub key_kind: &'static str,
+    pub suite: &'static str,
+}
+
 impl KeyRole {
-    /// Hex characters a well-formed key line for this role contains.
-    pub fn hex_chars(self) -> usize {
+    fn rules(self) -> &'static KeyFileRules {
         match self {
-            Self::Identity => crate::protocol::hex_len(SEED_BYTES),
-            Self::Recipient => crate::protocol::hex_len(PUBLIC_KEY_BYTES),
+            Self::Identity => &IDENTITY_RULES,
+            Self::Recipient => &RECIPIENT_RULES,
         }
     }
+}
 
-    /// Only an identity is secret; a recipient file is public by design.
-    fn is_secret(self) -> bool {
-        matches!(self, Self::Identity)
+const IDENTITY_RULES: KeyFileRules = KeyFileRules {
+    label: "identity",
+    marker: IDENTITY_MARKER,
+    hex_chars: crate::protocol::hex_len(SEED_BYTES),
+    secret: true,
+    key_kind: STANZA_TAG,
+    suite: SUITE_HYBRID,
+};
+
+const RECIPIENT_RULES: KeyFileRules = KeyFileRules {
+    label: "recipient",
+    marker: RECIPIENT_MARKER,
+    hex_chars: crate::protocol::hex_len(PUBLIC_KEY_BYTES),
+    secret: false,
+    key_kind: STANZA_TAG,
+    suite: SUITE_HYBRID,
+};
+
+/// Reads a key file and returns its single key line, having checked every property
+/// that must hold before key material is parsed: size, ownership, and the suite
+/// marker.
+///
+/// `pub(crate)` so the signing key files reuse this exact sequence; callers outside this
+/// crate go through [`KeyFile::load`] or a signing loader instead.
+pub(crate) fn read_key_line(path: &Path, rules: &'static KeyFileRules) -> Result<String> {
+    let meta = fs::symlink_metadata(path)
+        .with_context(|| format!("inspect {} key file {}", rules.label, path.display()))?;
+    if !meta.is_file() || meta.file_type().is_symlink() {
+        bail!(
+            "{} key file {} must be a regular non-symlink file",
+            rules.label,
+            path.display()
+        );
     }
+    if meta.len() > MAX_KEY_FILE_BYTES {
+        bail!(
+            "{} key file {} is {} bytes, over the {} byte limit for a {}-byte {}",
+            rules.label,
+            path.display(),
+            meta.len(),
+            MAX_KEY_FILE_BYTES,
+            rules.hex_chars / 2,
+            rules.key_kind
+        );
+    }
+    if rules.secret && meta.permissions().mode() & PRIVATE_FILE_FORBIDDEN_MODE_BITS != 0 {
+        bail!(
+            "{} key file {} must be mode 0600 or stricter, not {:04o}",
+            rules.label,
+            path.display(),
+            meta.permissions().mode() & 0o777
+        );
+    }
+
+    let contents = fs::read_to_string(path)
+        .with_context(|| format!("read {} key file {}", rules.label, path.display()))?;
+    let mut lines = contents
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty());
+    let marker = lines.next();
+    if marker != Some(rules.marker) {
+        bail!(
+            "{} key file {} must start with the suite marker {}",
+            rules.label,
+            path.display(),
+            rules.marker
+        );
+    }
+    let key = lines.next().with_context(|| {
+        format!(
+            "{} key file {} has a marker but no key line",
+            rules.label,
+            path.display()
+        )
+    })?;
+    if lines.next().is_some() {
+        bail!(
+            "{} key file {} must hold exactly one {}-character key line",
+            rules.label,
+            path.display(),
+            rules.hex_chars
+        );
+    }
+    // Checked here rather than in the parser so the error names the file and the
+    // expected length; the parser only knows about hex.
+    if rules.secret && key.len() > crate::protocol::MAX_SECRET_HEX_CHARS {
+        bail!(
+            "{} key file {} has a {}-character key line, over the {} limit",
+            rules.label,
+            path.display(),
+            key.len(),
+            crate::protocol::MAX_SECRET_HEX_CHARS
+        );
+    }
+    if key.len() != rules.hex_chars {
+        bail!(
+            "{} key file {} has a {}-character key line, expected {}",
+            rules.label,
+            path.display(),
+            key.len(),
+            rules.hex_chars
+        );
+    }
+    Ok(key.to_string())
+}
+
+/// Writes a key file atomically enough for a key: create-only, owner-only for
+/// secrets, and never through an existing path.
+///
+/// Shared with the signing key files for the same reason the read path is: the rules
+/// that stop a key being clobbered or left group-readable must not differ by family.
+pub(crate) fn write_key_file(path: &Path, bytes: &[u8], secret: bool) -> Result<()> {
+    let mut options = OpenOptions::new();
+    options.create_new(true).write(true);
+    if secret {
+        options.mode(0o600);
+    } else {
+        options.mode(0o644);
+    }
+    let mut file = options.open(path)?;
+    file.write_all(bytes)?;
+    file.flush()?;
+    file.sync_all()?;
+    // `mode` on create is masked by umask, so set the final permissions explicitly.
+    file.set_permissions(fs::Permissions::from_mode(if secret {
+        0o600
+    } else {
+        0o644
+    }))?;
+    Ok(())
 }
 
 /// Gives the backup and restore paths an identity without naming where it came
@@ -84,11 +233,12 @@ impl KeyFile {
     /// alone; anything else is refused before its contents are parsed.
     pub fn load(path: impl AsRef<Path>, role: KeyRole) -> Result<Self> {
         let path = path.as_ref();
-        let line = read_key_line(path, role)?;
+        let rules = role.rules();
+        let line = read_key_line(path, rules)?;
         let identity = match role {
             KeyRole::Identity => {
                 let identity = HybridIdentity::from_seed_hex(&line)
-                    .with_context(|| format!("{} key file {}", label(role), path.display()))?;
+                    .with_context(|| format!("{} key file {}", rules.label, path.display()))?;
                 Some(identity)
             }
             KeyRole::Recipient => None,
@@ -98,9 +248,9 @@ impl KeyFile {
             None => {
                 let bytes = hex::decode(&line)
                     .map_err(|e| anyhow::anyhow!("recipient key is not valid lowercase hex: {e}"))
-                    .with_context(|| format!("{} key file {}", label(role), path.display()))?;
+                    .with_context(|| format!("{} key file {}", rules.label, path.display()))?;
                 HybridRecipient::from_bytes(&bytes)
-                    .with_context(|| format!("{} key file {}", label(role), path.display()))?
+                    .with_context(|| format!("{} key file {}", rules.label, path.display()))?
             }
         };
         Ok(Self {
@@ -152,7 +302,7 @@ impl KeyFile {
 
     /// The suite this key belongs to, as a manifest records it.
     pub fn suite(&self) -> &'static str {
-        SUITE_HYBRID
+        self.role.rules().suite
     }
 
     /// The public half, which is safe to print and is how an operator confirms two
@@ -207,120 +357,6 @@ pub fn status(path: impl AsRef<Path>, role: KeyRole) -> Result<KeyStatus> {
         recipient_hex: key.recipient().to_string(),
     })
 }
-
-/// Reads a key file and returns its single key line, having checked every property
-/// that must hold before key material is parsed: size, ownership, and the suite
-/// marker.
-fn read_key_line(path: &Path, role: KeyRole) -> Result<String> {
-    let meta = fs::symlink_metadata(path)
-        .with_context(|| format!("inspect {} key file {}", label(role), path.display()))?;
-    if !meta.is_file() || meta.file_type().is_symlink() {
-        bail!(
-            "{} key file {} must be a regular non-symlink file",
-            label(role),
-            path.display()
-        );
-    }
-    if meta.len() > MAX_KEY_FILE_BYTES {
-        bail!(
-            "{} key file {} is {} bytes, over the {} byte limit for a {}-byte {}",
-            label(role),
-            path.display(),
-            meta.len(),
-            MAX_KEY_FILE_BYTES,
-            role.hex_chars() / 2,
-            STANZA_TAG
-        );
-    }
-    if role.is_secret() && meta.permissions().mode() & PRIVATE_FILE_FORBIDDEN_MODE_BITS != 0 {
-        bail!(
-            "identity key file {} must be mode 0600 or stricter, not {:04o}",
-            path.display(),
-            meta.permissions().mode() & 0o777
-        );
-    }
-
-    let contents = fs::read_to_string(path)
-        .with_context(|| format!("read {} key file {}", label(role), path.display()))?;
-    let mut lines = contents
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty());
-    let marker = lines.next();
-    if marker != Some(IDENTITY_MARKER) {
-        bail!(
-            "{} key file {} must start with the suite marker {IDENTITY_MARKER}",
-            label(role),
-            path.display()
-        );
-    }
-    let key = lines.next().with_context(|| {
-        format!(
-            "{} key file {} has a marker but no key line",
-            label(role),
-            path.display()
-        )
-    })?;
-    if lines.next().is_some() {
-        bail!(
-            "{} key file {} must hold exactly one {}-character key line",
-            label(role),
-            path.display(),
-            role.hex_chars()
-        );
-    }
-    // Checked here rather than in the parser so the error names the file and the
-    // expected length; the parser only knows about hex.
-    if key.len() > MAX_IDENTITY_HEX_CHARS && role == KeyRole::Identity {
-        bail!(
-            "identity key file {} has a {}-character key line, over the {} limit",
-            path.display(),
-            key.len(),
-            MAX_IDENTITY_HEX_CHARS
-        );
-    }
-    if key.len() != role.hex_chars() {
-        bail!(
-            "{} key file {} has a {}-character key line, expected {}",
-            label(role),
-            path.display(),
-            key.len(),
-            role.hex_chars()
-        );
-    }
-    Ok(key.to_string())
-}
-
-/// Writes a key file atomically enough for a key: create-only, owner-only for
-/// secrets, and never through an existing path.
-fn write_key_file(path: &Path, bytes: &[u8], secret: bool) -> Result<()> {
-    let mut options = OpenOptions::new();
-    options.create_new(true).write(true);
-    if secret {
-        options.mode(0o600);
-    } else {
-        options.mode(0o644);
-    }
-    let mut file = options.open(path)?;
-    file.write_all(bytes)?;
-    file.flush()?;
-    file.sync_all()?;
-    // `mode` on create is masked by umask, so set the final permissions explicitly.
-    file.set_permissions(fs::Permissions::from_mode(if secret {
-        0o600
-    } else {
-        0o644
-    }))?;
-    Ok(())
-}
-
-fn label(role: KeyRole) -> &'static str {
-    match role {
-        KeyRole::Identity => "identity",
-        KeyRole::Recipient => "recipient",
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1,6 +1,6 @@
 # Published artifact v1 contract
 
-Status: M0 wire-format proposal; freeze only after the M4a encryption tests and the M4b signature and interoperability tests. Development-only M1 plaintext output is **not** v1. This document defines field and validation requirements, not Rust serialization code.
+Status: M0 wire-format proposal; freeze only after the M4a encryption tests and the M4b signature and interoperability tests. The M4b implementation shape, the measured signature and key lengths, and the one step by which `globals.age` is bound are in [ADR 0002](../architecture/adr-0002-artifact-v1-and-signing.md). Development-only M1 plaintext output is **not** v1. This document defines field and validation requirements, not Rust serialization code.
 
 ## Layout
 

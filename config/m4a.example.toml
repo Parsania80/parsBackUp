@@ -27,6 +27,16 @@ root = "/tmp/backupctl-m4a-data"
 # identity at mode 0600 and its public recipient half at 0644, and never overwrites an
 # existing file. A backup host that may only write needs the recipient_file and nothing
 # else; verifying or restoring needs both.
+#
+# If you supply the identity yourself instead, write it at mode 0600 and run
+# `backupctl --config this-file.toml key publish`: it reads the identity, refuses one this
+# store would not open, and writes only the recipient half. Neither command modifies an
+# identity that already exists.
+#
+# One pair is one generation: rotating means a new key directory and a new configuration,
+# and an older artifact stays readable only through the pair that wrote it. Keep an
+# offline copy of every generation's identity before you need it; the rotation and
+# key-loss procedures are in docs/security/key-lifecycle.md.
 [encryption]
 identity_file = "/var/lib/backupctl-keys/identity.key"
 recipient_file = "/var/lib/backupctl-keys/recipient.key"

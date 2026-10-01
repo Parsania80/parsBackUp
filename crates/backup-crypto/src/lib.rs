@@ -9,10 +9,11 @@
 //! lines of key agreement rather than a new file format.
 //!
 //! Nothing here knows about databases, schedules, or the artifact layout: it exposes
-//! recipients, identities, and streams, and reports the suite it used.
+//! recipients, identities, signers, and streams, and reports the suite it used.
 
 pub mod keystore;
 pub mod protocol;
+pub mod signing;
 
 mod kem;
 mod recipient;

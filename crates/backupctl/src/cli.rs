@@ -58,12 +58,15 @@ pub(crate) enum ConfigCommand {
     Check,
 }
 
-/// Both commands act on the `[encryption]` paths in the configuration, never on paths
-/// typed at the prompt: a key the store will not load is worse than no key at all.
+/// Every key command acts on the `[encryption]` paths in the configuration, never on
+/// paths typed at the prompt: a key the store will not load is worse than no key at all.
 #[derive(Subcommand)]
 pub(crate) enum KeyCommand {
     /// Generate the configured identity and publish its recipient half.
     Generate,
+    /// Publish the recipient half of an identity that already exists, leaving the
+    /// identity itself untouched.
+    Publish,
     /// Report the configured key files without decrypting or printing secret material.
     Status,
 }

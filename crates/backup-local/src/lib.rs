@@ -337,14 +337,19 @@ impl LocalStore {
             .open(&path)
             .context("create private scratch file")?;
         let ciphertext = File::open(ciphertext).context("open encrypted payload")?;
+        // The view takes the directory before a single byte is decrypted, so every
+        // failure path below drops it on the way out. A refused or over-cap decryption
+        // must not leave a half-written plaintext file sitting in the store, which is
+        // the one thing this directory exists to avoid.
+        let view = LocalPlaintext {
+            path,
+            scratch: Some(scratch),
+        };
         match max_plaintext_bytes {
             Some(limit) => decrypt_with_limit(keys.identity.identity()?, ciphertext, file, limit)?,
             None => decrypt(keys.identity.identity()?, ciphertext, file)?,
         };
-        Ok(LocalPlaintext {
-            path,
-            scratch: Some(scratch),
-        })
+        Ok(view)
     }
 
     fn load_artifact(&self, id: Uuid) -> Result<LocalArtifact> {
@@ -706,6 +711,38 @@ pub fn key_status(
     ))
 }
 
+/// Refuses a key path that already holds something, a dangling symlink included, so
+/// no key command can replace material an existing artifact depends on.
+fn refuse_occupied(path: &Path) -> Result<()> {
+    // Checked through the symlink so a dangling link is treated as the occupied path
+    // it is, rather than as free space to write into.
+    if fs::symlink_metadata(path).is_ok() {
+        bail!(
+            "refusing to overwrite the existing key file {}; a new key orphans every \
+             artifact encrypted to the current one",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+/// Creates the directory a key file is configured into when it does not exist yet.
+/// The configured location is the operator's own directory, and a first run is the
+/// normal case, so it is created here rather than left as a write error. It is
+/// private because it will hold a key: the same reason the key itself is 0600.
+fn ensure_private_parent(path: &Path) -> Result<()> {
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+    if !parent.exists() {
+        DirBuilder::new()
+            .mode(0o700)
+            .recursive(true)
+            .create(parent)?;
+    }
+    Ok(())
+}
+
 /// Generates the identity and publishes its recipient half, in one deliberate step.
 ///
 /// Neither file is created unless neither already exists: an identity whose recipient
@@ -717,32 +754,34 @@ pub fn generate_key_pair(
 ) -> Result<(KeyStatus, KeyStatus)> {
     let identity_file = identity_file.as_ref();
     let recipient_file = recipient_file.as_ref();
-    // Checked through the symlink so a dangling link is treated as the occupied path
-    // it is, rather than as free space to write into.
     for path in [identity_file, recipient_file] {
-        if fs::symlink_metadata(path).is_ok() {
-            bail!(
-                "refusing to overwrite the existing key file {}; a new key orphans every \
-                 artifact encrypted to the current one",
-                path.display()
-            );
-        }
+        refuse_occupied(path)?;
     }
-    // The configured location is the operator's own directory, and a first run is the
-    // normal case, so it is created here rather than left as a write error. It is
-    // private because it will hold the identity: the same reason the key itself is 0600.
     for path in [identity_file, recipient_file] {
-        let Some(parent) = path.parent() else {
-            continue;
-        };
-        if !parent.exists() {
-            DirBuilder::new()
-                .mode(0o700)
-                .recursive(true)
-                .create(parent)?;
-        }
+        ensure_private_parent(path)?;
     }
     let identity = KeyFile::create_identity(identity_file)?;
+    KeyFile::write_recipient(recipient_file, identity.recipient())?;
+    key_status(identity_file, recipient_file)
+}
+
+/// Publishes the recipient half of an identity this CLI did not generate, so an
+/// operator who supplied the seed themselves can make the store accept the pair.
+///
+/// Only the recipient file is written, and only into free space: the identity is read
+/// and never modified, because rewriting a seed is the one action that makes every
+/// artifact sealed under it permanently unreadable. The identity is loaded with the
+/// store's own rules first, so a file the store would refuse to open never gets a
+/// public half published beside it.
+pub fn publish_recipient(
+    identity_file: impl AsRef<Path>,
+    recipient_file: impl AsRef<Path>,
+) -> Result<(KeyStatus, KeyStatus)> {
+    let identity_file = identity_file.as_ref();
+    let recipient_file = recipient_file.as_ref();
+    refuse_occupied(recipient_file)?;
+    let identity = KeyFile::load(identity_file, KeyRole::Identity)?;
+    ensure_private_parent(recipient_file)?;
     KeyFile::write_recipient(recipient_file, identity.recipient())?;
     key_status(identity_file, recipient_file)
 }
@@ -782,7 +821,7 @@ fn hash_file(path: &Path) -> Result<(u64, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use backup_crypto::protocol::SUITE_HYBRID;
+    use backup_crypto::protocol::{IDENTITY_MARKER, SUITE_HYBRID};
     use backup_domain::{DEV_FORMAT, PLAN_FORMAT, RestoreSecurityPolicy};
     use std::os::unix::fs::PermissionsExt;
 
@@ -981,6 +1020,50 @@ mod tests {
         assert!(keyless.plaintext_payload(&artifact).is_err());
         fs::remove_dir_all(root).unwrap();
         fs::remove_dir_all(keys).unwrap();
+    }
+
+    /// The scratch view is a promise about failures, not only about success. A stream
+    /// this identity cannot open is refused part-way through, and the directory it was
+    /// decrypted into has to disappear with it, so a refused restore leaves no
+    /// half-written plaintext file in the store.
+    #[test]
+    fn a_refused_decryption_leaves_no_scratch_behind() {
+        let root = temp_root();
+        let written = temp_keys();
+        let reader = temp_keys();
+        let (identity, recipient) = key_pair(&written);
+        let store = LocalStore::with_keys(root.clone(), &identity, &recipient).unwrap();
+        let id = Uuid::new_v4();
+        let plaintext = b"synthetic archive bytes";
+        let stage = store
+            .begin(
+                id,
+                &WriteOptions {
+                    with_globals: false,
+                },
+            )
+            .unwrap();
+        stage_bytes(&store, &stage, plaintext, None);
+        let (size_bytes, sha256) = store.measure(&stage).unwrap();
+        let mut m = manifest(id, size_bytes, sha256);
+        m.format = AGE_FORMAT.to_string();
+        m.recipient_suite = Some(SUITE_HYBRID.to_string());
+        m.payload_plaintext_bytes = Some(plaintext.len() as u64);
+        store.publish(stage, &m).unwrap();
+
+        // A second, unrelated pair: the same bytes, the same store, no way in.
+        let (stranger, stranger_recipient) = key_pair(&reader);
+        let other = LocalStore::with_keys(root.clone(), &stranger, &stranger_recipient).unwrap();
+        let artifact = other.open(id).unwrap();
+        assert!(other.plaintext_payload(&artifact).is_err());
+        let leftovers: Vec<_> = fs::read_dir(root.join("scratch")).unwrap().collect();
+        assert!(
+            leftovers.is_empty(),
+            "a refused decryption left a scratch entry"
+        );
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(written).unwrap();
+        fs::remove_dir_all(reader).unwrap();
     }
 
     /// Encryption is configured, not assumed: a store built without key files keeps
@@ -1200,6 +1283,80 @@ mod tests {
             0o700
         );
         assert_eq!(identity_status.mode, 0o600);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// An identity the operator supplied is a key this CLI can still make usable: the
+    /// public half is derived and written, and the identity is read and never rewritten.
+    #[test]
+    fn publishing_writes_the_recipient_of_a_hand_written_identity() {
+        let dir = temp_keys();
+        let identity = dir.join("identity.key");
+        let recipient = dir.join("recipient.key");
+        fs::create_dir_all(&dir).unwrap();
+        // Any 32-byte seed is a valid identity. This one is fixed so the test stays
+        // reproducible and carries nothing that protects real data.
+        let seed = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        fs::write(&identity, format!("{IDENTITY_MARKER}\n{seed}\n")).unwrap();
+        fs::set_permissions(&identity, fs::Permissions::from_mode(0o600)).unwrap();
+        let before = fs::read(&identity).unwrap();
+
+        let (identity_status, recipient_status) = publish_recipient(&identity, &recipient).unwrap();
+        assert_eq!(
+            fs::read(&identity).unwrap(),
+            before,
+            "the identity was rewritten"
+        );
+        assert_eq!(identity_status.mode, 0o600);
+        assert_eq!(recipient_status.mode, 0o644);
+        assert_eq!(
+            identity_status.recipient_hex,
+            recipient_status.recipient_hex
+        );
+        assert_eq!(identity_status.recipient_hex.len(), 2432);
+        // A published pair is a pair the store opens, which is the whole point: a
+        // backup written under this identity is readable by the same configuration.
+        let root = temp_root();
+        let store = LocalStore::with_keys(root.clone(), &identity, &recipient).unwrap();
+        assert!(store.list().is_ok());
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Publishing is not a way to replace a published key.
+    #[test]
+    fn publishing_refuses_an_occupied_recipient() {
+        let dir = temp_keys();
+        let (identity, recipient) = key_pair(&dir);
+        let original = fs::read(&recipient).unwrap();
+        let error = publish_recipient(&identity, &recipient)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("refusing to overwrite"), "{error}");
+        assert_eq!(fs::read(&recipient).unwrap(), original);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The identity is loaded under the store's own rules before its half is written,
+    /// so a key the store would refuse never acquires a usable partner.
+    #[test]
+    fn publishing_refuses_an_identity_the_store_would_not_open() {
+        let dir = temp_keys();
+        let identity = dir.join("identity.key");
+        let recipient = dir.join("recipient.key");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            &identity,
+            format!("{IDENTITY_MARKER}\n{}\n", "ab".repeat(32)),
+        )
+        .unwrap();
+        fs::set_permissions(&identity, fs::Permissions::from_mode(0o644)).unwrap();
+
+        assert!(publish_recipient(&identity, &recipient).is_err());
+        assert!(
+            !recipient.exists(),
+            "a refused identity still got a public half"
+        );
         fs::remove_dir_all(dir).unwrap();
     }
 

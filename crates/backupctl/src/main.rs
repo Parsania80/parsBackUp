@@ -16,7 +16,7 @@ use crate::report::{
 use anyhow::{Context, Result, anyhow, bail};
 use backup_application::{BackupService, RestoreService, VerifyService};
 use backup_domain::{Config, RestoreSecurityPolicy, VERIFY_ARCHIVE, VERIFY_CHECKSUM};
-use backup_local::{LocalStore, generate_key_pair, key_status};
+use backup_local::{LocalStore, generate_key_pair, key_status, publish_recipient};
 use backup_postgres::PostgresAdapter;
 use clap::Parser;
 use std::process::ExitCode;
@@ -79,6 +79,9 @@ fn run() -> Result<()> {
             let (identity, recipient) = match command {
                 KeyCommand::Generate => {
                     generate_key_pair(&encryption.identity_file, &encryption.recipient_file)?
+                }
+                KeyCommand::Publish => {
+                    publish_recipient(&encryption.identity_file, &encryption.recipient_file)?
                 }
                 KeyCommand::Status => {
                     key_status(&encryption.identity_file, &encryption.recipient_file)?
