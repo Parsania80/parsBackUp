@@ -70,6 +70,18 @@ pub const SIGNING_MARKER: &str = "!backupctl-ed25519mldsa65-v0";
 /// First line of a verifying key file, with the same purpose as `SIGNING_MARKER`.
 pub const VERIFYING_MARKER: &str = SIGNING_MARKER;
 
+/// Domain-separation prefix of a `recipient_id`. The ids a v1 artifact records are derived
+/// from public key bytes rather than configured, and this prefix is why a recipient and a
+/// signing key that were somehow the same bytes still get different ids. Changing it
+/// relabels every artifact ever written, so it is part of the format like `SIGNATURE_DOMAIN`.
+pub const RECIPIENT_ID_DOMAIN: &[u8] = b"backupctl-recipient-id-v1\0";
+/// Domain-separation prefix of a `signer_id`, derived from the verifying key rather than
+/// from a signature, so signature malleability cannot move an artifact's recorded signer.
+pub const SIGNER_ID_DOMAIN: &[u8] = b"backupctl-signer-id-v1\0";
+/// Hex characters in a derived id. A truncated digest is still collision-resistant enough
+/// to spot a mis-set key, which is the whole job these ids have.
+pub const KEY_ID_HEX_CHARS: usize = 16;
+
 /// Domain-separation prefix of the signed tuple, terminated by a NUL so a prefix of
 /// one field can never be read as another. It is a distinct constant from `HPKE_INFO`
 /// even though the bytes overlap: encryption binds a stanza to this format through
@@ -170,6 +182,22 @@ mod tests {
             SIGNATURE_DOMAIN.len() + BACKUP_ID_BYTES + DIGEST_BYTES * 2
         );
         assert_eq!(hex_len(SIGNING_SEED_BYTES), 128);
+        assert_eq!(
+            RECIPIENT_ID_DOMAIN, b"backupctl-recipient-id-v1\0",
+            "changing the recipient id prefix relabels every artifact"
+        );
+        assert_eq!(
+            SIGNER_ID_DOMAIN, b"backupctl-signer-id-v1\0",
+            "changing the signer id prefix relabels every artifact"
+        );
+        const {
+            assert!(
+                KEY_ID_HEX_CHARS == 16
+                    && KEY_ID_HEX_CHARS.is_multiple_of(2)
+                    && KEY_ID_HEX_CHARS / 2 <= DIGEST_BYTES,
+                "an artifact id is eight bytes of a real digest; widening it relabels every artifact"
+            );
+        }
         assert_eq!(hex_len(HYBRID_VERIFYING_KEY_BYTES), 3968);
         assert_eq!(hex_len(MLDSA65_VERIFYING_KEY_BYTES), 3904);
         assert_eq!(HYBRID_SIGNATURE_BYTES, 3373);

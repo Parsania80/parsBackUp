@@ -11,6 +11,7 @@
 //! Nothing here knows about databases, schedules, or the artifact layout: it exposes
 //! recipients, identities, signers, and streams, and reports the suite it used.
 
+pub mod keyid;
 pub mod keystore;
 pub mod protocol;
 pub mod signing;

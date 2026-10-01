@@ -66,20 +66,16 @@ impl ArtifactScope {
     }
 
     /// The namespaces a restore target must hold even though the archive does
-    /// not create them: `pg_dump --table` selections carry no `CREATE SCHEMA`
-    /// entries, while schema selections (and whole-database dumps) do.
+    /// not create them. A signed v1 manifest has no scope record — its resolved
+    /// selection is the same fact — so both shapes reach this through one rule.
     pub fn restore_required_schemas(&self) -> Vec<String> {
-        if !self.resolved_schemas.is_empty() || self.resolved_tables.is_empty() {
-            return Vec::new();
+        ResolvedSelection {
+            whole_database: self.whole_database,
+            schemas: self.resolved_schemas.clone(),
+            tables: self.resolved_tables.clone(),
+            ..Default::default()
         }
-        let mut schemas: Vec<String> = self
-            .resolved_tables
-            .iter()
-            .filter_map(|table| table.split_once('.').map(|(schema, _)| schema.to_string()))
-            .collect();
-        schemas.sort();
-        schemas.dedup();
-        schemas
+        .restore_required_schemas()
     }
 }
 

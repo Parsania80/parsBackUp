@@ -9,18 +9,22 @@
 pub mod protocol;
 
 mod artifact;
+mod artifact_v1;
 mod config;
 mod profile;
 mod restore;
 mod selection;
+mod utc;
 
 #[cfg(test)]
 mod fixture;
 
 pub use artifact::{ArtifactScope, DevelopmentManifest};
-pub use config::{Config, Encryption, Source, Storage};
+pub use artifact_v1::{ArtifactManifest, PublicHeader, RequestedSelection, source_fingerprint};
+pub use config::{Config, Encryption, Signing, Source, Storage};
 pub use profile::{Profile, SelectionMode, is_safe_created_schema_name};
 pub use restore::{RestorePlan, RestoreSections, RestoreSecurityPolicy};
 pub use selection::{DanglingReference, DumpOptions, ResolvedSelection};
+pub use utc::{format_utc, is_utc_timestamp};
 
 pub use protocol::*;

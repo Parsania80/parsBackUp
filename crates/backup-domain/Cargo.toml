@@ -11,7 +11,8 @@ sha2.workspace = true
 uuid.workspace = true
 
 # Test-only, and only to prove the suite names this crate validates are the names the
-# crypto adapter writes. A dependency in the other direction would let the storage
-# layer dictate manifest vocabulary.
+# crypto adapter writes, and that the documented TOML shapes actually parse. A dependency
+# in the other direction would let the storage layer dictate manifest vocabulary.
 [dev-dependencies]
 backup-crypto = { path = "../backup-crypto" }
+toml.workspace = true

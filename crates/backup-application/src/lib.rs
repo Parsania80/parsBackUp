@@ -1,9 +1,12 @@
 use anyhow::{Context, Result, bail};
 use backup_domain::{
-    AGE_FORMAT, ARCHIVE_COMPRESSION, ARCHIVE_FORMAT, ArtifactScope, BACKUP_STATUS, Config,
-    DEV_FORMAT, DevelopmentManifest, DumpOptions, Profile, ResolvedSelection, RestorePlan,
-    RestoreSections, RestoreSecurityPolicy, Source, VERIFICATION_NONE, VERIFY_ARCHIVE,
-    VERIFY_CHECKSUM, VERIFY_RESTORE_TESTED,
+    AGE_FORMAT, ARCHIVE_COMPRESSION, ARCHIVE_FORMAT, ARTIFACT_FORMAT_VERSION, ArtifactManifest,
+    ArtifactScope, BACKUP_STATUS, Config, DEV_FORMAT, DevelopmentManifest, DumpOptions,
+    ENGINE_POSTGRESQL, GLOBALS_POLICY_EXPORTED, GLOBALS_POLICY_SKIPPED, Profile, PublicHeader,
+    RequestedSelection, ResolvedSelection, RestorePlan, RestoreSections, RestoreSecurityPolicy,
+    SUBSCRIPTION_POLICY_DROPPED, SelectionMode, Source, VERIFICATION_NONE, VERIFY_ARCHIVE,
+    VERIFY_CHECKSUM, VERIFY_RESTORE_TESTED, VERIFY_SIGNATURE, WHOLE_DATABASE_PROFILE, format_utc,
+    source_fingerprint,
 };
 use sha2::Digest as _;
 use std::io::{self, Read, Write};
@@ -137,6 +140,49 @@ pub trait ArtifactHandle {
     fn globals_path(&self) -> Option<&Path>;
 }
 
+/// A v1 artifact whose origin signature has been checked.
+///
+/// The handle is separate from [`ArtifactHandle`] rather than an extra method on it, because
+/// what it takes to read one is different in kind: an unsigned artifact's manifest is a file
+/// beside the payload, while a signed artifact's manifest only exists after two ciphertext
+/// digests have been recomputed and a signature over them has verified. Reaching this type
+/// therefore means the reader already did the authentication, and every field read off
+/// [`SignedArtifactHandle::manifest`] is a claim by whoever holds the signing key.
+pub trait SignedArtifactHandle {
+    /// `public.json`, now known to describe the bytes it was read beside.
+    fn header(&self) -> &PublicHeader;
+    fn manifest(&self) -> &ArtifactManifest;
+    fn payload_path(&self) -> &Path;
+    fn globals_path(&self) -> Option<&Path>;
+}
+
+/// What a key-free listing of a store holds.
+///
+/// The two lists are separate because they mean different things: a signed entry has been
+/// *found* (its discovery record parsed), not verified, while an unsigned entry is an
+/// artifact from before v1 that this listing can name but never describe. Reporting the
+/// unsigned ids is the point — a signature-first `backup list` that hides them hides the
+/// store's own history.
+#[derive(Debug)]
+pub struct StoreListing {
+    pub signed: Vec<PublicHeader>,
+    pub unsigned: Vec<Uuid>,
+}
+
+/// The key facts a v1 manifest must record, computed by the store from its own key files.
+///
+/// An id the operator could type is an id that could lie about which key opened this
+/// artifact, so neither number is read from the configuration: both are derived here, from
+/// key bytes, and the writer refuses a manifest that disagrees.
+#[derive(Clone, Debug)]
+pub struct SignedKeyFacts {
+    pub recipient_id: String,
+    pub signer_id: String,
+    /// The signature suite the store's signing key belongs to, which is what the manifest
+    /// and `public.json` both have to name.
+    pub signature_suite: &'static str,
+}
+
 pub trait ArtifactStore {
     type Stage: StageHandle;
     type Artifact: ArtifactHandle;
@@ -174,6 +220,151 @@ pub trait ArtifactStore {
     ) -> Result<()>;
     fn save_plan(&self, plan: &RestorePlan) -> Result<()>;
     fn load_plan(&self, id: Uuid) -> Result<Option<RestorePlan>>;
+
+    /// A v1 artifact the store has authenticated, ready to read.
+    type Signed: SignedArtifactHandle;
+
+    /// Whether the artifacts this store holds are the signed v1 shape.
+    ///
+    /// This is a property of the key files the store was opened with, never of a flag on the
+    /// call: a store configured to sign writes v1 and reads v1, and one that is not writes
+    /// and reads the development shapes.
+    fn is_signed(&self) -> bool;
+
+    /// The key facts a v1 manifest records, derived from this store's own key files.
+    fn signed_key_facts(&self) -> Result<SignedKeyFacts>;
+
+    /// Publishes a staged dump as a signed v1 artifact and returns the discovery record it
+    /// wrote.
+    ///
+    /// The signature is written and verified before the artifact becomes visible, so a store
+    /// has no reachable state in which a v1 artifact exists without one.
+    fn publish_signed(
+        &self,
+        stage: Self::Stage,
+        manifest: &ArtifactManifest,
+    ) -> Result<PublicHeader>;
+
+    /// The reader's first three steps only: parse `public.json`, recompute both ciphertext
+    /// digests from the files on disk, and verify `signature.hybrid`.
+    ///
+    /// Nothing is decrypted here and no plaintext manifest is read, so this works on a host
+    /// that holds a verifying key and no decryption identity. The returned header is
+    /// authenticated, which is why its digests can be reported.
+    fn verify_signed(&self, id: Uuid) -> Result<PublicHeader>;
+
+    /// The full reader order: [`ArtifactStore::verify_signed`], then decrypt `manifest.age`
+    /// and compare it field by field with the header, then bind `globals.age` through the
+    /// digest inside that signed manifest.
+    fn open_signed(&self, id: Uuid) -> Result<Self::Signed>;
+
+    /// Discovery from `public.json` alone, with no key material and nothing decrypted.
+    fn list_signed(&self) -> Result<StoreListing>;
+
+    /// An authenticated payload as plaintext, decrypted into private storage.
+    fn payload_plaintext(&self, artifact: &Self::Signed) -> Result<Self::Plaintext>;
+
+    /// An authenticated globals file as plaintext.
+    fn globals_plaintext(&self, artifact: &Self::Signed) -> Result<Self::Plaintext>;
+}
+
+/// One artifact, open, in whichever shape its store keeps it.
+///
+/// The two shapes differ in exactly one way that matters to a service: how the metadata it
+/// is about to trust became trustworthy. Everything after that — the payload a restore
+/// replays, the globals it applies, the source it came from — is the same work, so it is
+/// written once here instead of once per service per shape.
+enum Opened<S: ArtifactStore> {
+    Development(S::Artifact),
+    Signed(S::Signed),
+}
+
+/// What a restore needs from an artifact, in the one form both manifests can give.
+struct ArtifactFacts {
+    database: String,
+    source_major: u32,
+    has_globals: bool,
+    required_schemas: Vec<String>,
+    profile: Option<String>,
+    verification_level: Option<String>,
+    /// The v1 manifest's digest of the source it was dumped from. `None` for a development
+    /// artifact, whose manifest predates the field, so a plan cannot bind what was never
+    /// recorded.
+    source_fingerprint: Option<String>,
+}
+
+impl<S: ArtifactStore> Opened<S> {
+    /// Opens an artifact the way its store can be trusted to: a signed store authenticates
+    /// before it decrypts, and refuses a v1 artifact to the manifest-file reader rather than
+    /// reporting a missing file.
+    fn open(store: &S, id: Uuid) -> Result<Self> {
+        if store.is_signed() {
+            Ok(Self::Signed(store.open_signed(id)?))
+        } else {
+            Ok(Self::Development(store.open(id)?))
+        }
+    }
+
+    fn facts(&self) -> ArtifactFacts {
+        match self {
+            Self::Development(artifact) => {
+                let manifest = artifact.manifest();
+                ArtifactFacts {
+                    database: manifest.database.clone(),
+                    source_major: manifest.source_major,
+                    has_globals: manifest.security_globals,
+                    required_schemas: manifest
+                        .scope
+                        .as_ref()
+                        .map_or_else(Vec::new, ArtifactScope::restore_required_schemas),
+                    profile: manifest.scope.as_ref().map(|scope| scope.profile.clone()),
+                    verification_level: manifest.verification_level.clone(),
+                    source_fingerprint: None,
+                }
+            }
+            Self::Signed(artifact) => {
+                let manifest = artifact.manifest();
+                ArtifactFacts {
+                    // A v1 manifest carries no separate database field: the profile snapshot
+                    // it was written from names the database the dump came out of.
+                    database: manifest.profile_snapshot.database.clone(),
+                    source_major: manifest.source_server_major,
+                    has_globals: manifest.globals_policy == GLOBALS_POLICY_EXPORTED,
+                    required_schemas: manifest.resolved_selection.restore_required_schemas(),
+                    profile: Some(manifest.profile_snapshot.name.clone()),
+                    verification_level: Some(manifest.verification_level.clone()),
+                    source_fingerprint: Some(manifest.source_fingerprint.clone()),
+                }
+            }
+        }
+    }
+
+    /// The payload as plaintext a PostgreSQL tool may read, with any decrypted copy owned by
+    /// the returned view.
+    fn payload(&self, store: &S) -> Result<S::Plaintext> {
+        match self {
+            Self::Development(artifact) => store.plaintext_payload(artifact),
+            Self::Signed(artifact) => store.payload_plaintext(artifact),
+        }
+    }
+
+    fn globals(&self, store: &S) -> Result<S::Plaintext> {
+        match self {
+            Self::Development(artifact) => store.plaintext_globals(artifact),
+            Self::Signed(artifact) => store.globals_plaintext(artifact),
+        }
+    }
+
+    /// The handle behind an unsigned artifact, for the one operation only that shape supports:
+    /// rewriting its plaintext manifest in place.
+    fn development(&self) -> Result<&S::Artifact> {
+        match self {
+            Self::Development(artifact) => Ok(artifact),
+            Self::Signed(_) => bail!(
+                "a signed artifact's manifest exists only inside an authenticated ciphertext, so its record cannot be rewritten in place"
+            ),
+        }
+    }
 }
 
 pub fn now_unix_ms() -> Result<u128> {
@@ -200,6 +391,73 @@ pub fn toc_digest(lines: &[String]) -> Result<String> {
 pub struct BackupService<E, S> {
     engine: E,
     store: S,
+}
+
+/// What a completed write published.
+///
+/// The two shapes report different records because they are known in different ways: a
+/// development artifact's manifest is the plaintext file beside the payload, while a v1 write
+/// returns both the discovery record a reader can check with no keys and the manifest the
+/// signature authenticates.
+#[derive(Debug)]
+pub enum Created {
+    Development(Box<DevelopmentManifest>),
+    Signed {
+        header: Box<PublicHeader>,
+        manifest: Box<ArtifactManifest>,
+    },
+}
+
+impl Created {
+    pub fn id(&self) -> Uuid {
+        match self {
+            Self::Development(manifest) => manifest.id,
+            Self::Signed { header, .. } => header.backup_id,
+        }
+    }
+}
+
+/// What `backup list` found.
+#[derive(Debug)]
+pub enum Inventory {
+    Development(Vec<DevelopmentManifest>),
+    Public(StoreListing),
+}
+
+/// What `backup inspect` read.
+#[derive(Debug)]
+pub enum Record {
+    Development(Box<DevelopmentManifest>),
+    Signed(Box<ArtifactManifest>),
+}
+
+impl Record {
+    pub fn id(&self) -> Uuid {
+        match self {
+            Self::Development(manifest) => manifest.id,
+            Self::Signed(manifest) => manifest.backup_id,
+        }
+    }
+}
+
+/// The profile snapshot a signed store records for a dump that named no profile.
+///
+/// A v1 manifest has no absent fields, and a whole-database dump did make a selection: every
+/// object in the database. Recording that as a profile keeps the field honest instead of
+/// leaving a hole where a scope should be. `large_objects` is what the native default did —
+/// `pg_dump` with no blob flag includes them — and the reserved name says which case this is.
+fn whole_database_profile(source: &Source) -> Profile {
+    Profile {
+        name: WHOLE_DATABASE_PROFILE.to_string(),
+        database: source.database.clone(),
+        mode: SelectionMode::default(),
+        schemas: Vec::new(),
+        exclude_schemas: Vec::new(),
+        tables: Vec::new(),
+        exclude_tables: Vec::new(),
+        exclude_extensions: Vec::new(),
+        large_objects: true,
+    }
 }
 
 impl<E: DatabaseAdapter, S: ArtifactStore> BackupService<E, S> {
@@ -256,11 +514,7 @@ impl<E: DatabaseAdapter, S: ArtifactStore> BackupService<E, S> {
         Ok((info, resolved))
     }
 
-    pub fn create(
-        &self,
-        config: &Config,
-        profile_name: Option<&str>,
-    ) -> Result<DevelopmentManifest> {
+    pub fn create(&self, config: &Config, profile_name: Option<&str>) -> Result<Created> {
         let timeout = Duration::from_secs(config.timeout_seconds);
         let (info, resolved) = self.resolve(config, profile_name)?;
         let profile = match profile_name {
@@ -280,6 +534,9 @@ impl<E: DatabaseAdapter, S: ArtifactStore> BackupService<E, S> {
             exclude_extensions,
         };
         let id = Uuid::new_v4();
+        // Recorded before the dump runs, because a signed manifest states when the dump
+        // started as well as when it finished, and the pair is inside the signature.
+        let started_unix_ms = now_unix_ms()?;
         let stage = self.store.begin(
             id,
             &WriteOptions {
@@ -334,6 +591,62 @@ impl<E: DatabaseAdapter, S: ArtifactStore> BackupService<E, S> {
         // sink, not a flag the service carries: the format tag follows that report.
         let encrypted = staged.recipient_suite.is_some();
         let created_unix_ms = now_unix_ms()?;
+        // A signed store has one shape to write, and it is not this one: the record a v1
+        // artifact publishes is inside `manifest.age`, sealed and signed, and what the writer
+        // gets back is the discovery header the rename left behind.
+        if self.store.is_signed() {
+            let facts = self.store.signed_key_facts()?;
+            let recipient_suite = staged.recipient_suite.context(
+                "a signed store seals its payload, but this one reported a plaintext archive",
+            )?;
+            let snapshot = match profile {
+                Some(profile) => profile.clone(),
+                None => whole_database_profile(&config.source),
+            };
+            let manifest = ArtifactManifest {
+                format_version: ARTIFACT_FORMAT_VERSION,
+                backup_id: id,
+                engine: ENGINE_POSTGRESQL.to_string(),
+                source_server_major: info.source_major,
+                source_server_version: info.source_version.clone(),
+                dump_client_version: info.dump_client_version.clone(),
+                application_version: env!("CARGO_PKG_VERSION").to_string(),
+                recipient_id: facts.recipient_id,
+                signer_id: facts.signer_id,
+                recipient_suite: recipient_suite.to_string(),
+                signature_suite: facts.signature_suite.to_string(),
+                started_at_utc: format_utc(started_unix_ms.try_into()?)?,
+                completed_at_utc: format_utc(created_unix_ms.try_into()?)?,
+                source_fingerprint: source_fingerprint(&config.source, info.source_major),
+                profile_snapshot: snapshot.clone(),
+                requested_selection: RequestedSelection::from_profile(&snapshot),
+                resolved_selection: resolved,
+                archive_format: ARCHIVE_FORMAT.to_string(),
+                compression: ARCHIVE_COMPRESSION.to_string(),
+                subscription_policy: SUBSCRIPTION_POLICY_DROPPED.to_string(),
+                globals_policy: if config.export_globals {
+                    GLOBALS_POLICY_EXPORTED.to_string()
+                } else {
+                    GLOBALS_POLICY_SKIPPED.to_string()
+                },
+                globals_sha256,
+                globals_ciphertext_bytes: globals_size_bytes,
+                payload_ciphertext_sha256: sha256,
+                payload_ciphertext_bytes: size_bytes,
+                archive_plaintext_bytes: staged.plaintext_bytes,
+                // The table of contents was listed from the staged archive before anything was
+                // sealed, which is the only moment a signed manifest can learn it: writing a
+                // later check into these bytes would change what the signature covers.
+                archive_toc_sha256: Some(toc_sha256),
+                verification_level: VERIFICATION_NONE.to_string(),
+                compatibility_notes: Vec::new(),
+            };
+            let header = self.store.publish_signed(stage, &manifest)?;
+            return Ok(Created::Signed {
+                header: Box::new(header),
+                manifest: Box::new(manifest),
+            });
+        }
         let manifest = DevelopmentManifest {
             format: if encrypted {
                 AGE_FORMAT.to_string()
@@ -365,15 +678,63 @@ impl<E: DatabaseAdapter, S: ArtifactStore> BackupService<E, S> {
         };
         manifest.validate_shape()?;
         self.store.publish(stage, &manifest)?;
-        Ok(manifest)
+        Ok(Created::Development(Box::new(manifest)))
     }
 
-    pub fn list(&self) -> Result<Vec<DevelopmentManifest>> {
-        self.store.list()
+    /// Lists the store the way it can be trusted: a signed store is discovered from
+    /// `public.json` with no keys and nothing decrypted, and an unsigned one from the
+    /// plaintext manifests beside its payloads.
+    ///
+    /// The signed listing reports less than a development one does on purpose — `public.json`
+    /// holds no database name and no timestamp — because what it reports is a record a reader
+    /// with no keys can believe.
+    pub fn list(&self) -> Result<Inventory> {
+        if self.store.is_signed() {
+            return Ok(Inventory::Public(self.store.list_signed()?));
+        }
+        Ok(Inventory::Development(self.store.list()?))
     }
 
-    pub fn inspect(&self, id: Uuid) -> Result<DevelopmentManifest> {
-        self.store.inspect(id)
+    /// Reads one artifact's record. A signed artifact's metadata is inside `manifest.age`, so
+    /// this needs the store's decryption identity — the price of not leaving a plaintext
+    /// manifest beside the ciphertext.
+    pub fn inspect(&self, id: Uuid) -> Result<Record> {
+        if self.store.is_signed() {
+            return Ok(Record::Signed(Box::new(
+                self.store.open_signed(id)?.manifest().clone(),
+            )));
+        }
+        Ok(Record::Development(Box::new(self.store.inspect(id)?)))
+    }
+}
+
+/// Who attested that an artifact came from the key holder, established by an origin
+/// signature that verified.
+///
+/// Only a v1 artifact can supply this: a development artifact carries no signature at all, so
+/// there is an integrity claim to check but no origin to name.
+#[derive(Clone, Debug)]
+pub struct OriginFacts {
+    pub signer_id: String,
+    pub recipient_id: String,
+    pub signature_suite: String,
+}
+
+impl OriginFacts {
+    fn from_header(header: &PublicHeader) -> Self {
+        Self {
+            signer_id: header.signer_id.clone(),
+            recipient_id: header.recipient_id.clone(),
+            signature_suite: header.signature_suite.clone(),
+        }
+    }
+
+    fn from_manifest(manifest: &ArtifactManifest) -> Self {
+        Self {
+            signer_id: manifest.signer_id.clone(),
+            recipient_id: manifest.recipient_id.clone(),
+            signature_suite: manifest.signature_suite.clone(),
+        }
     }
 }
 
@@ -385,6 +746,7 @@ pub struct VerifyReport {
     pub payload_sha256: String,
     pub globals_size_bytes: Option<u64>,
     pub globals_sha256: Option<String>,
+    pub origin: Option<OriginFacts>,
 }
 
 pub struct VerifyService<E, S> {
@@ -398,8 +760,17 @@ impl<E: DatabaseAdapter, S: ArtifactStore> VerifyService<E, S> {
     }
 
     pub fn verify(&self, config: &Config, id: Uuid, level: &str) -> Result<VerifyReport> {
-        if !matches!(level, VERIFY_CHECKSUM | VERIFY_ARCHIVE) {
-            bail!("verification level must be checksum or archive");
+        if !matches!(level, VERIFY_SIGNATURE | VERIFY_CHECKSUM | VERIFY_ARCHIVE) {
+            bail!("verification level must be signature, checksum or archive");
+        }
+        if self.store.is_signed() {
+            return self.verify_v1(config, id, level);
+        }
+        if level == VERIFY_SIGNATURE {
+            bail!(
+                "this store's artifacts carry no origin signature, so signature level has nothing to verify; \
+                 use --level checksum or --level archive, or configure [signing] before writing artifacts"
+            );
         }
         let timeout = Duration::from_secs(config.timeout_seconds);
         // Opening the artifact already recomputes payload and globals digests
@@ -430,6 +801,65 @@ impl<E: DatabaseAdapter, S: ArtifactStore> VerifyService<E, S> {
             payload_sha256: manifest.sha256.clone(),
             globals_size_bytes: manifest.globals_size_bytes,
             globals_sha256: manifest.globals_sha256.clone(),
+            origin: None,
+        })
+    }
+
+    /// Verification for a signed store, which verifies the origin signature at every level
+    /// rather than only at the top one.
+    ///
+    /// Signature level is the reader's first three steps and stops there: `public.json`, both
+    /// ciphertext digests recomputed from the files on disk, and the hybrid signature over
+    /// them. That is the level a disaster-recovery host runs when it holds a verifying key and
+    /// no decryption identity, so nothing here may require a secret.
+    fn verify_v1(&self, config: &Config, id: Uuid, level: &str) -> Result<VerifyReport> {
+        if level == VERIFY_SIGNATURE {
+            let header = self.store.verify_signed(id)?;
+            return Ok(VerifyReport {
+                artifact_id: id,
+                level: level.to_string(),
+                payload_size_bytes: header.payload_ciphertext_bytes,
+                payload_sha256: header.payload_sha256.clone(),
+                globals_size_bytes: None,
+                globals_sha256: None,
+                origin: Some(OriginFacts::from_header(&header)),
+            });
+        }
+        // Opening does the signature check again from the top and only then decrypts the
+        // manifest, so the digests below are read from an authenticated record.
+        let artifact = self.store.open_signed(id)?;
+        let manifest = artifact.manifest();
+        if level == VERIFY_ARCHIVE {
+            let payload = self.store.payload_plaintext(&artifact)?;
+            let toc = self
+                .engine
+                .inspect_archive(
+                    &config.source,
+                    payload.path(),
+                    Duration::from_secs(config.timeout_seconds),
+                )
+                .context("archive table of contents failed to parse")?;
+            let digest = toc_digest(&toc)?;
+            // A v1 manifest records its table of contents at write time, because it is signed
+            // and a later check cannot be written into it.
+            match &manifest.archive_toc_sha256 {
+                Some(recorded) if recorded != &digest => bail!(
+                    "archive table of contents does not match the signed manifest; the payload was replaced or re-dumped"
+                ),
+                None => bail!(
+                    "the signed manifest records no archive table of contents, so archive level cannot be proven"
+                ),
+                Some(_) => {}
+            }
+        }
+        Ok(VerifyReport {
+            artifact_id: id,
+            level: level.to_string(),
+            payload_size_bytes: manifest.payload_ciphertext_bytes,
+            payload_sha256: manifest.payload_ciphertext_sha256.clone(),
+            globals_size_bytes: manifest.globals_ciphertext_bytes,
+            globals_sha256: manifest.globals_sha256.clone(),
+            origin: Some(OriginFacts::from_manifest(manifest)),
         })
     }
 }
@@ -444,11 +874,38 @@ pub struct RestoreOutcome {
     pub plan: RestorePlan,
     /// The artifact's verification level after this run.
     pub verification_level: String,
+    /// Whether that level is now written into the artifact itself.
+    ///
+    /// A v1 manifest is signed, so a restore on a disaster-recovery host cannot record
+    /// anything into it — that host holds no signing key, and re-signing someone else's
+    /// artifact would attribute it to this one. The run still proves the restore worked;
+    /// only the artifact cannot carry the fact.
+    pub recorded_in_artifact: bool,
 }
 
 impl<E: DatabaseAdapter, S: ArtifactStore> RestoreService<E, S> {
     pub fn new(engine: E, store: S) -> Self {
         Self { engine, store }
+    }
+
+    /// Refuses an artifact whose signed manifest was written for a different source than the
+    /// configured one.
+    ///
+    /// A development manifest predates the field, so there is nothing to compare and the
+    /// check passes: the database-name match below is the only binding that shape supports.
+    fn check_source(config: &Config, facts: &ArtifactFacts, server_major: u32) -> Result<()> {
+        let Some(recorded) = &facts.source_fingerprint else {
+            return Ok(());
+        };
+        let configured = source_fingerprint(&config.source, server_major);
+        if recorded != &configured {
+            bail!(
+                "this artifact was dumped from a different source than the configured one: the signed manifest \
+                 records fingerprint {recorded} while {configured} describes the current configuration. \
+                 Refusing to plan a restore whose archive does not belong to this server and database"
+            );
+        }
+        Ok(())
     }
 
     pub fn plan(
@@ -466,15 +923,18 @@ impl<E: DatabaseAdapter, S: ArtifactStore> RestoreService<E, S> {
         sections.check_security(&security)?;
         let timeout = Duration::from_secs(config.timeout_seconds);
         let info = self.engine.preflight(&config.source, timeout)?;
-        let artifact = self.store.open(artifact_id)?;
-        let manifest = artifact.manifest();
-        if security.roles && !manifest.security_globals {
+        // A signed store authenticates before it decrypts, so a bad signature is refused
+        // here — before a target database exists to be filled with a forgery.
+        let artifact = Opened::open(&self.store, artifact_id)?;
+        let facts = artifact.facts();
+        if security.roles && !facts.has_globals {
             bail!("restore policy requires roles but the backup contains no globals security file");
         }
-        if manifest.source_major != info.source_major {
+        if facts.source_major != info.source_major {
             bail!("client major does not match the backup source major; same-major restore only");
         }
-        if target == manifest.database {
+        Self::check_source(config, &facts, info.source_major)?;
+        if target == facts.database {
             bail!("restore target must differ from the backup source database");
         }
         if self
@@ -484,7 +944,7 @@ impl<E: DatabaseAdapter, S: ArtifactStore> RestoreService<E, S> {
             bail!("target database already exists; restore only creates a new database");
         }
         if security.roles {
-            let globals = self.store.plaintext_globals(&artifact)?;
+            let globals = artifact.globals(&self.store)?;
             let conflicts = self
                 .engine
                 .role_conflicts(&config.source, globals.path(), timeout)?;
@@ -500,13 +960,13 @@ impl<E: DatabaseAdapter, S: ArtifactStore> RestoreService<E, S> {
             format: backup_domain::PLAN_FORMAT.to_string(),
             id: Uuid::new_v4(),
             artifact_id,
-            artifact_database: manifest.database.clone(),
-            source_major: manifest.source_major,
+            artifact_database: facts.database.clone(),
+            source_major: facts.source_major,
             client_version: info.dump_client_version,
             target_database: target.to_string(),
             security,
             sections,
-            artifact_scope: manifest.scope.as_ref().map(|scope| scope.profile.clone()),
+            artifact_scope: facts.profile.clone(),
             created_unix_ms: created,
             expires_unix_ms: created + PLAN_TTL.as_millis(),
         };
@@ -537,14 +997,18 @@ impl<E: DatabaseAdapter, S: ArtifactStore> RestoreService<E, S> {
         if info.source_major != plan.source_major {
             bail!("client or server major changed since the plan was created");
         }
-        let artifact = self.store.open(plan.artifact_id)?;
-        if artifact.manifest().database != plan.artifact_database {
+        let artifact = Opened::open(&self.store, plan.artifact_id)?;
+        let facts = artifact.facts();
+        if facts.database != plan.artifact_database {
             bail!("artifact database identity does not match the plan");
         }
+        // Re-bound here as well: a plan is a claim about a file that another process may
+        // have swapped out while it sat in the store.
+        Self::check_source(config, &facts, info.source_major)?;
         // Step 1 of the DR order: security metadata validated (digest binding
-        // happened in open()); re-check role conflicts at execution time.
+        // happened when the artifact was opened); re-check role conflicts at execution time.
         if plan.security.roles {
-            let globals = self.store.plaintext_globals(&artifact)?;
+            let globals = artifact.globals(&self.store)?;
             let conflicts = self
                 .engine
                 .role_conflicts(&config.source, globals.path(), timeout)?;
@@ -573,18 +1037,20 @@ impl<E: DatabaseAdapter, S: ArtifactStore> RestoreService<E, S> {
         // A table-selected archive restores its relations but never creates
         // their namespaces; prepare them so the restore targets an otherwise
         // empty database, matching the schema-selection behavior.
-        if let Some(scope) = artifact.manifest().scope.as_ref() {
-            let required = scope.restore_required_schemas();
-            if !required.is_empty() {
-                self.engine
-                    .create_schemas(&config.source, &plan.target_database, &required, timeout)
-                    .context("target schema preparation failed")?;
-            }
+        if !facts.required_schemas.is_empty() {
+            self.engine
+                .create_schemas(
+                    &config.source,
+                    &plan.target_database,
+                    &facts.required_schemas,
+                    timeout,
+                )
+                .context("target schema preparation failed")?;
         }
         // Steps 4-6: schema/data, then ownership and privileges from the
         // archive's own ALTER OWNER/GRANT entries (skipped per policy). The view is
         // held for the length of the restore and its plaintext is removed after.
-        let payload = self.store.plaintext_payload(&artifact)?;
+        let payload = artifact.payload(&self.store)?;
         let restored = self.engine.restore_to_database(
             &config.source,
             &plan.target_database,
@@ -599,30 +1065,44 @@ impl<E: DatabaseAdapter, S: ArtifactStore> RestoreService<E, S> {
                 plan.target_database
             );
         }
+        let recorded = facts
+            .verification_level
+            .clone()
+            .unwrap_or_else(|| VERIFICATION_NONE.to_string());
+        if self.store.is_signed() {
+            // Replaying the archive into a live database is exactly what restore-tested means,
+            // but the fact cannot be added to a signed manifest: that would need the signing
+            // key, which a disaster-recovery host does not hold, and re-signing an artifact
+            // this host produced nothing about would attribute it to one that did.
+            return Ok(RestoreOutcome {
+                plan,
+                verification_level: recorded,
+                recorded_in_artifact: false,
+            });
+        }
         if !plan.sections.is_full() {
             // A section-limited restore proves nothing about the rest of the
             // archive, so the artifact keeps its recorded verification level.
             return Ok(RestoreOutcome {
                 plan,
-                verification_level: artifact
-                    .manifest()
-                    .verification_level
-                    .clone()
-                    .unwrap_or_else(|| VERIFICATION_NONE.to_string()),
+                verification_level: recorded,
+                recorded_in_artifact: false,
             });
         }
         // Record restore-tested verification on the artifact (additive field
         // update; payload and digests are unchanged).
-        let mut updated = artifact.manifest().clone();
+        let unsigned = artifact.development()?;
+        let mut updated = unsigned.manifest().clone();
         updated.verification_level = Some(VERIFY_RESTORE_TESTED.to_string());
         updated.verified_unix_ms = Some(now_unix_ms()?);
         updated.validate_shape()?;
         self.store
-            .rewrite_manifest(&artifact, &updated)
+            .rewrite_manifest(unsigned, &updated)
             .context("restore succeeded but verification marking failed")?;
         Ok(RestoreOutcome {
             plan,
             verification_level: VERIFY_RESTORE_TESTED.to_string(),
+            recorded_in_artifact: true,
         })
     }
 }

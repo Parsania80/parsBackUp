@@ -15,7 +15,7 @@ pub enum SelectionMode {
 /// Exact, non-pattern object names. `pg_dump` treats its own filters as
 /// patterns with case folding, so accepting wildcards or mixed case here would
 /// let a profile name objects the resolver cannot match one-to-one.
-fn is_valid_schema_name(name: &str) -> bool {
+pub(crate) fn is_valid_schema_name(name: &str) -> bool {
     let mut chars = name.chars();
     let Some(first) = chars.next() else {
         return false;
@@ -24,7 +24,7 @@ fn is_valid_schema_name(name: &str) -> bool {
         && chars.all(|c| c == '_' || c.is_ascii_lowercase() || c.is_ascii_digit() || c == '$')
 }
 
-fn is_valid_table_name(name: &str) -> bool {
+pub(crate) fn is_valid_table_name(name: &str) -> bool {
     let Some((schema, table)) = name.split_once('.') else {
         return false;
     };

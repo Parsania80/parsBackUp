@@ -16,6 +16,7 @@
 //! only randomness here is the seed drawn when a key is generated.
 
 use std::fmt;
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result, bail};
@@ -482,6 +483,54 @@ impl SigningKeyFile {
             .as_ref()
             .context("key file holds only a verifying key; a signing key is required to sign")
     }
+}
+
+/// A signing or verifying key file as an operator sees it: path, role, suite, permission
+/// bits, and the fingerprint an artifact's `signer_id` must equal. Nothing secret is in it,
+/// which is what makes `key status` safe to run on a host that also holds the seed.
+pub struct SigningKeyStatus {
+    pub path: PathBuf,
+    pub role: SigningRole,
+    pub suite: &'static str,
+    /// Owner permission bits, as the filesystem reports them.
+    pub mode: u32,
+    pub signer_id: String,
+}
+
+impl fmt::Debug for SigningKeyStatus {
+    /// Names the file and its fingerprint. A status can reach an error chain, and the
+    /// verifying key behind it is 1952 bytes of public material nobody asked to read.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "SigningKeyStatus({:?} {} {})",
+            self.role,
+            self.path.display(),
+            self.signer_id
+        )
+    }
+}
+
+/// Inspects a signing or verifying key file without printing either half.
+///
+/// The file is loaded under the role's own rules first, so a status this reports is a file
+/// the store will accept, and a 0600 seed beside its 0644 public half is how an operator
+/// proves the pair belongs together.
+pub fn status(path: impl AsRef<Path>, role: SigningRole) -> Result<SigningKeyStatus> {
+    let path = path.as_ref();
+    let key = SigningKeyFile::load(path, role)?;
+    let mode = std::fs::symlink_metadata(path)
+        .context("inspect signing key file")?
+        .permissions()
+        .mode()
+        & 0o777;
+    Ok(SigningKeyStatus {
+        path: path.to_path_buf(),
+        role,
+        suite: key.suite(),
+        mode,
+        signer_id: crate::keyid::signer_id(key.verifier().to_bytes().as_slice()),
+    })
 }
 
 /// Gives a writer the key that signs artifacts. Separate from [`VerifyingProvider`]

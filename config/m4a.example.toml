@@ -40,3 +40,46 @@ root = "/tmp/backupctl-m4a-data"
 [encryption]
 identity_file = "/var/lib/backupctl-keys/identity.key"
 recipient_file = "/var/lib/backupctl-keys/recipient.key"
+
+# M4b adds an optional [signing] block. Together these two blocks are the only way to say
+# what a store writes; there is no per-run flag for either. Three shapes, and nothing else:
+#
+#   no key blocks    payload.dump + globals.sql + manifest.json   m1-development-plaintext
+#                    the M1-M3 layout, readable without any key.
+#   [encryption]     payload.age + manifest.json                  m4a-development-age
+#                    encrypted and unsigned. Development only: the manifest beside the
+#                    ciphertext is plaintext, and anyone holding the recipient key can
+#                    write an artifact this store will restore.
+#   [encryption] + [signing]  payload.age + manifest.age + public.json + signature.hybrid
+#                    artifact v1, the frozen format. The manifest is encrypted, and a
+#                    replaced, downgraded or re-encrypted artifact fails before anything is
+#                    decrypted or restored.
+#
+# A [signing] block with no [encryption] block is refused at load: the signature is made
+# over the two ciphertext files, so a store that writes plaintext has nothing for it to
+# authenticate.
+#
+# The same path rules as [encryption] apply — absolute, outside the storage root, never
+# overwritten — but the two files here are distributed differently, and that difference is
+# the point of the block:
+#
+#   signing_key_file    0600, the secret seed. Only a host that creates backups has it.
+#                       A host that verifies or restores must NOT have it, and omitting the
+#                       key is what makes that provable rather than a matter of trust.
+#   verifying_key_file  0644, the trusted public half. Every reader needs it, and it is
+#                       installed independently of the artifact store: a verifying key
+#                       copied out of the store it checks proves nothing.
+#
+# Create both with `backupctl --config this-file.toml key generate`. A read-only or DR host
+# configures the verifying half alone:
+#
+# [signing]
+# verifying_key_file = "/var/lib/backupctl-keys/verifying.key"
+#
+# One signing pair is one generation, exactly like the age pair, and rotation is the same
+# procedure (docs/security/key-lifecycle.md). Losing the signing key does not lose the data
+# — the artifacts stay readable with the identity and a re-installed verifying key for that
+# generation — but nothing new can be published until a new pair is created.
+[signing]
+signing_key_file = "/var/lib/backupctl-keys/signing.key"
+verifying_key_file = "/var/lib/backupctl-keys/verifying.key"

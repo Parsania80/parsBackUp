@@ -259,3 +259,58 @@ no seed in `Debug` or errors, and the compile-time `ZeroizeOnDrop` bounds).
 `tests/m4a_key_drill.sh` re-run on PostgreSQL 16, 17 and 18 and green, which is the evidence
 that the shared key-file refactor changed no behavior the operator-facing procedure depends
 on. No artifact format changed yet: the v1 writer is task #30.
+
+## 2026-10-01 — M4b: artifact v1 is written, signed, and refused before anything is restored
+
+**What landed.** `backup-domain` gained the v1 record types (`ArtifactManifest`,
+`PublicHeader`, `RequestedSelection`), `source_fingerprint`, UTC formatting for the two
+timestamps, the `whole-database` and fingerprint domain constants, and the optional
+`[signing]` block. `backup-local` became the v1 writer and the signature-first reader:
+`payload.age`, optional `globals.age`, `manifest.age`, a 3373-byte `signature.hybrid`,
+a bounded `public.json`, then `complete`, with discovery, verification and listing all
+possible from `public.json` alone. `backup-application` and `backupctl` put that shape in
+front of an operator: `key generate|publish|status` now act on `[signing]` as well as
+`[encryption]`, `backup verify` takes `--level signature`, `backup inspect` reads a v1
+record out of the authenticated ciphertext, and `restore plan` authenticates before it
+binds a source.
+
+**Three things only writing the code forced into the open.**
+1. `archive_toc_sha256` is recorded when the artifact is written, not when it is verified.
+   `docs/artifact-contract.md` §3.2 says a manifest at `verification_level: none` carries no
+   table of contents, but a signed manifest cannot gain a fact later without changing what
+   its signature covers, so archive level compares against the write-time digest and refuses
+   an artifact that recorded none. §3.2 gets the reconciliation when #33 freezes the format.
+2. A v1 dump that names no profile still records a scope, under a reserved synthetic name.
+   The manifest is the only record of what was selected, and a missing one is
+   indistinguishable from a filtered dump that claimed otherwise.
+3. `restore run` on a signed artifact reports `recorded_in_artifact: false`. Replaying the
+   archive is exactly what `restore-tested` means, but writing it into the artifact needs
+   the signing key a DR host does not hold — and re-signing an artifact this host produced
+   nothing about would attribute it to a host that did.
+
+**A rule enforced in the wrong type, found by the test that first wrote a v1 artifact.**
+`whole-database` was refused by `Profile::validate`, and `ArtifactManifest::validate`
+re-validates the snapshot it signs, so `BackupService::create` on a signed store refused its
+own manifest: `profile name whole-database is reserved for a dump that names no profile`.
+The rule is about *configuration*, so it now sits in `Config::validate`'s profile loop and a
+snapshot the writer builds stays a valid `Profile`. `crates/backup-local/tests/signed_write_path.rs`
+is what caught it; the four tests it added are the composed v1 path — the six files and the
+signed facts a reader cannot forge, all three verification levels passing with signature
+level touching no tool and decrypting nothing into `scratch`, one bit flipped in the
+ed25519 half refusing every level *and* the plan while `CREATE DATABASE` stays un-called,
+and an artifact whose recorded source fingerprint no longer matches the configuration
+refused at planning. The control run is in the same test on purpose: the empty list is only
+evidence after the same stub demonstrably created a database for an intact artifact.
+
+**Shared fixtures.** `write_path.rs`'s stub adapter, capture and key/config helpers moved to
+`tests/common/mod.rs`, which the two composed-path tests share; the capture now also records
+every `CREATE DATABASE` it is asked for, and `signed_store.rs` uses the same `Keys`,
+`artifact_dir` and `failure` helpers rather than a third copy.
+
+**Verification performed:** `cargo fmt --all --check` clean, `cargo clippy --workspace
+--all-targets -- -D warnings` clean, `cargo test --workspace` at **128 passing tests** (up
+from the 87 logged at the signing-crypto increment; 24 of them in `backup-local`'s two
+signed integration files). No Docker matrix was run for this increment, so nothing here
+claims M4b acceptance: the PG 16/17/18 sign/verify/DR runs, the signing half of the key
+drill and the stock-`rage` golden CLI assertion are task #32, and artifact v1 is not frozen
+until they are green.

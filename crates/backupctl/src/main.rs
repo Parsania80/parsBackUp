@@ -7,16 +7,23 @@ mod report;
 
 use crate::cli::{
     BackupCommand, Cli, ConfigCommand, KeyCommand, Output, ProfileCommand, RestoreCommand,
-    SecurityPreset, TopCommand, VerifyLevel, key_json, sections_from, selection_json,
+    SecurityPreset, TopCommand, VerifyLevel, json_created, json_inventory, json_record, key_json,
+    sections_from, selection_json, signing_json,
 };
 use crate::report::{
-    print_backup_created, print_inspect, print_keys, print_plan, print_profile_scope,
-    print_restore, print_selection, print_verify,
+    print_backup_created, print_inspect, print_inventory, print_keys, print_plan,
+    print_profile_scope, print_restore, print_selection, print_signing_keys, print_verify,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use backup_application::{BackupService, RestoreService, VerifyService};
-use backup_domain::{Config, RestoreSecurityPolicy, VERIFY_ARCHIVE, VERIFY_CHECKSUM};
-use backup_local::{LocalStore, generate_key_pair, key_status, publish_recipient};
+use backup_domain::{
+    AGE_FORMAT, Config, DEV_FORMAT, RestoreSecurityPolicy, VERIFY_ARCHIVE, VERIFY_CHECKSUM,
+    VERIFY_SIGNATURE,
+};
+use backup_local::{
+    LocalStore, generate_key_pair, generate_signing_pair, key_status, publish_recipient,
+    publish_verifying, signing_key_status,
+};
 use backup_postgres::PostgresAdapter;
 use clap::Parser;
 use std::process::ExitCode;
@@ -35,17 +42,31 @@ fn main() -> ExitCode {
 
 /// Opens the configured store.
 ///
-/// Encryption is a property of the configuration rather than of a command: a config
-/// without an `[encryption]` block writes the plaintext artifacts every earlier
-/// milestone expects, and one with it seals every artifact to the configured recipient.
+/// Encryption and signing are properties of the configuration rather than of a command: a
+/// config without `[encryption]` writes the plaintext artifacts every earlier milestone
+/// expects, one with only that seals them, and adding `[signing]` makes every artifact a
+/// signed v1. A `[signing]` block that names no `signing_key_file` opens the disaster-recovery
+/// shape instead, which verifies and restores and can write nothing.
 fn open_store(config: &Config) -> Result<LocalStore> {
-    match &config.encryption {
-        None => LocalStore::new(config.storage.root.clone()),
-        Some(encryption) => LocalStore::with_keys(
-            config.storage.root.clone(),
+    let root = config.storage.root.clone();
+    let Some(encryption) = &config.encryption else {
+        // Config validation refuses a [signing] block with no [encryption] to seal under.
+        return LocalStore::new(root);
+    };
+    let Some(signing) = &config.signing else {
+        return LocalStore::with_keys(root, &encryption.identity_file, &encryption.recipient_file);
+    };
+    match &signing.signing_key_file {
+        Some(path) => LocalStore::with_signing_keys(
+            root,
             &encryption.identity_file,
             &encryption.recipient_file,
+            path,
+            &signing.verifying_key_file,
         ),
+        None => {
+            LocalStore::for_reading(root, &encryption.identity_file, &signing.verifying_key_file)
+        }
     }
 }
 
@@ -63,10 +84,29 @@ fn run() -> Result<()> {
         TopCommand::Config {
             command: ConfigCommand::Check,
         } => {
+            let (encrypted, signed) = (config.encryption.is_some(), config.signing.is_some());
+            // Which optional blocks are present is the only thing that decides what this
+            // store writes, so `config check` reports the resulting shape instead of
+            // leaving the operator to re-read the TOML after a backup has run.
+            let blocks = match (encrypted, signed) {
+                (true, true) => "[encryption] + [signing]",
+                (true, false) => "[encryption]",
+                (false, _) => "no key blocks",
+            };
+            let shape = if signed {
+                "signed artifact v1"
+            } else if encrypted {
+                AGE_FORMAT
+            } else {
+                DEV_FORMAT
+            };
             if json {
-                println!("{{\"valid\":true,\"mode\":\"synthetic-only\"}}");
+                println!(
+                    "{{\"valid\":true,\"mode\":\"synthetic-only\",\"encryption\":{encrypted},\"signing\":{signed},\"shape\":\"{shape}\"}}"
+                );
             } else {
                 println!("configuration valid (synthetic-only mode)");
+                println!("active blocks: {blocks}; this store writes: {shape}");
             }
         }
         TopCommand::Key { command } => {
@@ -87,16 +127,45 @@ fn run() -> Result<()> {
                     key_status(&encryption.identity_file, &encryption.recipient_file)?
                 }
             };
+            // The signing files are reported and acted on by the same command, because a
+            // backup host needs both pairs correct before a single artifact is trustworthy.
+            let signing = match (&config.signing, &command) {
+                (None, _) => None,
+                (Some(signing), KeyCommand::Status) => Some(signing_key_status(
+                    signing.signing_key_file.as_deref(),
+                    &signing.verifying_key_file,
+                )?),
+                (Some(signing), _) => {
+                    let signing_key_file = signing.signing_key_file.as_ref().ok_or_else(|| {
+                        anyhow!(
+                            "this [signing] block configures no signing_key_file, so this host may verify \
+                             but not produce a signing key; copy the verifying file here instead of generating"
+                        )
+                    })?;
+                    let statuses = match command {
+                        KeyCommand::Generate => {
+                            generate_signing_pair(signing_key_file, &signing.verifying_key_file)?
+                        }
+                        _ => publish_verifying(signing_key_file, &signing.verifying_key_file)?,
+                    };
+                    Some(statuses)
+                }
+            };
             if json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "identity": key_json("identity", &identity),
-                        "recipient": key_json("recipient", &recipient),
-                    }))?
-                );
+                let mut report = serde_json::json!({
+                    "identity": key_json("identity", &identity),
+                    "recipient": key_json("recipient", &recipient),
+                });
+                if let Some(statuses) = &signing {
+                    report["signing"] =
+                        serde_json::Value::Array(statuses.iter().map(signing_json).collect());
+                }
+                println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
                 print_keys(&identity, &recipient);
+                if let Some(statuses) = &signing {
+                    print_signing_keys(statuses);
+                }
             }
         }
         TopCommand::Profile { command } => match command {
@@ -166,7 +235,9 @@ fn run() -> Result<()> {
                     }
                     if !confirm_synthetic {
                         bail!(
-                            "backup create requires --confirm-synthetic; never use this plaintext format for real data"
+                            "backup create requires --confirm-synthetic; no format this build writes is \
+                             trusted for real data until [signing] is configured, and the unsigned \
+                             development formats stay refused for it"
                         );
                     }
                     if config.export_globals && config.encryption.is_none() && !json {
@@ -174,35 +245,37 @@ fn run() -> Result<()> {
                             "warning: globals.sql holds cluster role definitions (never password verifiers) in plaintext; configure [encryption] to seal it"
                         );
                     }
-                    let manifest = service.create(&config, profile.as_deref())?;
+                    let created = service.create(&config, profile.as_deref())?;
                     if json {
-                        println!("{}", serde_json::to_string_pretty(&manifest)?);
+                        let report = json_created(&created)?;
+                        println!("{}", serde_json::to_string_pretty(&report)?);
                     } else {
-                        print_backup_created(&manifest);
+                        print_backup_created(&created);
                     }
                 }
                 BackupCommand::List => {
-                    let manifests = service.list()?;
+                    let inventory = service.list()?;
                     if json {
-                        println!("{}", serde_json::to_string_pretty(&manifests)?);
+                        let report = json_inventory(&inventory)?;
+                        println!("{}", serde_json::to_string_pretty(&report)?);
                     } else {
-                        for item in manifests {
-                            println!("{}  {}  {} bytes", item.id, item.database, item.size_bytes);
-                        }
+                        print_inventory(&inventory);
                     }
                 }
                 BackupCommand::Inspect { id } => {
-                    let manifest = service.inspect(id)?;
+                    let record = service.inspect(id)?;
                     if json {
-                        println!("{}", serde_json::to_string_pretty(&manifest)?);
+                        let report = json_record(&record)?;
+                        println!("{}", serde_json::to_string_pretty(&report)?);
                     } else {
-                        print_inspect(manifest);
+                        print_inspect(&record);
                     }
                 }
                 BackupCommand::Verify { id, level } => {
                     let store = open_store(&config)?;
                     let service = VerifyService::new(PostgresAdapter, store);
                     let level_name = match level {
+                        VerifyLevel::Signature => VERIFY_SIGNATURE,
                         VerifyLevel::Checksum => VERIFY_CHECKSUM,
                         VerifyLevel::Archive => VERIFY_ARCHIVE,
                     };
@@ -217,6 +290,11 @@ fn run() -> Result<()> {
                                 "payload_sha256": report.payload_sha256,
                                 "globals_size_bytes": report.globals_size_bytes,
                                 "globals_sha256": report.globals_sha256,
+                                "origin": report.origin.as_ref().map(|origin| serde_json::json!({
+                                    "signer_id": origin.signer_id,
+                                    "recipient_id": origin.recipient_id,
+                                    "signature_suite": origin.signature_suite,
+                                })),
                             }))?
                         );
                     } else {
@@ -269,6 +347,7 @@ fn run() -> Result<()> {
                                 "sections": executed.plan.sections,
                                 "security": executed.plan.security,
                                 "verification_level": executed.verification_level,
+                                "recorded_in_artifact": executed.recorded_in_artifact,
                             }))?
                         );
                     } else {

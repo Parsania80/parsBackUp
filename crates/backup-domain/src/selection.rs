@@ -32,6 +32,27 @@ impl ResolvedSelection {
     pub fn is_filtered(&self) -> bool {
         !self.whole_database
     }
+
+    /// The namespaces a restore target must hold even though the archive does not create
+    /// them: `pg_dump --table` selections carry no `CREATE SCHEMA` entries, while schema
+    /// selections (and whole-database dumps) do.
+    ///
+    /// This is the rule a restore runs on, so it is stated once here rather than being
+    /// derived twice — once from a development manifest's scope and once from a signed
+    /// manifest's resolved selection.
+    pub fn restore_required_schemas(&self) -> Vec<String> {
+        if !self.schemas.is_empty() || self.tables.is_empty() {
+            return Vec::new();
+        }
+        let mut schemas: Vec<String> = self
+            .tables
+            .iter()
+            .filter_map(|table| table.split_once('.').map(|(schema, _)| schema.to_string()))
+            .collect();
+        schemas.sort();
+        schemas.dedup();
+        schemas
+    }
 }
 
 /// Everything the dump step needs, resolved before the tool runs.

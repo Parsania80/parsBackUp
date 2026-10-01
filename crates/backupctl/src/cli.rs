@@ -2,8 +2,10 @@
 //! translate them. No I/O here, so the mapping from flags to domain values is
 //! readable on its own.
 
+use anyhow::Result;
+use backup_application::{Created, Inventory, Record};
 use backup_domain::{ResolvedSelection, RestoreSections};
-use backup_local::KeyStatus;
+use backup_local::{KeyStatus, SigningKeyStatus, SigningRole};
 use clap::{Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 use uuid::Uuid;
@@ -58,14 +60,17 @@ pub(crate) enum ConfigCommand {
     Check,
 }
 
-/// Every key command acts on the `[encryption]` paths in the configuration, never on
-/// paths typed at the prompt: a key the store will not load is worse than no key at all.
+/// Every key command acts on the paths in the configuration, never on paths typed at the
+/// prompt: a key the store will not load is worse than no key at all. With a `[signing]`
+/// block present the same command acts on its two files as well, so one call reports the
+/// whole set this deployment depends on.
 #[derive(Subcommand)]
 pub(crate) enum KeyCommand {
-    /// Generate the configured identity and publish its recipient half.
+    /// Generate the configured identity and publish its recipient half, plus the signing
+    /// key and its verifying half when `[signing]` names a signing key file.
     Generate,
-    /// Publish the recipient half of an identity that already exists, leaving the
-    /// identity itself untouched.
+    /// Publish the public halves of key files that already exist, leaving the secrets
+    /// untouched.
     Publish,
     /// Report the configured key files without decrypting or printing secret material.
     Status,
@@ -80,8 +85,12 @@ pub(crate) enum ProfileCommand {
     List,
 }
 
+/// Ascending trust: each level includes the one above it. `signature` is only available for
+/// an artifact written as signed v1, and is the level a host that holds nothing but a
+/// verifying key can run.
 #[derive(Clone, Copy, ValueEnum)]
 pub(crate) enum VerifyLevel {
+    Signature,
     Checksum,
     Archive,
 }
@@ -183,5 +192,57 @@ pub(crate) fn key_json(label: &'static str, status: &KeyStatus) -> serde_json::V
         "suite": status.suite,
         "mode": format!("{:04o}", status.mode),
         "recipient": status.recipient_hex,
+    })
+}
+
+/// A signing or verifying key file, in the same shape as [`key_json`]: path, role, suite,
+/// permission bits, and the public fingerprint both halves derive. The signing seed is not
+/// in this report, which is why printing it is safe on a host that may only write backups.
+pub(crate) fn signing_json(status: &SigningKeyStatus) -> serde_json::Value {
+    let role = match status.role {
+        SigningRole::Signing => "signing",
+        SigningRole::Verifying => "verifying",
+    };
+    serde_json::json!({
+        "path": status.path.display().to_string(),
+        "role": role,
+        "suite": status.suite,
+        "mode": format!("{:04o}", status.mode),
+        "signer": status.signer_id,
+    })
+}
+
+/// What a write published, as JSON.
+///
+/// A signed artifact reports two records rather than one, because the two are trusted by
+/// different readers: `public` is what `backup list` and `verify --level signature` check
+/// with no key material at all, while `manifest` is the authenticated detail only a holder of
+/// the decryption identity can read.
+pub(crate) fn json_created(created: &Created) -> Result<serde_json::Value> {
+    Ok(match created {
+        Created::Development(manifest) => serde_json::to_value(manifest)?,
+        Created::Signed { header, manifest } => serde_json::json!({
+            "public": header,
+            "manifest": manifest,
+        }),
+    })
+}
+
+/// The store's contents, as JSON, in the shape the store itself can support: a signed store
+/// reports what `public.json` says plus the ids it cannot describe.
+pub(crate) fn json_inventory(inventory: &Inventory) -> Result<serde_json::Value> {
+    Ok(match inventory {
+        Inventory::Development(manifests) => serde_json::to_value(manifests)?,
+        Inventory::Public(listing) => serde_json::json!({
+            "signed": listing.signed,
+            "unsigned": listing.unsigned,
+        }),
+    })
+}
+
+pub(crate) fn json_record(record: &Record) -> Result<serde_json::Value> {
+    Ok(match record {
+        Record::Development(manifest) => serde_json::to_value(manifest)?,
+        Record::Signed(manifest) => serde_json::to_value(&**manifest)?,
     })
 }

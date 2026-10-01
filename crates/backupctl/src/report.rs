@@ -3,11 +3,12 @@
 //! strings live; the JSON path stays in `run` because it serializes the domain
 //! types directly.
 
-use backup_application::{RestoreOutcome, VerifyReport};
+use backup_application::{Created, Inventory, Record, RestoreOutcome, VerifyReport};
 use backup_domain::{
-    DevelopmentManifest, Profile, ResolvedSelection, RestorePlan, VERIFICATION_NONE,
+    ArtifactManifest, DevelopmentManifest, Profile, ResolvedSelection, RestorePlan,
+    VERIFICATION_NONE,
 };
-use backup_local::KeyStatus;
+use backup_local::{KeyStatus, SigningKeyStatus, SigningRole};
 
 fn print_list(label: &str, values: &[String]) {
     if !values.is_empty() {
@@ -45,6 +46,27 @@ pub(crate) fn print_keys(identity: &KeyStatus, recipient: &KeyStatus) {
     );
 }
 
+/// The signing pair, the same way [`print_keys`] reports the encryption pair: paths, modes,
+/// and the public signer id both files derive. A verifying-only host reports one row, because
+/// holding no signing secret is the point of that configuration.
+pub(crate) fn print_signing_keys(statuses: &[SigningKeyStatus]) {
+    for status in statuses {
+        let role = match status.role {
+            SigningRole::Signing => "signing",
+            SigningRole::Verifying => "verifying",
+        };
+        println!(
+            "{role}: {} (mode {:04o}, suite {})",
+            status.path.display(),
+            status.mode,
+            status.suite
+        );
+    }
+    if let Some(first) = statuses.first() {
+        println!("signer key: {}", first.signer_id);
+    }
+}
+
 pub(crate) fn print_selection(selection: &ResolvedSelection) {
     if selection.whole_database {
         println!("scope: whole database");
@@ -70,7 +92,14 @@ pub(crate) fn print_profile_scope(profile: &Profile) {
     println!("large objects: {}", profile.large_objects);
 }
 
-pub(crate) fn print_backup_created(manifest: &DevelopmentManifest) {
+pub(crate) fn print_backup_created(created: &Created) {
+    match created {
+        Created::Development(manifest) => print_development_created(manifest),
+        Created::Signed { manifest, .. } => print_signed_created(manifest),
+    }
+}
+
+fn print_development_created(manifest: &DevelopmentManifest) {
     println!("created synthetic development backup {}", manifest.id);
     println!("database: {}", manifest.database);
     println!("bytes: {}", manifest.size_bytes);
@@ -103,7 +132,55 @@ pub(crate) fn print_backup_created(manifest: &DevelopmentManifest) {
     );
 }
 
-pub(crate) fn print_inspect(manifest: DevelopmentManifest) {
+/// What a v1 write published.
+///
+/// The record is reported from the manifest that was just sealed and signed, so every line
+/// here is a claim the operator's own key has now attested to — including the two id
+/// fingerprints, which name the keys an artifact can be opened and trusted by.
+fn print_signed_created(manifest: &ArtifactManifest) {
+    println!("created signed artifact v1 {}", manifest.backup_id);
+    println!("source database: {}", manifest.profile_snapshot.database);
+    println!("profile: {}", manifest.profile_snapshot.name);
+    println!(
+        "payload: {} bytes of ciphertext {}, {} of archive",
+        manifest.payload_ciphertext_bytes,
+        manifest.payload_ciphertext_sha256,
+        manifest.archive_plaintext_bytes
+    );
+    println!(
+        "sealed: {} to recipient {}",
+        manifest.recipient_suite, manifest.recipient_id
+    );
+    println!(
+        "signed: {} by signer {}",
+        manifest.signature_suite, manifest.signer_id
+    );
+    println!(
+        "security metadata: {}",
+        if manifest.globals_policy == backup_domain::GLOBALS_POLICY_EXPORTED {
+            "globals.age (roles and memberships, no password verifiers)"
+        } else {
+            "none"
+        }
+    );
+    println!(
+        "verification: {}; the manifest is signed, so later checks are reported by \
+         backup verify rather than written into the artifact",
+        manifest.verification_level
+    );
+}
+
+/// One artifact's record, printed from whichever of the two files describes it. A signed
+/// artifact's detail is only readable by a host holding the decryption identity, which is
+/// precisely why `backup inspect` on such a store needs keys and `backup list` does not.
+pub(crate) fn print_inspect(record: &Record) {
+    match record {
+        Record::Development(manifest) => print_development_inspect(manifest),
+        Record::Signed(manifest) => print_signed_inspect(manifest),
+    }
+}
+
+fn print_development_inspect(manifest: &DevelopmentManifest) {
     println!("id: {}", manifest.id);
     println!("format: {}", manifest.format);
     println!("database: {}", manifest.database);
@@ -131,14 +208,116 @@ pub(crate) fn print_inspect(manifest: DevelopmentManifest) {
     }
     println!(
         "table of contents: {}",
-        manifest.toc_sha256.unwrap_or_else(|| "none".to_string())
+        manifest
+            .toc_sha256
+            .clone()
+            .unwrap_or_else(|| "none".to_string())
     );
     println!(
         "verification: {}",
         manifest
             .verification_level
+            .clone()
             .unwrap_or_else(|| VERIFICATION_NONE.to_string())
     );
+}
+
+fn print_signed_inspect(manifest: &ArtifactManifest) {
+    println!("id: {}", manifest.backup_id);
+    println!("format: signed artifact v1");
+    println!(
+        "engine: {} major {}",
+        manifest.engine, manifest.source_server_major
+    );
+    println!("source server: {}", manifest.source_server_version);
+    println!("client: {}", manifest.dump_client_version);
+    println!(
+        "written: {} to {}",
+        manifest.started_at_utc, manifest.completed_at_utc
+    );
+    println!("source fingerprint: {}", manifest.source_fingerprint);
+    println!("profile: {}", manifest.profile_snapshot.name);
+    println!("source database: {}", manifest.profile_snapshot.database);
+    println!(
+        "scope: {}",
+        if manifest.resolved_selection.whole_database {
+            "whole database".to_string()
+        } else {
+            format!(
+                "{} schemas, {} relations",
+                manifest.resolved_selection.schemas.len(),
+                manifest.resolved_selection.tables.len()
+            )
+        }
+    );
+    print_list("resolved schemas", &manifest.resolved_selection.schemas);
+    print_list("resolved relations", &manifest.resolved_selection.tables);
+    print_list(
+        "extension members",
+        &manifest.resolved_selection.extension_members,
+    );
+    println!(
+        "payload: {} bytes of ciphertext {}, {} of archive",
+        manifest.payload_ciphertext_bytes,
+        manifest.payload_ciphertext_sha256,
+        manifest.archive_plaintext_bytes
+    );
+    println!(
+        "globals: {}",
+        match (manifest.globals_policy.as_str(), &manifest.globals_sha256) {
+            (backup_domain::GLOBALS_POLICY_EXPORTED, Some(sha)) => format!(
+                "{} bytes {}",
+                manifest.globals_ciphertext_bytes.unwrap_or_default(),
+                sha
+            ),
+            (backup_domain::GLOBALS_POLICY_SKIPPED, None) => "skipped".to_string(),
+            _ => "declared inconsistently".to_string(),
+        }
+    );
+    println!(
+        "sealed: {} to recipient {}, signed: {} by signer {}",
+        manifest.recipient_suite,
+        manifest.recipient_id,
+        manifest.signature_suite,
+        manifest.signer_id
+    );
+    println!(
+        "table of contents: {}",
+        manifest
+            .archive_toc_sha256
+            .clone()
+            .unwrap_or_else(|| "recorded by verify --level archive".to_string())
+    );
+    println!("verification: {}", manifest.verification_level);
+}
+
+/// What the store holds, in the shape it can be listed.
+///
+/// A signed store's listing is unauthenticated by design — these are candidates to verify,
+/// not facts — and the pre-v1 artifacts it cannot describe are named by id so that nothing in
+/// the store is hidden from the operator who has to decide what to restore.
+pub(crate) fn print_inventory(inventory: &Inventory) {
+    match inventory {
+        Inventory::Development(manifests) => {
+            for item in manifests {
+                println!("{}  {}  {} bytes", item.id, item.database, item.size_bytes);
+            }
+        }
+        Inventory::Public(listing) => {
+            for header in &listing.signed {
+                println!(
+                    "{}  {} bytes  signed v1 (signer {})",
+                    header.backup_id, header.payload_ciphertext_bytes, header.signer_id
+                );
+            }
+            for id in &listing.unsigned {
+                println!("{id}  unsigned development artifact; no record without keys");
+            }
+            if listing.signed.is_empty() && listing.unsigned.is_empty() {
+                println!("no artifacts");
+            }
+        }
+    }
 }
 
 pub(crate) fn print_verify(report: &VerifyReport) {
@@ -152,6 +331,15 @@ pub(crate) fn print_verify(report: &VerifyReport) {
     );
     if let (Some(size), Some(sha)) = (report.globals_size_bytes, &report.globals_sha256) {
         println!("globals: {size} bytes {sha}");
+    }
+    if let Some(origin) = &report.origin {
+        println!(
+            "origin: {} signature by signer {}, sealed to recipient {}",
+            origin.signature_suite, origin.signer_id, origin.recipient_id
+        );
+    }
+    if report.level == backup_domain::VERIFY_SIGNATURE {
+        println!("nothing was decrypted to produce this report");
     }
 }
 
@@ -186,6 +374,11 @@ pub(crate) fn print_restore(executed: &RestoreOutcome) {
         executed.plan.artifact_id, executed.plan.target_database
     );
     println!("verification level: {}", executed.verification_level);
+    if !executed.recorded_in_artifact {
+        println!(
+            "note: this run did not change what the artifact itself records about verification"
+        );
+    }
     if !executed.plan.sections.is_full() {
         println!(
             "warning: only part of the archive was replayed, so this run does not prove the artifact restores completely"

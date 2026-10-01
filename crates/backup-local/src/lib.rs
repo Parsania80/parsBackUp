@@ -11,17 +11,25 @@ mod layout;
 
 use anyhow::{Context, Result, bail};
 use backup_application::{
-    ArtifactHandle, ArtifactStore, PayloadSink, PlaintextView, StageHandle, StagedBytes,
-    WriteOptions,
+    ArtifactHandle, ArtifactStore, PayloadSink, PlaintextView, SignedArtifactHandle,
+    SignedKeyFacts, StageHandle, StagedBytes, StoreListing, WriteOptions,
 };
+use backup_crypto::HybridRecipient;
+use backup_crypto::keyid::{recipient_id, signer_id};
 pub use backup_crypto::keystore::KeyStatus;
 use backup_crypto::keystore::{IdentityProvider, KeyFile, KeyRole, status as read_key_file};
+use backup_crypto::protocol::{DIGEST_BYTES, HYBRID_SIGNATURE_BYTES};
+use backup_crypto::signing::{SigningKeyFile, signature_tuple, status as signing_status};
+pub use backup_crypto::signing::{SigningKeyStatus, SigningRole};
 use backup_crypto::stream::{EncryptSink, decrypt, decrypt_with_limit};
-use backup_domain::{AGE_FORMAT, DevelopmentManifest, RestorePlan};
+use backup_domain::{
+    AGE_FORMAT, ArtifactManifest, DevelopmentManifest, GLOBALS_POLICY_EXPORTED,
+    GLOBALS_POLICY_SKIPPED, MAX_PUBLIC_JSON_BYTES, PublicHeader, RestorePlan,
+};
 use layout::{
-    AGE_GLOBALS_FILE, AGE_PAYLOAD_FILE, ARTIFACTS_DIR, COMPLETE_MARKER, GLOBALS_FILE,
-    MANIFEST_FILE, MANIFEST_TMP_FILE, MAX_MANIFEST_BYTES, MAX_PLAN_BYTES, PAYLOAD_FILE,
-    PLAN_SUFFIX, PLANS_DIR, SCRATCH_DIR, STAGING_DIR,
+    AGE_GLOBALS_FILE, AGE_MANIFEST_FILE, AGE_PAYLOAD_FILE, ARTIFACTS_DIR, COMPLETE_MARKER,
+    GLOBALS_FILE, MANIFEST_FILE, MANIFEST_TMP_FILE, MAX_MANIFEST_BYTES, MAX_PLAN_BYTES,
+    PAYLOAD_FILE, PLAN_SUFFIX, PLANS_DIR, PUBLIC_FILE, SCRATCH_DIR, SIGNATURE_FILE, STAGING_DIR,
 };
 use sha2::{Digest, Sha256};
 use std::fs::{self, DirBuilder, File, OpenOptions};
@@ -31,10 +39,37 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use uuid::Uuid;
 
-/// The two key files an encrypted store seals with and opens with.
+/// The key material a store holds.
+///
+/// `identity` is set exactly when artifacts are encrypted. The other three are separate
+/// because custody differs by host rather than by command: a backup writer holds
+/// `recipient` plus `signing`, while a disaster-recovery host holds `identity` plus
+/// `verifying` and must be *unable* to do anything else. An artifact is written as signed v1
+/// precisely when this store holds a signing key, so the shape of the store follows from the
+/// keys it was configured with rather than from a flag on the call.
 pub struct StoreKeys {
     identity: KeyFile,
-    recipient: KeyFile,
+    recipient: Option<KeyFile>,
+    /// The secret half of the origin signature. Never read on a host that only verifies, and
+    /// never rendered: its `Debug` names the path.
+    signing: Option<SigningKeyFile>,
+    /// The public half this store trusts. Verification is what a reader does with it, so a
+    /// store configured without it cannot read a signed artifact at all.
+    verifying: Option<SigningKeyFile>,
+}
+
+/// A v1 artifact whose signature has been checked.
+///
+/// Reaching one of these means both ciphertext digests were recomputed from the files on
+/// disk, the signature over them verified against the configured verifying key, and only
+/// then was `manifest.age` decrypted and compared field by field with `public.json`. So a
+/// value read off [`SignedArtifactHandle::manifest`] is a claim about bytes written by whoever
+/// holds the signing key, not about bytes an attacker chose.
+pub struct SignedArtifact {
+    header: PublicHeader,
+    manifest: ArtifactManifest,
+    payload: PathBuf,
+    globals: Option<PathBuf>,
 }
 
 pub struct LocalStore {
@@ -185,6 +220,27 @@ impl StageHandle for LocalStage {
     }
 }
 
+impl SignedArtifactHandle for SignedArtifact {
+    /// The untrusted-by-itself discovery record this artifact was opened from, now checked
+    /// against the signature and the manifest.
+    fn header(&self) -> &PublicHeader {
+        &self.header
+    }
+
+    /// The manifest from `manifest.age`, authenticated by the signature over its ciphertext.
+    fn manifest(&self) -> &ArtifactManifest {
+        &self.manifest
+    }
+
+    fn payload_path(&self) -> &Path {
+        &self.payload
+    }
+
+    fn globals_path(&self) -> Option<&Path> {
+        self.globals.as_deref()
+    }
+}
+
 impl ArtifactHandle for LocalArtifact {
     fn id(&self) -> Uuid {
         self.manifest.id
@@ -224,7 +280,88 @@ impl LocalStore {
             root,
             Some(StoreKeys {
                 identity,
-                recipient,
+                recipient: Some(recipient),
+                signing: None,
+                verifying: None,
+            }),
+        )
+    }
+
+    /// A store that writes signed v1 artifacts: it seals to the configured recipient and
+    /// signs with the configured signing key.
+    ///
+    /// The two signing halves are loaded together and required to be the *same* key, because
+    /// a store that signs under one key while trusting another publishes artifacts its own
+    /// next command refuses to read. That failure is cheap to detect here and expensive to
+    /// discover during a restore.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_signing_keys(
+        root: PathBuf,
+        identity_file: impl AsRef<Path>,
+        recipient_file: impl AsRef<Path>,
+        signing_key_file: impl AsRef<Path>,
+        verifying_key_file: impl AsRef<Path>,
+    ) -> Result<Self> {
+        let (identity, recipient) = load_pair(identity_file.as_ref(), recipient_file.as_ref())?;
+        let signing = SigningKeyFile::load(signing_key_file.as_ref(), SigningRole::Signing)
+            .with_context(|| {
+                format!(
+                    "load signing key file {}",
+                    signing_key_file.as_ref().display()
+                )
+            })?;
+        let verifying = SigningKeyFile::load(verifying_key_file.as_ref(), SigningRole::Verifying)
+            .with_context(|| {
+            format!(
+                "load verifying key file {}",
+                verifying_key_file.as_ref().display()
+            )
+        })?;
+        if signing.verifier() != verifying.verifier() {
+            bail!(
+                "verifying key file {} is not the public half of signing key file {}",
+                verifying_key_file.as_ref().display(),
+                signing_key_file.as_ref().display()
+            );
+        }
+        Self::open(
+            root,
+            Some(StoreKeys {
+                identity,
+                recipient: Some(recipient),
+                signing: Some(signing),
+                verifying: Some(verifying),
+            }),
+        )
+    }
+
+    /// A store that reads, verifies, and restores v1 artifacts, and cannot write any.
+    ///
+    /// This is the disaster-recovery shape: the decryption identity plus the trusted
+    /// verifying key, with no recipient and no signing secret to lose. `publish` and
+    /// [`LocalStore::publish_signed`] both refuse here rather than producing something this
+    /// host could not have authenticated.
+    pub fn for_reading(
+        root: PathBuf,
+        identity_file: impl AsRef<Path>,
+        verifying_key_file: impl AsRef<Path>,
+    ) -> Result<Self> {
+        let identity = KeyFile::load(identity_file.as_ref(), KeyRole::Identity)
+            .with_context(|| format!("load identity file {}", identity_file.as_ref().display()))?;
+        let verifying = SigningKeyFile::load(verifying_key_file.as_ref(), SigningRole::Verifying)
+            .with_context(|| {
+            format!(
+                "load verifying key file {}",
+                verifying_key_file.as_ref().display()
+            )
+        })?;
+        Self::open(
+            root,
+            Some(StoreKeys {
+                identity,
+                recipient: None,
+                signing: None,
+                verifying: Some(verifying),
             }),
         )
     }
@@ -289,16 +426,26 @@ impl LocalStore {
                 .clone()
                 .with_context(|| format!("stage has no {}", target.name()))?,
         };
+        // Resolved before the file is created: a store that cannot seal a stream should not
+        // leave an empty staged file behind on its way to refusing the call.
+        let writer = match &self.keys {
+            None => None,
+            Some(keys) => Some(
+                keys.recipient
+                    .as_ref()
+                    .context("this store holds no recipient file, so it cannot seal a new dump")?,
+            ),
+        };
         let file = OpenOptions::new()
             .write(true)
             .create_new(true)
             .mode(0o600)
             .open(&path)
             .with_context(|| format!("create staged {}", target.name()))?;
-        let writer = match &self.keys {
+        let writer = match writer {
             None => Writer::Plain { file, written: 0 },
-            Some(keys) => Writer::Age(
-                EncryptSink::new(keys.recipient.recipient(), file)
+            Some(recipient) => Writer::Age(
+                EncryptSink::new(recipient.recipient(), file)
                     .with_context(|| format!("open {} stream", target.name()))?,
             ),
         };
@@ -352,11 +499,130 @@ impl LocalStore {
         Ok(view)
     }
 
+    /// The ids this store's own key files derive, as a v1 manifest and `public.json` must
+    /// record them.
+    ///
+    /// These are the two numbers that make a mis-set configuration visible instead of merely
+    /// fatal: an artifact names the recipient it was sealed to and the key that signed it,
+    /// and both are computed here from key bytes rather than copied from a config file.
+    fn key_ids(&self) -> Result<(String, String)> {
+        let keys = self
+            .keys
+            .as_ref()
+            .context("no key files are configured, so there is no key to identify")?;
+        let recipient = recipient_id(
+            &keys
+                .recipient
+                .as_ref()
+                .context("this store holds no recipient file, so it cannot name a recipient")?
+                .recipient()
+                .as_bytes(),
+        );
+        let signer = signer_id(
+            &keys
+                .verifying
+                .as_ref()
+                .context("this store holds no verifying key, so it cannot name a signer")?
+                .verifier()
+                .to_bytes(),
+        );
+        Ok((recipient, signer))
+    }
+
+    /// Writes `plaintext` to `path` as one age stream sealed to `recipient`, and leaves it
+    /// on disk synced.
+    ///
+    /// The private manifest is sealed with the same recipient as the payload it describes:
+    /// it names a database, a server version, and an operator's profile, none of which
+    /// belongs in a directory that may be copied off-site for disaster recovery. Its
+    /// ciphertext digest is what the signature covers, so it has to be a file on disk before
+    /// anything is signed.
+    fn seal_to_file(recipient: &HybridRecipient, path: &Path, plaintext: &[u8]) -> Result<()> {
+        let file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+            .with_context(|| format!("create sealed {}", path.display()))?;
+        let mut sink = EncryptSink::new(recipient, file)
+            .with_context(|| format!("open stream for {}", path.display()))?;
+        sink.write_all(plaintext)?;
+        let (file, _) = sink.finish()?;
+        file.sync_all()?;
+        Ok(())
+    }
+
+    /// Creates one file the caller has sized and bounded, with the store's durability
+    /// idiom: `create_new` so a second writer can never replace it, then `sync_all` so the
+    /// bytes are on disk before the directory that names them is renamed.
+    fn write_private_file(path: &Path, bytes: &[u8]) -> Result<()> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+            .with_context(|| format!("create {}", path.display()))?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        Ok(())
+    }
+
+    /// Reads and validates `public.json`. The record is bounded before the parser sees it,
+    /// and every field in it is still untrusted here — the signature check that follows is
+    /// what makes it true.
+    fn read_header(&self, dir: &Path) -> Result<PublicHeader> {
+        let path = dir.join(PUBLIC_FILE);
+        ensure_regular_file(&path)?;
+        let bytes = read_bounded(&path, MAX_PUBLIC_JSON_BYTES as u64 + 1)?;
+        let text = std::str::from_utf8(&bytes)
+            .with_context(|| format!("{} is not valid UTF-8", path.display()))?;
+        PublicHeader::from_json(text)
+    }
+
+    /// Decrypts `manifest.age` into scratch, reads it under the manifest size cap, and
+    /// returns the authenticated manifest. The scratch copy is gone before this returns.
+    fn authenticated_manifest(&self, path: &Path) -> Result<ArtifactManifest> {
+        let view = self.decrypt_to_scratch(path, MANIFEST_FILE, Some(MAX_MANIFEST_BYTES))?;
+        let result = (|| -> Result<ArtifactManifest> {
+            let bytes = read_bounded(view.path(), MAX_MANIFEST_BYTES + 1)?;
+            let manifest: ArtifactManifest = serde_json::from_slice(&bytes)
+                .context("manifest.age does not hold a v1 artifact manifest")?;
+            manifest.validate()?;
+            Ok(manifest)
+        })();
+        drop(view);
+        result
+    }
+
+    /// Refuses an artifact directory holding both a plaintext `manifest.json` and a sealed
+    /// `manifest.age`: two manifests for one id means the store cannot say which record the
+    /// payload belongs to, and guessing would let an older plaintext manifest describe a
+    /// newer ciphertext.
+    fn refuse_split_manifest(dir: &Path) -> Result<()> {
+        let both = dir.join(MANIFEST_FILE).symlink_metadata().is_ok()
+            && dir.join(AGE_MANIFEST_FILE).symlink_metadata().is_ok();
+        if both {
+            bail!(
+                "artifact holds both {MANIFEST_FILE} and {AGE_MANIFEST_FILE}; a store with two manifests for one id cannot be read safely"
+            );
+        }
+        Ok(())
+    }
+
     fn load_artifact(&self, id: Uuid) -> Result<LocalArtifact> {
         let dir = self.artifact_dir(id);
         ensure_real_dir(&dir)?;
         let marker = dir.join(COMPLETE_MARKER);
         ensure_regular_file(&marker)?;
+        // A v1 artifact carries no plaintext manifest, so reading it as an older shape would
+        // report a missing file instead of the real reason: this artifact has a signature to
+        // check first, and that is a different reader.
+        Self::refuse_split_manifest(&dir)?;
+        if dir.join(AGE_MANIFEST_FILE).symlink_metadata().is_ok() {
+            bail!(
+                "artifact {id} is a signed v1 artifact; the signed reader does, not the manifest.json reader"
+            );
+        }
         let manifest_path = dir.join(MANIFEST_FILE);
         ensure_regular_file(&manifest_path)?;
         let mut bytes = Vec::new();
@@ -425,6 +691,35 @@ impl ArtifactStore for LocalStore {
     type Stage = LocalStage;
     type Artifact = LocalArtifact;
     type Plaintext = LocalPlaintext;
+    type Signed = SignedArtifact;
+
+    /// True when this store's configuration names a signing key pair, i.e. its artifacts are
+    /// the signed v1 shape. The older shapes stay readable through the other methods; what
+    /// changes is that a new artifact gets a sealed manifest and a signature.
+    fn is_signed(&self) -> bool {
+        self.keys
+            .as_ref()
+            .is_some_and(|keys| keys.signing.is_some() || keys.verifying.is_some())
+    }
+
+    fn signed_key_facts(&self) -> Result<SignedKeyFacts> {
+        let keys = self
+            .keys
+            .as_ref()
+            .context("no key files are configured, so there is no key to identify")?;
+        let (recipient, signer) = self.key_ids()?;
+        Ok(SignedKeyFacts {
+            recipient_id: recipient,
+            signer_id: signer,
+            // The suite the store's own verifying key belongs to: what a reader of this
+            // store's artifacts sizes `signature.hybrid` by.
+            signature_suite: keys
+                .verifying
+                .as_ref()
+                .context("this store holds no verifying key, so it signs nothing")?
+                .suite(),
+        })
+    }
 
     fn begin(&self, id: Uuid, options: &WriteOptions) -> Result<Self::Stage> {
         let dir = self.root.join(STAGING_DIR).join(id.to_string());
@@ -484,6 +779,14 @@ impl ArtifactStore for LocalStore {
     }
 
     fn publish(&self, stage: Self::Stage, manifest: &DevelopmentManifest) -> Result<()> {
+        // The unsigned shape and the signed shape are mutually exclusive per store, and this
+        // is where that is enforced: a store configured to sign has no way to publish a
+        // plaintext manifest, so a configuration mistake cannot silently downgrade it.
+        if self.is_signed() {
+            bail!(
+                "this store has [signing] configured, so it publishes only signed v1 artifacts; use publish_signed"
+            );
+        }
         if stage.id != manifest.id {
             bail!("manifest ID does not match staging ID");
         }
@@ -641,6 +944,310 @@ impl ArtifactStore for LocalStore {
         Ok(())
     }
 
+    /// Publishes a staged dump as a signed v1 artifact, in the contract's writer order:
+    /// the staged `payload.age` (and `globals.age` when declared), then `manifest.age`,
+    /// `signature.hybrid`, and `public.json`, and only then the directory rename with
+    /// `complete` last.
+    ///
+    /// Nothing reaches `artifacts/` before the signature has been written *and* checked
+    /// against this store's own verifying key, so a v1 store has no reachable state in which
+    /// an unsigned artifact is visible. That is the property the reader relies on: the only
+    /// way an artifact in this store lacks a valid signature is that something changed it
+    /// after publication.
+    fn publish_signed(
+        &self,
+        stage: LocalStage,
+        manifest: &ArtifactManifest,
+    ) -> Result<PublicHeader> {
+        let keys = self.keys.as_ref().context(
+            "a signed artifact needs [encryption] and [signing] key files; this store has neither",
+        )?;
+        let signing = keys.signing.as_ref().context(
+            "this store holds no signing key, so it publishes nothing: a host configured only \
+             to verify cannot write artifacts",
+        )?;
+        let recipient = keys
+            .recipient
+            .as_ref()
+            .context("this store holds no recipient file, so it cannot seal an artifact")?;
+        if !stage.sealed_payload.load(Ordering::Relaxed) {
+            bail!("payload stream was never finished; staged artifact was not published");
+        }
+        if manifest.backup_id != stage.id {
+            bail!("manifest ID does not match staging ID");
+        }
+        manifest.validate_writable()?;
+        let (derived_recipient, derived_signer) = self.key_ids()?;
+        if manifest.recipient_id != derived_recipient {
+            bail!(
+                "manifest records recipient id {} but the configured recipient derives {derived_recipient}",
+                manifest.recipient_id
+            );
+        }
+        if manifest.signer_id != derived_signer {
+            bail!(
+                "manifest records signer id {} but the configured signing key derives {derived_signer}",
+                manifest.signer_id
+            );
+        }
+        let (payload_bytes, payload_digest) = self.measure(&stage)?;
+        if payload_bytes != manifest.payload_ciphertext_bytes
+            || payload_digest != manifest.payload_ciphertext_sha256
+        {
+            bail!("staged payload changed, or the manifest was not built from it");
+        }
+        match (
+            manifest.globals_policy.as_str(),
+            stage.globals.as_ref(),
+            manifest.globals_sha256.as_ref(),
+        ) {
+            (GLOBALS_POLICY_EXPORTED, Some(path), Some(digest)) => {
+                if !stage.sealed_globals.load(Ordering::Relaxed) {
+                    bail!("globals stream was never finished; staged artifact was not published");
+                }
+                let (bytes, measured) = hash_file(path)?;
+                if manifest.globals_ciphertext_bytes != Some(bytes) || digest != &measured {
+                    bail!("staged globals file changed, or the manifest was not built from it");
+                }
+            }
+            (GLOBALS_POLICY_SKIPPED, None, None) => {}
+            _ => bail!(
+                "manifest globals policy {:?} disagrees with what the stage holds",
+                manifest.globals_policy
+            ),
+        };
+        let manifest_path = stage.dir.join(AGE_MANIFEST_FILE);
+        let mut manifest_bytes =
+            serde_json::to_vec_pretty(manifest).context("serialize artifact manifest")?;
+        manifest_bytes.push(b'\n');
+        if manifest_bytes.len() as u64 > MAX_MANIFEST_BYTES {
+            bail!(
+                "private manifest is {} bytes, over the {MAX_MANIFEST_BYTES} byte limit",
+                manifest_bytes.len()
+            );
+        }
+        Self::seal_to_file(recipient.recipient(), &manifest_path, &manifest_bytes)?;
+        let (manifest_ciphertext_bytes, manifest_digest) = hash_file(&manifest_path)?;
+        let tuple = signature_tuple(
+            stage.id.as_bytes(),
+            &digest_bytes(&manifest_digest)?,
+            &digest_bytes(&payload_digest)?,
+        );
+        let signature = signing
+            .signer()?
+            .try_sign(&tuple)
+            .context("origin signature failed")?;
+        let signature_path = stage.dir.join(SIGNATURE_FILE);
+        Self::write_private_file(&signature_path, signature.as_bytes())?;
+        // Re-read and checked from the bytes on disk, at exactly the length the reader will
+        // require: publishing a signature this store could not verify would produce an
+        // artifact that is unreadable by design.
+        let stored = read_bounded(&signature_path, HYBRID_SIGNATURE_BYTES as u64 + 1)?;
+        let written = backup_crypto::signing::HybridSignature::from_bytes(&stored)
+            .context("signature.hybrid was not written at the suite's exact length")?;
+        signing
+            .verifier()
+            .verify(&tuple, &written)
+            .context("freshly written signature does not verify against this store's key")?;
+        let header = PublicHeader::seal(manifest, &manifest_digest, manifest_ciphertext_bytes)?;
+        Self::write_private_file(
+            stage.dir.join(PUBLIC_FILE).as_path(),
+            header.to_json()?.as_bytes(),
+        )?;
+        File::open(&stage.dir)?.sync_all()?;
+        let final_dir = self.artifact_dir(stage.id);
+        if final_dir.exists() {
+            bail!("artifact ID already exists");
+        }
+        fs::rename(&stage.dir, &final_dir).context("publish staged artifact")?;
+        File::open(self.root.join(ARTIFACTS_DIR))?.sync_all()?;
+        let marker = final_dir.join(COMPLETE_MARKER);
+        let marker_file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(marker)?;
+        marker_file.sync_all()?;
+        File::open(&final_dir)?.sync_all()?;
+        Ok(header)
+    }
+
+    /// Lists what the store holds using only `public.json`, so this works while holding no
+    /// key material at all — which is exactly why the fields it reports stay untrusted.
+    ///
+    /// Nothing here is decrypted and no signature is checked: a listing is how an operator
+    /// finds an artifact to verify, and verifying is [`LocalStore::verify_signed`]. Pre-v1
+    /// artifacts are reported by id rather than skipped, because an unsigned artifact that a
+    /// signature-first listing hides is the failure mode this function exists to catch.
+    fn list_signed(&self) -> Result<StoreListing> {
+        let mut listing = StoreListing {
+            signed: Vec::new(),
+            unsigned: Vec::new(),
+        };
+        for entry in fs::read_dir(self.root.join(ARTIFACTS_DIR))? {
+            let path = entry?.path();
+            let Some(id) = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(|name| Uuid::parse_str(name).ok())
+            else {
+                continue;
+            };
+            if !path.join(COMPLETE_MARKER).exists() {
+                continue;
+            }
+            if path.join(PUBLIC_FILE).symlink_metadata().is_ok() {
+                listing.signed.push(self.read_header(&path)?);
+            } else {
+                listing.unsigned.push(id);
+            }
+        }
+        listing.signed.sort_by_key(|header| header.backup_id);
+        listing.unsigned.sort();
+        Ok(listing)
+    }
+
+    /// The reader's first three steps and no further: parse `public.json`, recompute both
+    /// ciphertext digests from the files on disk, and verify the signature over the backup id
+    /// and those digests against the configured verifying key.
+    ///
+    /// No manifest is decrypted here, so this is the whole of what a host holding nothing but
+    /// a verifying key can prove about an artifact.
+    fn verify_signed(&self, id: Uuid) -> Result<PublicHeader> {
+        let keys = self
+            .keys
+            .as_ref()
+            .context("artifact is signed but no key files are configured")?;
+        let verifying = keys
+            .verifying
+            .as_ref()
+            .context("no verifying key is configured, so no signature can be trusted")?;
+        let dir = self.artifact_dir(id);
+        ensure_real_dir(&dir)?;
+        ensure_regular_file(&dir.join(COMPLETE_MARKER))?;
+        Self::refuse_split_manifest(&dir)?;
+        let header = self.read_header(&dir)?;
+        if header.backup_id != id {
+            bail!(
+                "public.json records backup id {}, found under directory {id}",
+                header.backup_id
+            );
+        }
+        let payload = dir.join(AGE_PAYLOAD_FILE);
+        ensure_regular_file(&payload)?;
+        let (payload_bytes, payload_digest) = hash_file(&payload)?;
+        if payload_bytes != header.payload_ciphertext_bytes
+            || payload_digest != header.payload_sha256
+        {
+            bail!(
+                "payload.age is not the ciphertext public.json describes: {payload_bytes} bytes digesting {payload_digest}"
+            );
+        }
+        let manifest_path = dir.join(AGE_MANIFEST_FILE);
+        ensure_regular_file(&manifest_path)?;
+        let (manifest_bytes, manifest_digest) = hash_file(&manifest_path)?;
+        if manifest_bytes != header.manifest_ciphertext_bytes
+            || manifest_digest != header.manifest_sha256
+        {
+            bail!(
+                "manifest.age is not the ciphertext public.json describes: {manifest_bytes} bytes digesting {manifest_digest}"
+            );
+        }
+        let signature_path = dir.join(SIGNATURE_FILE);
+        ensure_regular_file(&signature_path)?;
+        let stored = read_bounded(&signature_path, HYBRID_SIGNATURE_BYTES as u64 + 1)?;
+        let signature = backup_crypto::signing::HybridSignature::from_bytes(&stored)
+            .with_context(|| format!("read {}", signature_path.display()))?;
+        let tuple = signature_tuple(
+            id.as_bytes(),
+            &digest_bytes(&manifest_digest)?,
+            &digest_bytes(&payload_digest)?,
+        );
+        verifying
+            .verifier()
+            .verify(&tuple, &signature)
+            .with_context(|| format!("origin signature of artifact {id} does not verify"))?;
+        Ok(header)
+    }
+
+    /// Reads one v1 artifact, authenticating it before decrypting anything.
+    ///
+    /// The order is the contract's, and it is the whole point of the type: [`Self::verify_signed`]
+    /// first, and only then is `manifest.age` opened — under a size bound, and checked field by
+    /// field against the header it was sealed beside.
+    ///
+    /// `globals.age` is bound one step further in, by the digest inside the signed manifest,
+    /// so a swapped globals file is caught through the signature rather than by its own
+    /// metadata.
+    fn open_signed(&self, id: Uuid) -> Result<SignedArtifact> {
+        let header = self.verify_signed(id)?;
+        // Everything from here in was written by whoever holds the configured signing key.
+        let dir = self.artifact_dir(id);
+        let manifest = self.authenticated_manifest(&dir.join(AGE_MANIFEST_FILE))?;
+        manifest.matches_header(&header)?;
+        if manifest.backup_id != id {
+            bail!(
+                "authenticated manifest records backup id {}, requested {id}",
+                manifest.backup_id
+            );
+        }
+        let payload = dir.join(AGE_PAYLOAD_FILE);
+        let globals_path = dir.join(AGE_GLOBALS_FILE);
+        let globals = match manifest.globals_policy.as_str() {
+            GLOBALS_POLICY_EXPORTED => {
+                ensure_regular_file(&globals_path)?;
+                let (bytes, digest) = hash_file(&globals_path)?;
+                if manifest.globals_sha256.as_deref() != Some(digest.as_str())
+                    || manifest.globals_ciphertext_bytes != Some(bytes)
+                {
+                    bail!(
+                        "globals.age does not match the digest inside the signed manifest; the file was changed after publication"
+                    );
+                }
+                Some(globals_path)
+            }
+            GLOBALS_POLICY_SKIPPED => {
+                if globals_path.symlink_metadata().is_ok() {
+                    bail!(
+                        "artifact holds a globals file its authenticated manifest declares skipped"
+                    );
+                }
+                None
+            }
+            other => bail!("manifest globals policy {other:?} is not a known policy"),
+        };
+        Ok(SignedArtifact {
+            header,
+            manifest,
+            payload,
+            globals,
+        })
+    }
+
+    /// The authenticated payload as plaintext, decrypted into the store's scratch directory
+    /// and removed when the returned view is dropped.
+    ///
+    /// The bound is `archive_plaintext_bytes`, a number from inside the signature, so a
+    /// ciphertext that inflates past what the manifest promised is refused while streaming
+    /// rather than after the write.
+    fn payload_plaintext(&self, artifact: &SignedArtifact) -> Result<LocalPlaintext> {
+        self.decrypt_to_scratch(
+            &artifact.payload,
+            PAYLOAD_FILE,
+            Some(artifact.manifest.archive_plaintext_bytes),
+        )
+    }
+
+    /// The authenticated globals file as plaintext, under the format-wide bound: role
+    /// metadata carries no recorded plaintext size in the manifest.
+    fn globals_plaintext(&self, artifact: &SignedArtifact) -> Result<LocalPlaintext> {
+        let path = artifact
+            .globals
+            .as_ref()
+            .context("authenticated manifest declares no globals file")?;
+        self.decrypt_to_scratch(path, GLOBALS_FILE, None)
+    }
+
     fn save_plan(&self, plan: &RestorePlan) -> Result<()> {
         let path = self.plan_path(plan.id);
         let mut file = OpenOptions::new()
@@ -786,6 +1393,79 @@ pub fn publish_recipient(
     key_status(identity_file, recipient_file)
 }
 
+/// Generates the signing key and publishes its verifying half, in one deliberate step.
+///
+/// The same all-or-nothing rule as [`generate_key_pair`]: neither file is created unless
+/// neither already exists. A signing key whose verifying half was never written signs
+/// artifacts this deployment cannot read, and re-running the command to find out would
+/// replace the first key with an unrelated second one.
+pub fn generate_signing_pair(
+    signing_key_file: impl AsRef<Path>,
+    verifying_key_file: impl AsRef<Path>,
+) -> Result<Vec<SigningKeyStatus>> {
+    let signing_key_file = signing_key_file.as_ref();
+    let verifying_key_file = verifying_key_file.as_ref();
+    for path in [signing_key_file, verifying_key_file] {
+        refuse_occupied(path)?;
+    }
+    for path in [signing_key_file, verifying_key_file] {
+        ensure_private_parent(path)?;
+    }
+    let signing = SigningKeyFile::create_signing(signing_key_file)?;
+    SigningKeyFile::write_verifying(verifying_key_file, signing.verifier())?;
+    signing_key_status(Some(signing_key_file), verifying_key_file)
+}
+
+/// Publishes the verifying half of a signing key this CLI did not generate, so an operator
+/// who supplied the seed themselves can make the store trust the pair.
+///
+/// Only the verifying file is written, and only into free space: the signing seed is read
+/// and never modified, because rewriting it is the one action that makes every artifact
+/// signed under it unverifiable under the key a reader holds.
+pub fn publish_verifying(
+    signing_key_file: impl AsRef<Path>,
+    verifying_key_file: impl AsRef<Path>,
+) -> Result<Vec<SigningKeyStatus>> {
+    let signing_key_file = signing_key_file.as_ref();
+    let verifying_key_file = verifying_key_file.as_ref();
+    refuse_occupied(verifying_key_file)?;
+    let signing = SigningKeyFile::load(signing_key_file, SigningRole::Signing)
+        .with_context(|| format!("load signing key file {}", signing_key_file.display()))?;
+    ensure_private_parent(verifying_key_file)?;
+    SigningKeyFile::write_verifying(verifying_key_file, signing.verifier())?;
+    signing_key_status(Some(signing_key_file), verifying_key_file)
+}
+
+/// Reports the configured signing key files: path, role, suite, permission bits, and the
+/// public signer id. No secret is in the result, which is what makes it safe to print.
+///
+/// The verifying file is required and the signing file optional, because that is the split
+/// between the two hosts: a disaster-recovery machine trusts a public key and must not hold
+/// a private one. When both are named they have to be the same key, since a store that signs
+/// under one key while trusting another publishes artifacts its own next command refuses.
+pub fn signing_key_status(
+    signing_key_file: Option<&Path>,
+    verifying_key_file: &Path,
+) -> Result<Vec<SigningKeyStatus>> {
+    let verifying = SigningKeyFile::load(verifying_key_file, SigningRole::Verifying)
+        .with_context(|| format!("load verifying key file {}", verifying_key_file.display()))?;
+    let mut statuses = Vec::new();
+    if let Some(path) = signing_key_file {
+        let signing = SigningKeyFile::load(path, SigningRole::Signing)
+            .with_context(|| format!("load signing key file {}", path.display()))?;
+        if signing.verifier() != verifying.verifier() {
+            bail!(
+                "verifying key file {} is not the public half of signing key file {}",
+                verifying_key_file.display(),
+                path.display()
+            );
+        }
+        statuses.push(signing_status(signing.path(), SigningRole::Signing)?);
+    }
+    statuses.push(signing_status(verifying.path(), SigningRole::Verifying)?);
+    Ok(statuses)
+}
+
 fn ensure_real_dir(path: &Path) -> Result<()> {
     let meta = fs::symlink_metadata(path)?;
     if meta.file_type().is_symlink() || !meta.is_dir() {
@@ -816,6 +1496,46 @@ fn hash_file(path: &Path) -> Result<(u64, String)> {
         hasher.update(&buffer[..n]);
     }
     Ok((bytes, format!("{:x}", hasher.finalize())))
+}
+
+/// Reads at most `limit` bytes, refusing a file that turns out to be larger.
+///
+/// The cap is applied while reading rather than from the file's reported size, because a
+/// size an attacker controls is not a bound: the reader has to stop on its own terms.
+fn read_bounded(path: &Path, limit: u64) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    File::open(path)?.take(limit).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > limit {
+        bail!(
+            "{} is larger than the {limit} byte bound this reader applies",
+            path.display()
+        );
+    }
+    Ok(bytes)
+}
+
+/// A recorded digest as the raw bytes the signed tuple needs.
+///
+/// The text has already been validated as lowercase hex by the record it came from, and is
+/// re-checked here rather than trusted: a hostile `public.json` reaches this function, and
+/// bytes that are not a digest must be a refusal, not a panic or a silent padding.
+fn digest_bytes(value: &str) -> Result<[u8; DIGEST_BYTES]> {
+    let text = value.as_bytes();
+    if text.len() != DIGEST_BYTES * 2 {
+        bail!("{value:?} is not a SHA-256 digest");
+    }
+    let mut digest = [0u8; DIGEST_BYTES];
+    for (byte, pair) in digest.iter_mut().zip(text.chunks_exact(2)) {
+        let nibble = |value: u8| -> Result<u8> {
+            match value {
+                b'0'..=b'9' => Ok(value - b'0'),
+                b'a'..=b'f' => Ok(value - b'a' + 10),
+                _ => bail!("{value:?} is not a lowercase hex digit"),
+            }
+        };
+        *byte = (nibble(pair[0])? << 4) | nibble(pair[1])?;
+    }
+    Ok(digest)
 }
 
 #[cfg(test)]
