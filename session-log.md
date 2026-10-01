@@ -425,3 +425,156 @@ variants restored to pristine between cases. Both seeds were grepped out of ever
 (`grep -f` over `key status --output json`: no match), no `PGDMP` magic and no fixture role name
 reached the store, and `staging/` and `scratch/` were empty after every refusal. No Rust source
 changed, so `cargo fmt`/`clippy`/`test` results from the freeze stand.
+
+## 2026-10-01 — M5 scoped as ADR 0003, written against the code rather than against the roadmap
+
+`docs/architecture/adr-0003-backup-inventory-jobs-retention.md` was drafted as a proposal and
+**accepted the same day**: it states the milestone's gaps, the decisions that fork the design, and
+the runs a close needs. No M5 code was written. The operator answered all seven decisions exactly
+as recommended after the first table form of them came back unreadable, so the questions were
+rewritten as the problem each one solves — the roadmap's M5 bullet then gained its status line and
+the threat model's T03 row gained its scoped clause.
+
+**What the survey established.** M5 is greenfield: `crates/backup-local/Cargo.toml` carries no SQL
+dependency and no crate in the workspace mentions a metadata database, jobs, retention or pruning;
+`BackupCommand` is `create|list|inspect|verify` and `RestoreCommand` is `plan|run`, so
+`backup protect|delete|prune` from roadmap §12 do not exist and **nothing in the current build can
+destroy a backup**. `backup list` is a directory scan returning
+`StoreListing { signed, unsigned }`.
+
+**Four findings that shaped the draft, each from a read of the frozen code.** (1) `backup_id` is
+UUIDv4 (`backup-application/src/lib.rs:536`, `uuid` features `["v4", "serde"]` in the workspace
+manifest), so ids order nothing and "newest" has to come from `completed_at_utc` or from a
+sequence M5 assigns. (2) A v1 manifest records `verification_level: none` always and no reader
+raises it, so roadmap §10's "count only verified/complete artifacts as valid" **cannot be read
+off the artifact** — whether a backup was verified is a fact about a host at a time, which is
+inventory state, and it also means "restore-tested" is per-host and does not travel. (3) M4b
+sealed the manifest because it names a database, a host's shape and an operator's scope; a
+plaintext database holding those same strings would reopen T13 in the one file operators will
+casually copy, so the recommended schema is key-free columns only and `backup inspect` keeps
+decrypting. (4) "catalog" already means PostgreSQL's catalog — on 74 lines across seven non-test
+Rust files — so the new subsystem is named **inventory** to keep two `catalog.rs` files from
+meaning different things.
+
+**The seven decisions, accepted as recommended on 2026-10-01.** Increment boundary (M5a
+observability, M5b deletion), placement and schema (`<root>/inventory.db`, key-free columns),
+which side is authoritative (files for existence, db for lifecycle, unregistered vs missing,
+explicit adoption), what a job is in a synchronous CLI (persisted states and a lock, no worker
+pool, `job cancel` deferred), retention mechanics (per `source_fingerprint`-and-profile
+`keep_last`, protection as a column because a sidecar file would change the frozen v1 shape,
+plan-digest confirmation reusing the restore plan mechanism, **marker-first**
+deletion so a crashed delete leaves a directory the reader already refuses, rows kept as `deleted`
+because the rebuild scan cannot resurrect them anyway), how far a local ledger honestly goes
+on T03 (a high-water-mark alarm labeled as one, with the chained signed inventory declared out of
+scope for a future ADR), and the naming decision above — which is why the file is
+`adr-0003-backup-inventory-jobs-retention.md`.
+
+Two accepted consequences are written as limits rather than left as details: losing `inventory.db`
+costs the protection flags, so the M6 guide has to tell an operator to back that file up; and the
+rollback ledger is not T03's mitigation, so the threat model row stays open.
+
+**Verification performed:** docs-only change, `cargo fmt --all --check` exit 0, the repository-wide
+relative-link check reports no broken links, and every code claim above was taken from a grep or a
+read of the file cited rather than from the roadmap's description of it.
+
+## 2026-10-01 — the M5 spike ran, and one of its measurements reversed a recommendation
+
+ADR 0003 deliberately left the SQLite questions to a spike that would measure them. It ran the same
+day in `/tmp/m5-catalog` as a probe binary plus ten driver scripts, and the repository gained no
+dependency from it.
+
+**The driver, measured.** `rusqlite` 0.40.2 resolves to `libsqlite3-sys` 0.38.2 and reports
+`rusqlite=3.53.2 bundled_sqlite=3.53.2`. The system-library variant was not merely worse, it was
+impossible here: `rust-lld: error: unable to find library -lsqlite3`, because `libsqlite3-dev` is
+not installed — and had it linked, the binary would have been pinned to the distro's
+`libsqlite3-0:amd64 3.46.1-9ubuntu0.3` instead of 3.53.2. Cold build ~53 s either way, dominated by
+the amalgamation. rusqlite is **+2.2 MB** in the release binary (444,952 B without it, 2,710,408 B
+with `features = ["bundled"]`), and `default-features = false` on the *same source* removes 3 crates
+(`hashlink`, `foldhash`, `hashbrown` — the `cache` feature) and 5,424 bytes. So the pin is
+`rusqlite = { version = "0.40.2", default-features = false, features = ["bundled"] }`, and the size
+argument for or against the default features turned out to be noise; the argument is that a
+statement cache does nothing for a CLI that opens, runs a few statements, and exits.
+
+**Journal mode: the reversal.** WAL was the assumed answer, on a concurrency argument nobody had
+tested. With one process holding an open write transaction, a second reader got
+`complete_rows=41 after 1ms` with the held row invisible under **both** WAL and DELETE, and a second
+writer was refused at `busy_timeout=200` after 201 ms / 202 ms — identical, because a synchronous CLI
+has no reader standing inside the one commit window where a rollback journal blocks. The only place
+WAL won is a write shape the inventory will not use: 5,000 autocommit inserts took **128–130 ms**
+under WAL and **394–406 ms** under DELETE; batched into one transaction both are 42–56 ms and
+`synchronous` is irrelevant (NORMAL 42 ms, FULL 43 ms). What WAL costs is on the disaster-recovery
+path, and the probe found it by accident: a WAL database whose `-wal`/`-shm` are absent — which is
+what "copy the `.db`" produces — **cannot be opened read-only in a directory the process may not
+write to**: `attempt to write a readonly database`, from the plain read-only open *and* from
+read-write plus `PRAGMA query_only=ON`, because WAL must create the `-shm` before it can read. A
+rollback-journal database in the identical position opens in all three ways. Copy the sidecars too
+and WAL works (`journal=wal rows=41`), which is the whole problem: it depends on files nobody
+thinks of as part of the store. The inventory is therefore `journal_mode=DELETE`,
+`synchronous=FULL` — one file, copyable, readable from read-only media, and durable without
+praying over a crash.
+
+**Three rounds had to be thrown away, and why.** Round 3's six read-only scenes all "succeeded"
+because the `check` probe run between them had already created the `-shm`; round 4 rebuilt each
+scene in its own directory with the sidecars removed immediately before the open and `ls` used to
+prove it. Round 6 was written in the same shape as the earlier drivers and its `mk()` printed the
+database path *and* the probe output on stdout, so `db=$(mk …)` swallowed everything into the
+variable, the subshell inherited `set -u`, and `local j=$1 lbl=$2 d="$W/$lbl"` aborted on the
+unbound `lbl` — six scenes ran against the empty string, panicked at
+`called Option::unwrap() on a None value`, and reported `no such table: artifact` for databases that
+had never been created. The numbers were real but measured against nothing; round 6 was fixed and
+re-run, and the fix is why `readnow` now prints the row count it read. Round 7's `corrupt`
+subcommand did not corrupt anything — it only reopened a healthy database, which is why its
+`integrity=ok` line meant nothing; it is renamed `reopen` and the corruption evidence comes from
+round 8, which zeroes 512 bytes into the middle of a populated file.
+
+**What the probes forced into the design** (all of it now in the ADR's dependency section, each with
+the measurement attached): rusqlite's default `busy_timeout` is **5000 ms** — a probe that asked for
+no timeout waited 5005 ms before refusing, and the same probe printing `PRAGMA busy_timeout` is what
+caught it, so every open sets it explicitly or an operator waits five seconds for a lock instead of
+getting an answer. `Connection::open` on a missing path **creates** it, and a 0-byte `inventory.db`
+is a legal empty database (`integrity=ok`, `user_version=0`, `no such table: artifact`), so
+"the inventory exists" has to mean `user_version >= 1` plus the tables, and `PRAGMA user_version` is
+the migration lever. `query_only` is **not** a read-only open — it created a nonexistent file — so
+read paths use `SQLITE_OPEN_READ_ONLY`. `immutable=1` **silently serves stale rows**: it reported
+`journal=delete rows=41` while the same database held 43 including two committed rows sitting in the
+`-wal` the flag tells SQLite to ignore; prohibited against a live store. `SIGKILL` mid-transaction
+left `integrity=ok` with the committed rows present and the uncommitted one gone, so choice 4A's
+"row still in `running` means interrupted" is the whole recovery story and no application-side
+journaling is needed. And **a corrupt inventory still answers queries**: after the byte-zeroing,
+`integrity_check` reported `Rowid 83 out of order` and `Fragmentation of 303 bytes reported as 0 on
+page 16` while `SELECT count(*) FROM artifact` returned `201` under both journal modes — so the
+check command must run `integrity_check` itself, and gates 7–9 now assert that rather than trusting
+exit status. Scale is not a problem: 5,001 artifacts are 2.06 MB, `VACUUM` 7–9 ms, `page_size` 4096,
+`PRAGMA optimize` 0 ms.
+
+**Round 10 answered the lock question choice 4 left open.** A `flock` on a separate file, held by one
+process for 3 s: a second invocation is refused in **0 ms**, succeeds the instant the holder exits,
+and after a `SIGKILL` of the holder the lock is **free again with a 0-byte file left behind** — the
+kernel closes the descriptor, so there is no stale-pid cleanup path to write or get wrong. A blocking
+waiter got it after 2588 ms. The decisive scene is the one that ran both at once: while a process
+held an open **write transaction**, `locktry` on the lock file reported `lock free`, because SQLite's
+lock exists only while rows are being written and a `backup create` spends nearly all its runtime
+streaming a dump with no transaction open. The overlap refusal is about the whole run, so the
+`flock` is the job lock and the database's own locking stays as what keeps two row-writes from
+interleaving — complementary, not alternatives. Read paths take no lock, so a DR host with the store
+on read-only media runs `list`, `inspect` and `verify` without creating anything: **writes need a
+writable root, reads need nothing but `inventory.db`.**
+
+**Placement was the one question a spike could not measure,** so it is settled by the argument the
+ADR already had: `crates/backup-inventory`, its port in `backup-application`, no dependency on
+`backup-crypto` — which turns choice 2's key-free schema rule from a code-review note into a crate
+boundary, since nothing in that crate can receive a plaintext path.
+
+**Files changed:** `docs/architecture/adr-0003-backup-inventory-jobs-retention.md` (dependency
+section rewritten as measured results, status note updated, choice 4's lock question closed, gates
+7–9 added, a third consequence added), `project.md` (M5 paragraph's last sentence now records the
+settled dependency set instead of deferring it), `session-log.md` (this entry). Crate graph, code,
+and tests: unchanged.
+
+**Verification performed:** every number above is copied from a run in `/tmp/m5-catalog`
+(`spike.sh`, `spike2.sh` … `spike10.sh`, probe sources in `spike/src/main.rs`), the repo-relative
+link check reports 0 broken links, and `cargo fmt --all --check` exits 0. `cargo clippy` and
+`cargo test --workspace` were **not** re-run: this change touches no Rust source in this repository,
+and the spike's own crate lives outside it. Two things remain unmeasured and are written as limits
+rather than resolved: power-loss behaviour, which `SIGKILL` does not simulate, and the `.deb` build
+with a C toolchain in `Build-Depends`.
