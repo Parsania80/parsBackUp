@@ -8,7 +8,10 @@ encrypted, and a read decrypts only into a transient private view that the store
 Encryption is a property of the **deployment**, not of a run: a configuration with an
 `[encryption]` block writes sealed artifacts, one without it writes the M1 plaintext
 artifacts the earlier guides describe. There is deliberately no `--encrypt` or `--no-encrypt`
-flag, because a flag is something a schedule forgets.
+flag, because a flag is something a schedule forgets. Adding a `[signing]` block on top of
+this one moves the store to signed [artifact v1](../backup-format/manifest-v1.md), which
+seals the manifest as well and authenticates who wrote the artifact; this guide describes the
+encryption-only shape and what it does and does not prove.
 
 ## Requirements
 
@@ -75,22 +78,31 @@ past its own manifest is refused rather than allowed to fill the disk.
 
 ## Known limitations
 
-1. **Artifacts are not signed.** Integrity is proven, origin is not. Replacing a payload
-   with a *different valid artifact sealed to the same recipient* is undetectable by M4a:
-   age authenticates a stream, not which of your backups it came from. That is M4b's
-   signature, and it is why **no real-data artifact should be published before M4b**.
-2. **The manifest is still plaintext JSON.** `manifest.json` sits beside the ciphertext and
-   `backup inspect` reads it without any key. It carries the database name, resolved scope,
-   timings, client versions, digests and sizes — none of which age has sealed. Encrypting
-   the manifest (`manifest.age`, plus a bounded `public.json` for discovery) is part of
-   freezing artifact v1 at M4b. See [manifest v1](../backup-format/manifest-v1.md).
+1. **This shape is not signed.** Integrity is proven, origin is not. Replacing a payload
+   with a *different valid artifact sealed to the same recipient* is undetectable here: age
+   authenticates a stream, not which of your backups it came from. M4b's signature closes
+   it, and a store that writes real data must configure `[signing]` so it writes artifact v1
+   instead of this shape. **No real-data artifact should be published in the
+   encryption-only shape** — see [key lifecycle](../security/key-lifecycle.md) for the
+   signed procedures and [ADR 0002](../architecture/adr-0002-artifact-v1-and-signing.md) for
+   the format that replaced it.
+2. **The manifest of this shape is still plaintext JSON.** `manifest.json` sits beside the
+   ciphertext and `backup inspect` reads it without any key: database name, resolved scope,
+   timings, client versions, digests and sizes, none of it sealed. Artifact v1 moved it
+   inside `manifest.age` with a bounded `public.json` beside it, which a store with
+   `[signing]` writes; the M4a shape keeps the plaintext manifest deliberately so that the
+   artifacts this milestone produced still read. See
+   [manifest v1](../backup-format/manifest-v1.md).
 3. **Both key files must be present for every command**, including `backup create`. The
    configuration separates the two halves because a write-only host *should* need only the
    recipient, and today it does not get that: the store loads the pair before it touches the
    storage root. Keeping a secret the schedule never uses on the backup host is the cost of
-   deferring that port split; it is listed as open work, not as a supported topology.
-4. **One key pair per configuration, and no key ID in the manifest.** Which generation a
-   backup belongs to is your ledger's job; automated generation tracking belongs to M5's
+   deferring that port split; it is listed as open work, not as a supported topology. The
+   signing pair does have a working split (a host configured with `verifying_key_file` alone
+   is refused on `backup create`), so this limit is specific to `[encryption]`.
+4. **One key pair per configuration.** A v1 artifact records `recipient_id` and `signer_id`,
+   so a generation is now visible in the bytes, but nothing tracks *which* key directory
+   holds the halves for a given artifact: automated generation tracking belongs to M5's
    catalog. See [key lifecycle](../security/key-lifecycle.md).
 5. **No re-encryption.** There is no command that reads a plaintext archive out of one
    generation and seals it into another, because doing so puts plaintext in reach of the
@@ -101,8 +113,11 @@ past its own manifest is refused rather than allowed to fill the disk.
    because the plan-time tooling needs a seekable archive. An attacker who has already read
    the store at the moment of a restore can read that file too; the milestone narrows the
    window and the cleanup, it does not eliminate plaintext on the restoring host.
-7. **Stock-`rage` divergence is a contract, not yet a golden CLI assertion.** It is enforced
-   by repository-level tests on the recipient; the CLI-level fixture is still open.
+7. **Stock-`rage` divergence is a contract, enforced here at recipient level.** Repository
+   tests in `backup-crypto` prove that our writer's stream is unreadable by stock `rage` and
+   vice versa; the CLI-level assertion that a real `backupctl` artifact is refused by a stock
+   `rage` binary landed with the format freeze in `tests/m4b_docker_smoke.sh`, because a
+   fixture belongs with a shape that has stopped changing.
 8. **Synthetic fixtures only.** The `backupctl_fixture_*` database-name requirement and
    `--confirm-synthetic` are unchanged; there is no scheduling, catalog, retention, or
    network transport in this CLI.
@@ -113,4 +128,7 @@ past its own manifest is refused rather than allowed to fill the disk.
 unfinished streams and the scratch cleanup. `tests/m4a_docker_smoke.sh` and
 `tests/m4a_key_drill.sh` both run against PostgreSQL 16, 17 and 18; the drill executes the
 key lifecycle document end to end, including an identity the operator supplied themselves.
-The M1, M2 and M3 matrices were re-run after the encrypted write path landed.
+The M1, M2 and M3 matrices were re-run after the encrypted write path landed, and the whole
+set — M1, M2, M3 and M4a on all three majors — was run again on 2026-10-01 with artifact v1
+implemented, so an encrypted-but-unsigned store still writes, lists, verifies and restores
+exactly the layout this guide describes.

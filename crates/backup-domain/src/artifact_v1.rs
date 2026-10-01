@@ -116,8 +116,10 @@ pub struct ArtifactManifest {
     /// Bytes the payload decrypts to, which is the bound a restore writes under before it
     /// has authenticated anything.
     pub archive_plaintext_bytes: u64,
-    /// Present once an archive-level verification has listed the TOC, never before: the
-    /// manifest is signed, so a later check cannot be written into it.
+    /// Recorded when the artifact is written, from the table of contents listed off the
+    /// staged archive before anything was sealed. A signed manifest cannot gain a fact
+    /// later, so archive-level verification compares against this digest instead of
+    /// filling it in, and refuses an artifact that recorded none.
     pub archive_toc_sha256: Option<String>,
     pub verification_level: String,
     pub compatibility_notes: Vec<String>,

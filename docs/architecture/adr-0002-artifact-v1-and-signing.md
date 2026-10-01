@@ -1,7 +1,9 @@
 # ADR 0002: Origin signature and the artifact v1 freeze
 
-Status: **proposed** — records the M4b shape chosen on 2026-09-28. The three items in
-"Open choices" need the operator's confirmation before implementation starts.
+Status: **accepted** (2026-10-01) — the M4b shape chosen on 2026-09-28, implemented, and
+validated against real PostgreSQL 16, 17 and 18. The four choices in "Choices (accepted)"
+below were confirmed by the operator on 2026-09-28; what the run then surfaced is recorded in
+"Validation" and in the two written limits at the end of it.
 
 ## Context
 
@@ -89,7 +91,9 @@ depends on a second check rather than on the signature itself.
    fields refused. Discovery works with no keys at all.
 2. `backup inspect`, `backup verify` and `restore plan` recompute both ciphertext digests and
    verify `signature.hybrid` against the configured trusted verifying key **before** any
-   decryption. `signature.hybrid` is sized from the recorded `signature_suite`, not parsed.
+   decryption. `signature.hybrid` has one fixed 3373-byte length for the suite this build
+   writes, so a file of any other size is refused at parse time rather than sized from the
+   header's claim.
 3. Only then is `manifest.age` decrypted and authenticated as a whole, and its suite fields,
    backup id and payload digest compared against `public.json`. A disagreement is a refusal,
    not a warning.
@@ -168,28 +172,71 @@ artifact that mysteriously verifies — or, on the reading side, as one that nev
 ### What the freeze commits to
 
 `docs/backup-format/manifest-v1.md` moves from proposal to **frozen**, with its field list
-reconciled against what the writer actually emits, and a golden v1 fixture is checked in and
-re-read by every future reader change. The stock-`rage` divergence assertion deferred from
-M4a lands as a golden CLI assertion in the same increment, because that is the point where
-the fixture stops changing.
+reconciled against what the writer actually emits.
+
+The golden-fixture plan written here on 2026-09-28 was **not** what landed, and the
+difference is intentional. A checked-in v1 fixture is a byte-for-byte artifact whose reader
+rules a future change must keep accepting; it is the right test once an artifact from another
+host can arrive at a store. At this milestone every v1 byte in existence was produced by this
+same repository, so the freeze is instead pinned by three cheaper assertions that do not
+require publishing a secret-bearing file into git:
+
+- deterministic golden signature and key-encoding vectors in `backup-crypto`'s crate tests,
+  which is where a signature-format change has to be noticed;
+- `tests/m4b_docker_smoke.sh` reading a freshly written `payload.age` header and asserting
+  exactly one `mlkem768x25519` recipient stanza, no other stanza but age's own `*-grease`,
+  and a `signature.hybrid` of exactly 3373 bytes;
+- the same run feeding that artifact to stock `rage`, which refuses it — the deferred M4a
+  "our stream is not a plain X25519 age file" assertion, now at CLI level.
+
+Add the checked-in fixture when the first real cross-host artifact exists, not before.
 
 ## Validation
+
+Items 1–2 ran with the implementation; items 3–4 ran with `tests/m4b_docker_smoke.sh` on
+2026-10-01. Recorded as executed, with the two limits the runs surfaced written as limits
+rather than smoothed over.
 
 1. Crate tests in `backup-crypto`: exact 3373-byte length with ±1-byte refusal, both halves
    verified independently, one-half-only refused, deterministic golden vector, seed
    round-trip through the key-file format, `ZeroizeOnDrop` compile-time assertions, key-file
-   mode/symlink/ownership rules reused for the new roles.
+   mode/symlink/ownership rules reused for the new roles. **Ran**: `cargo test --workspace`
+   on 2026-10-01 — 128 passed, 0 failed.
 2. Store tests in `backup-local`: writer order (no `complete` without a signature), refusing
    an unsigned or single-leg `signature.hybrid`, refusing a `public.json` over its cap or with
    an unknown critical field, refusing suite disagreement between header and manifest,
    detecting a swapped `globals.age` through the signed manifest, and refusing a signature
-   made by a key that is not the trusted one.
+   made by a key that is not the trusted one. **Ran** in the same suite.
 3. CLI: `key status` over all four files, `--output json` carrying no secret, and the
-   stock-`rage` golden assertion.
+   stock-`rage` golden assertion. **Ran**, in `tests/m4b_docker_smoke.sh` rather than as a
+   checked-in fixture: `key status` rows are compared against the files they describe (roles,
+   `0600`/`0644` modes, suite, derived ids) and the assertion "no command printed a seed"
+   greps the JSON for both the 64-character identity seed and the 128-character signing seed.
 4. Docker: a new `tests/m4b_docker_smoke.sh` writes, signs, verifies at all three levels and
    DR-restores on PostgreSQL 16, 17 and 18; `tests/m4a_key_drill.sh` gains a signing half to
    the lifecycle drill (offline copy, rotation, loss, and a restore with no signing key
-   present). The M1–M4a matrices are re-run, and the M4a artifact paths must still verify.
+   present). **Ran on all three majors** for both scripts, and `tests/m1_docker_smoke.sh`,
+   `m2_`, `m3_` and `m4a_` were re-run on all three with the M4a artifact paths still
+   verifying.
+
+### Two limits this freeze ships with
+
+- **A suite downgrade in `public.json` is not caught at `--level signature`.** The signed
+  tuple covers `backup_id`, `SHA256(manifest.age)` and `SHA256(payload.age)` only; it does
+  not cover `signature_suite`, `recipient_suite`, `signer_id` or `recipient_id`. So an editor
+  who rewrites `public.json` to claim `ed25519` passes signature-level verification while the
+  report echoes the false claim, and the refusal arrives one step later, when the header is
+  compared against the authenticated manifest ("public header and manifest disagree on
+  signature_suite"). `--level checksum` and `--level archive` reach that comparison, and
+  `restore plan` does too, so no restore path relies on the header's word — but a reader that
+  trusts `public.json`'s suite fields *because* a signature verified has misread what the
+  signature authenticated. Pinned as matrix case 6.11 so the behavior cannot silently change.
+- **A missing file is reported as an I/O error, not as a contract refusal.** Remove
+  `complete` and the store refuses, as it must, but the message is the bare
+  `No such file or directory (os error 2)` from the stat rather than the contract sentence
+  naming the completion marker. Same shape for a missing key file. The refusal and its
+  position in the reader order are what the tests assert; a reader triaging a stored
+  artifact has to know that an absent component speaks in errno. Matrix case 6.7.
 
 ## Choices (accepted)
 
