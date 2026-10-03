@@ -8,7 +8,7 @@ use backup_domain::{
     ArtifactManifest, DevelopmentManifest, Profile, ResolvedSelection, RestorePlan,
     VERIFICATION_NONE,
 };
-use backup_local::{KeyStatus, SigningKeyStatus, SigningRole};
+use backup_local::{KeyStatus, Recovery, SigningKeyStatus, SigningRole};
 
 fn print_list(label: &str, values: &[String]) {
     if !values.is_empty() {
@@ -90,6 +90,33 @@ pub(crate) fn print_profile_scope(profile: &Profile) {
     print_list("excluded tables", &profile.exclude_tables);
     print_list("excluded extensions", &profile.exclude_extensions);
     println!("large objects: {}", profile.large_objects);
+}
+
+/// What ADR 0004's maintenance pass did before this backup ran, in the one case an operator has to
+/// know about: that it *didn't*. A quiet store with nothing to clear prints nothing here, so a normal
+/// nightly backup stays as silent as it was.
+pub(crate) fn print_recovery(recovery: &Recovery) {
+    if !recovery.claimed {
+        eprintln!(
+            "warning: another command is using this store's working directories, so nothing was \
+             cleared and no abandoned job was marked interrupted"
+        );
+        return;
+    }
+    for path in &recovery.refused {
+        eprintln!(
+            "warning: {} is not a directory this tool writes, so it was left alone",
+            path.display()
+        );
+    }
+    if recovery.removed.is_empty() && recovery.interrupted.is_empty() {
+        return;
+    }
+    eprintln!(
+        "cleared {} abandoned working directory(s), marked {} job(s) interrupted",
+        recovery.removed.len(),
+        recovery.interrupted.len()
+    );
 }
 
 pub(crate) fn print_backup_created(created: &Created) {

@@ -43,7 +43,7 @@ Local artifacts share the host's failure domain. Do not claim host-loss recovery
 | M5a increment 1 | `backup-inventory`, schema v1, estate binding, SQLite open rules and scope flock | Inventory reads/rebuild are not yet exposed through the CLI. |
 | M5a increment 2 | Signed publication registers an artifact row after the completion marker | Development artifacts remain unregistered. |
 | M5a increment 3 | Schema v2 jobs/audit; backup creation drives running/staged/complete | Restore jobs, verification events, reconcile/rebuild and crash matrix remain. |
-| Concurrency review | Same-scope job acquisition is tested mid-dump | Store initialization deletes live staging/scratch before locking: confirmed blocker. |
+| Phase S | Same-scope acquisition is tested mid-dump **and** by two real CLI processes | Opening a store removes nothing; work owns `activity.lock` shared, only `backup create` cleans it exclusively. Recovery, job surface and crash matrix remain for phase A. |
 | Operations/service | None yet | Scheduling, packaging, production hardening, API and UI remain planned. |
 
 Review evidence: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo test --workspace` passed; 167 tests passed, zero failed. Existing PostgreSQL 16/17/18 matrices have historical passing records through M4b. They were not rerun in the review or this rewrite. Test counts describe the baseline, not a target future count.
@@ -173,13 +173,13 @@ Do not mark a threat closed because one happy-path test passed. Record the attac
 
 Files are authoritative for artifact existence; inventory is authoritative for what this host recorded. Missing files never count as a remaining valid backup. An artifact absent from inventory is unregistered and never an automatic retention candidate. Reconciliation must not imply adoption or authenticated verification.
 
-The confirmed blocker is `LocalStore::open` removing all directories below staging/scratch before a job lock is acquired. A second `backup list` can remove live working data while a scope flock remains held. Fix it before further feature work; do not rely on the current same-process overlap test to prove safety.
+The blocker phase S closed was `LocalStore::open` removing all directories below staging/scratch before a job lock was acquired, so a second `backup list` removed live working data while a scope flock remained held. It is fixed in S02/S03 and pinned by `crates/backupctl/tests/store_concurrency.rs`, which runs competing CLI processes rather than calling a guard from one process.
 
-Planned S02 ownership baseline: ordinary read opening never performs cleanup. Backup/restore/verify operations that use working directories hold shared store-activity ownership for the entire relevant resource lifetime. A cleanup operation requires exclusive store-activity ownership and fails/skips without deleting when an active operation holds it. Scope locks still reject duplicate source/profile backups; shared activity ownership must not serialize different profiles. Keep a fixed lock inode outside immutable artifact directories and never unlink it. Attach ownership to stage/plaintext guards so it outlives their users, not merely an early helper call.
+Owned design, as recorded in `docs/architecture/adr-0004-working-directory-ownership.md`: ordinary opening performs no cleanup at all. A stage or a decrypted plaintext view holds `<root>/locks/activity.lock` shared for the entire lifetime of the directory it owns. The only code that removes a working directory is `LocalStore::recover`, invoked by `backup create` before resolution and before any scope claim; it takes that lock exclusive, nonblocking, and skips the whole store — reporting the skip, deleting nothing — while any operation holds it shared. Scope locks still reject duplicate source/profile backups, and because shared claims are compatible with each other, per-profile concurrency is unchanged. The lock file has a fixed name outside immutable artifact directories and is never unlinked. A nonmutating read that uses no working data takes no claim.
 
-Record this new maintenance/activity design and lock acquisition order in `docs/architecture/adr-0004-working-directory-ownership.md` before implementation. It supplements ADR 0003 rather than pretending the old scope lock covers every scratch user. A nonmutating read can avoid the activity lock when it uses no working data. If a read-only artifact root requires decrypted scratch, use a separately private writable scratch area only after its configuration/lifetime contract is recorded; never write into the read-only root or silently fall back to a public temp directory.
+If a read-only artifact root requires decrypted scratch, use a separately private writable scratch area only after its configuration/lifetime contract is recorded; never write into the read-only root or silently fall back to a public temp directory. A read-only root is refused with its path named (ADR 0004 Decision 7).
 
-Cleanup treats errors as errors, not as evidence an entry is abandoned. Process age/PID alone is not liveness. Crash recovery preserves published artifacts, reports abandoned staging, and removes only working directories it owns exclusively. Do not reset protected or verified facts during reconciliation.
+Cleanup treats errors as errors, not as evidence an entry is abandoned. Process age/PID alone is not liveness. Under the exclusive claim only a UUID-named *directory* is removed; a symlink, a regular file, or a name this tool would not write is reported and left alone. Crash recovery preserves published artifacts, reports abandoned staging, and removes only working directories it owns exclusively. Do not reset protected or verified facts during reconciliation.
 
 M5b deletion has four hard exclusions: protected artifact, active/restoring artifact, artifact required by an in-progress job, and the last known valid artifact in its source/profile scope. Revalidate before execution, remove the completion marker first, sync the directory, remove files, retain tombstone/audit history. Interrupted deletion is never reported as an intact valid backup.
 
@@ -372,7 +372,7 @@ A new model should be able to resume from status plus contracts without trusting
 | 4 | M3 profiles/selective operations | ✅ Done | Restricted names/dependencies/sections. |
 | 5 | M4a hybrid encryption/keys | ✅ Done | Streams, custody, recovery drills. |
 | 6 | M4b signing/v1 freeze | ✅ Done | Frozen 2026-10-01 with explicit limits. |
-| 7 | S — M5a cleanup/concurrency correction | 🔄 Current | Confirmed blocker; implementation not yet started. |
+| 7 | S — M5a cleanup/concurrency correction | ✅ Done | Startup purge removed; ownership proved by two-process scenes and both lock controls. |
 | 8 | C1 — clean code and human readability | ⬜ Todo | Next, after S accepts; before new M5a features. |
 | 9 | A — complete M5a inventory/jobs/recovery | ⬜ Todo | Three earlier increments already implemented. |
 | 10 | B — M5b retention/protection/deletion | ⬜ Todo | Requires complete M5a and C1. |
@@ -382,8 +382,8 @@ A new model should be able to resume from status plus contracts without trusting
 | 14 | U — M8 API-backed UI | ⬜ Todo | Requires stable API. |
 | 15 | F — platform validation/release | ⬜ Todo | Original M9 full-platform track. |
 
-### ➡️ Current: #7 - S — M5a cleanup/concurrency correction
-### ⏭️ Next: #8 - C1 — clean code and human readability
+### ➡️ Current: #8 - C1 — clean code and human readability
+### ⏭️ Next: #9 - A — complete M5a without deletion
 
 Task IDs below remain stable even if a phase is split into several commits. Complete dependent tasks in listed order. Independent documentation can proceed alongside its owning task; later feature coding waits for the phase prerequisites.
 
@@ -393,7 +393,7 @@ M0: architecture/ADRs/threat/content/privilege contracts and synthetic fixtures.
 
 Historical matrix evidence covers PostgreSQL 16/17/18; archives are [September](archive/SESSION-LOG-2026-09.md) and [October completed M4b](archive/SESSION-LOG-2026-10.md). Active M5 increments remain in session-log.md. Do not reopen these milestones merely to rename types or broaden selection. Their guides and tests define compatibility.
 
-### S — Correct ownership before feature development
+### S — Correct ownership before feature development ✅
 
 Prerequisites: baseline review; read storage/job implementation and ADR 0003. Owners: `backup-local`, application restore/verify resource lifetime, full-CLI integration tests. No artifact version change.
 
@@ -402,6 +402,8 @@ Prerequisites: baseline review; read storage/job implementation and ADR 0003. Ow
 3. **S03 — safe interruption recovery.** On an explicit writable recovery path, take exclusive maintenance ownership, conditionally mark genuinely abandoned jobs interrupted, and clean/report only abandoned work. Reopening the same scope must recover its old rows before the new job makes the scope appear busy. A concurrently completed job cannot be overwritten as interrupted. Add two-process SIGKILL scenes, repeated recovery/idempotence and changed-files/symlink refusals.
 
 Acceptance: active backup/restore/verify survives unrelated reads and refused competing commands; different backup profiles may still run; killed operations release ownership and recover without a complete artifact; no plaintext leak, live directory deletion or silent terminal-state rewrite. Existing negative same-scope acquisition control still fails when exclusivity is removed. Run fast checks and affected M1–M4b matrices. Do not proceed to C1 until these scenes pass.
+
+**Met 2026-10-03.** S01/S02/S03 landed as `crates/backup-inventory/src/activity.rs`, `LocalStore::recover`, `Inventory::open_bound`/`sweep_interrupted` and the `backup create` invocation, designed in [ADR 0004](docs/architecture/adr-0004-working-directory-ownership.md), whose gate section records each scene, both lock controls with the failures they produced, the fast gates and the PostgreSQL 16/17/18 matrices. Workspace tests rose from 167 to 179.
 
 ### C1 — Clean code and human readability
 
@@ -524,7 +526,7 @@ Clean-code conditions: coherent module ownership, readable operation order, mini
 | DELETE journal/FULL/current 2000 ms timeout | Implemented M5a/spike | Assert effective values; no WAL assumption. |
 | M5a observational before M5b destructive | Accepted ADR 0003 | No deletion before recovery acceptance. |
 | Per-name-fingerprint scope, marker-first deletion, local ledger only | Accepted ADR 0003 | Preserve limits, protection/tombstones and explicit plans. |
-| Shared activity/exclusive maintenance, nonmutating ordinary read | Planned S02 baseline in this revision | Record addendum and test lifecycle before coding cleanup. |
+| Shared activity/exclusive maintenance, nonmutating ordinary read | Accepted, implemented in S02/S03 | [ADR 0004](docs/architecture/adr-0004-working-directory-ownership.md): acquisition order, skip-when-busy, UUID-directory-only removal, both lock controls measured. |
 | Clean-code phase before new M5a features | Operator-requested in this revision | Behavior-preserving C1, no dependency/version drift. |
 | Exact new CLI/rebuild/event/policy contracts | Planned A/B baselines | Freeze examples/encodings in task docs before code. |
 | Production config, API runtime/auth, UI framework | Decision gates H01/P01/U01 | Do not choose silently during earlier tasks. |
@@ -533,7 +535,7 @@ If a baseline cannot satisfy a frozen/accepted invariant, state the conflict and
 
 ## 29. Gate checklist for the next implementing model
 
-Start at S01. Confirm the worktree still has M5a increments 1–3 and the live-cleanup behavior. Read the applicable contract/source files, define the full-CLI failing scene, record the S02 lock/ownership design in ADR 0004, fix and verify safety, then begin C01. Do not jump straight to job commands because they look small.
+Start at C1. Phase S is accepted: the startup purge is gone, working directories are owned through `locks/activity.lock`, and `crates/backupctl/tests/store_concurrency.rs` runs competing CLI processes rather than one process calling a guard. Read [ADR 0004](docs/architecture/adr-0004-working-directory-ownership.md) for the acquisition order before touching any store or lock code, and keep its two controls (exclusive maintenance, exclusive scope) failing when weakened. C1 is behavior-preserving readability only; do not jump to the job surface because it looks small.
 
 Before M5a close: S and C1 accepted; job/read-only/keyless modes exposed; discovery differs from adoption; source provenance of keyless rows honest; observations bound to bytes; restore jobs/use locks real; rebuild flags/history losses stated; corruption/secret-content/PG16–18 crash and regression gates pass.
 
@@ -567,3 +569,5 @@ Crypto agility means decrypting with a preserved old identity, re-encrypting/re-
 Assessment retained from the preceding review: product/architecture direction is sound, current M5a is incomplete, and cleanup safety is the immediate blocker. Reproduction used disposable synthetic staging/scratch directories with a held exclusive scope flock: `backup list` exited successfully, removed both directories, and left the flock held. The existing overlap test calls JobGuard directly and misses LocalStore startup.
 
 This rewrite puts S before C1 before remaining M5a/M5b, makes the clean-code work explicit, reconciles delivered gzip/custom/synthetic/job/SQLite behavior, retains accepted contracts and places unresolved future choices at named gates. It specifies testable behavior rather than promising identical source from every model. Documentation revision alone does not fix the blocker or complete any implementation task.
+
+Resolution recorded the same day: phase S ran S01–S03 and closed this blocker. The startup purge is deleted, `backup list` can no longer remove a live backup's or verification's working directory, and the abandoned-entry cleanup happens only under an exclusive activity claim in `backup create`. See [ADR 0004](docs/architecture/adr-0004-working-directory-ownership.md) for the measurements and §26 for the acceptance evidence.

@@ -246,6 +246,7 @@ dependencies = [
  "anyhow",
  "backup-application",
  "backup-domain",
+ "backup-inventory",
  "backup-local",
  "backup-postgres",
  "clap",

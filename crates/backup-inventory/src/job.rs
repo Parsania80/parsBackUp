@@ -244,6 +244,60 @@ pub(super) fn transition(
     })
 }
 
+/// Moves one still-open row to `interrupted`, and reports whether it did.
+///
+/// The `state IN (...)` guard is the whole difference from [`transition`]. A sweep decides from a
+/// read it took before probing the lock, so the row it is holding may have moved on by the time it
+/// writes; re-asserting the state it read inside the same transaction is what turns that race into
+/// a no-op instead of a `complete` row overwritten as `interrupted`. The guard is built from
+/// [`OPEN_STATES`], so a new non-terminal state is a state this can move and a state it refuses to
+/// overwrite in the same change.
+pub(super) fn mark_interrupted(conn: &Connection, job_id: Uuid) -> Result<bool> {
+    // Numbered after the three leading parameters: `?1..?3` are the new state, its timestamp and
+    // the job, so an `IN` list that reused those indices would compare the state against itself.
+    let placeholders = (0..OPEN_STATES.len())
+        .map(|offset| format!("?{}", 4 + offset))
+        .collect::<Vec<_>>()
+        .join(", ");
+    // `in_transaction` hands the caller a `&Connection`, so the answer travels in a cell rather
+    // than a return value; it is written at most once, before the commit.
+    let moved = Cell::new(false);
+    crate::in_transaction(conn, |conn| {
+        let backup_id = conn
+            .query_row(
+                "SELECT backup_id FROM job WHERE job_id = ?1",
+                [job_id.to_string()],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten();
+        let at = now_utc()?;
+        let id = job_id.to_string();
+        let mut values = vec![JobState::Interrupted.as_str(), at.as_str(), id.as_str()];
+        values.extend(OPEN_STATES.iter().map(|state| state.as_str()));
+        let changed = conn.execute(
+            &format!(
+                "UPDATE job SET state = ?1, updated_at_utc = ?2 \
+                 WHERE job_id = ?3 AND state IN ({placeholders})"
+            ),
+            rusqlite::params_from_iter(values),
+        )?;
+        if changed == 0 {
+            return Ok(());
+        }
+        moved.set(true);
+        let backup_id = backup_id
+            .as_deref()
+            .map(|text| {
+                Uuid::parse_str(text)
+                    .with_context(|| format!("inventory holds job {job_id}'s backup_id = {text:?}"))
+            })
+            .transpose()?;
+        record(conn, AuditAction::JobInterrupted, Some(job_id), backup_id)
+    })?;
+    Ok(moved.get())
+}
+
 pub(super) fn one(conn: &Connection, job_id: Uuid) -> Result<Option<JobRow>> {
     let mut stmt = conn.prepare(&format!("SELECT {JOB_COLUMNS} FROM job WHERE job_id = ?1"))?;
     let mut rows = stmt.query([job_id.to_string()])?;

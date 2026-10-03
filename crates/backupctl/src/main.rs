@@ -12,7 +12,8 @@ use crate::cli::{
 };
 use crate::report::{
     print_backup_created, print_inspect, print_inventory, print_keys, print_plan,
-    print_profile_scope, print_restore, print_selection, print_signing_keys, print_verify,
+    print_profile_scope, print_recovery, print_restore, print_selection, print_signing_keys,
+    print_verify,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use backup_application::{BackupService, RestoreService, VerifyService};
@@ -205,6 +206,16 @@ fn run() -> Result<()> {
         },
         TopCommand::Backup { command } => {
             let store = open_store(&config)?;
+            // ADR 0004: this is the command that clears abandoned working directories, and it does
+            // so before any scope is claimed — afterwards the dead job's row and the new one are
+            // indistinguishable to the lock probe. A dry run writes nothing, so it removes nothing
+            // either.
+            if matches!(command, BackupCommand::Create { dry_run: false, .. }) {
+                let recovery = store.recover()?;
+                if !json {
+                    print_recovery(&recovery);
+                }
+            }
             let service = BackupService::new(PostgresAdapter, store);
             match command {
                 BackupCommand::Create {

@@ -26,7 +26,7 @@ use backup_domain::{
     AGE_FORMAT, ArtifactManifest, DevelopmentManifest, GLOBALS_POLICY_EXPORTED,
     GLOBALS_POLICY_SKIPPED, MAX_PUBLIC_JSON_BYTES, PublicHeader, RestorePlan, profile_fingerprint,
 };
-use backup_inventory::{ArtifactRow, Estate, Shape, State};
+use backup_inventory::{ActivityLock, ArtifactRow, Estate, Inventory, Shape, State};
 use layout::{
     AGE_GLOBALS_FILE, AGE_MANIFEST_FILE, AGE_PAYLOAD_FILE, ARTIFACTS_DIR, COMPLETE_MARKER,
     GLOBALS_FILE, INVENTORY_FILE, LOCKS_DIR, MANIFEST_FILE, MANIFEST_TMP_FILE, MAX_MANIFEST_BYTES,
@@ -90,6 +90,9 @@ pub struct LocalStage {
     /// written an age header and nothing else, which is not a backup.
     sealed_payload: AtomicBool,
     sealed_globals: AtomicBool,
+    /// The store-wide claim that keeps this directory under a live process. A field rather than a
+    /// local, so it drops *after* [`LocalStage`]'s drop has removed the directory — see ADR 0004.
+    _claim: ActivityLock,
 }
 
 /// A held job, from this store.
@@ -124,6 +127,22 @@ pub struct LocalArtifact {
 pub struct LocalPlaintext {
     path: PathBuf,
     scratch: Option<PathBuf>,
+    /// Held while `scratch` exists, and dropped after it is removed. A view of a plaintext artifact
+    /// owns no directory, so it claims nothing.
+    _claim: Option<ActivityLock>,
+}
+
+/// What one maintenance pass did, as its caller reports it.
+#[derive(Clone, Debug, Default)]
+pub struct Recovery {
+    /// `false` means the store was busy: nothing was examined, swept, or removed.
+    pub claimed: bool,
+    /// Jobs a dead process left non-terminal, which this pass moved to `interrupted`.
+    pub interrupted: Vec<Uuid>,
+    /// Working directories this pass removed.
+    pub removed: Vec<PathBuf>,
+    /// Names under `staging/` or `scratch/` this tool would not have written, left alone on purpose.
+    pub refused: Vec<PathBuf>,
 }
 
 /// Which half of a stage a sink writes.
@@ -403,23 +422,90 @@ impl LocalStore {
             }
             ensure_real_dir(&dir)?;
         }
-        // A restart here implies any previous process died mid-dump; staged
-        // data was never published and must not linger (single-owner store).
+        // Nothing is removed here. Every command opens a store, including the ones that only read,
+        // and ADR 0004 makes clearing a working directory a decision that requires proof someone
+        // else is not using it — which is [`LocalStore::recover`], under the store's exclusive
+        // maintenance claim.
+        Ok(Self { root, keys })
+    }
+
+    /// Clears working directories this store can prove are abandoned, and corrects the job rows a
+    /// dead process left behind.
+    ///
+    /// The exclusive activity claim is the proof. While any operation holds the store shared, an
+    /// entry in `staging/` or `scratch/` may be mid-write, so a busy store makes this pass examine
+    /// nothing and remove nothing and the report says so; housekeeping that queued behind a two-hour
+    /// dump would turn a cosmetic gap into an outage. That also means an abandoned entry can survive
+    /// indefinitely on a continuously busy store, which is a documented limit rather than a bug.
+    ///
+    /// It runs before a scope is claimed, because after that the old row and the new job are
+    /// indistinguishable to [`backup_inventory::JobLock::is_free`] — see ADR 0004's decision 6.
+    pub fn recover(&self) -> Result<Recovery> {
+        let Some(claim) = ActivityLock::hold_maintenance(&self.root)? else {
+            return Ok(Recovery::default());
+        };
+        // The inventory is opened through its own binding: this pass cannot compute a source
+        // fingerprint, because that needs the server major a preflight reads off a live database.
+        let interrupted = match Inventory::open_bound(&self.root.join(INVENTORY_FILE))? {
+            None => Vec::new(),
+            Some(inventory) => inventory.sweep_interrupted(&self.root)?,
+        };
+        let mut removed = Vec::new();
+        let mut refused = Vec::new();
         for name in [STAGING_DIR, SCRATCH_DIR] {
-            let dir = root.join(name);
-            if !dir.exists() {
+            self.clear_working_dir(&self.root.join(name), &mut removed, &mut refused)?;
+        }
+        // The claim drops after the removals, so a competing command cannot create a working
+        // directory while this one is still deleting inside it.
+        drop(claim);
+        Ok(Recovery {
+            claimed: true,
+            interrupted,
+            removed,
+            refused,
+        })
+    }
+
+    /// Removes the entries of one working directory that can only be leftovers.
+    ///
+    /// Qualification is by name and by type: a UUID-named *directory* is the only shape this tool
+    /// writes there, so anything else — a symlink, a plain file, a name it did not make — is
+    /// reported and left alone. Refusing is not a failure of the pass; an operator's own file in
+    /// `staging/` is not evidence of a dirty store, and deleting it would make a backup tool the
+    /// thing that loses data here.
+    fn clear_working_dir(
+        &self,
+        dir: &Path,
+        removed: &mut Vec<PathBuf>,
+        refused: &mut Vec<PathBuf>,
+    ) -> Result<()> {
+        // A store configured without keys has no `scratch/` to clear, and an absent directory is
+        // not a problem: there is nothing in it either way.
+        let entries = match fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => {
+                return Err(error).with_context(|| format!("read {}", dir.display()));
+            }
+        };
+        for entry in entries {
+            let path = entry
+                .with_context(|| format!("read {}", dir.display()))?
+                .path();
+            // `symlink_metadata` does not follow the name, so a symlink here reports as a symlink
+            // rather than as the directory it points at.
+            let meta = fs::symlink_metadata(&path)
+                .with_context(|| format!("inspect {}", path.display()))?;
+            let name = path.file_name().unwrap_or_default().to_string_lossy();
+            if Uuid::parse_str(name.as_ref()).is_err() || !meta.is_dir() {
+                refused.push(path);
                 continue;
             }
-            for entry in fs::read_dir(&dir)? {
-                let path = entry?.path();
-                if path.is_dir() {
-                    fs::remove_dir_all(&path).with_context(|| {
-                        format!("remove stale {} entry {}", name, path.display())
-                    })?;
-                }
-            }
+            fs::remove_dir_all(&path)
+                .with_context(|| format!("remove abandoned {}", path.display()))?;
+            removed.push(path);
         }
-        Ok(Self { root, keys })
+        Ok(())
     }
 
     fn encrypted(&self) -> bool {
@@ -534,6 +620,7 @@ impl LocalStore {
             .as_ref()
             .context("artifact is encrypted but no key files are configured")?;
         ensure_regular_file(ciphertext)?;
+        let claim = ActivityLock::hold(&self.root)?;
         let scratch = self.root.join(SCRATCH_DIR).join(Uuid::new_v4().to_string());
         DirBuilder::new()
             .mode(0o700)
@@ -554,6 +641,7 @@ impl LocalStore {
         let view = LocalPlaintext {
             path,
             scratch: Some(scratch),
+            _claim: Some(claim),
         };
         match max_plaintext_bytes {
             Some(limit) => decrypt_with_limit(keys.identity.identity()?, ciphertext, file, limit)?,
@@ -785,6 +873,9 @@ impl ArtifactStore for LocalStore {
     }
 
     fn begin(&self, id: Uuid, options: &WriteOptions) -> Result<Self::Stage> {
+        // Claimed before the directory exists: a maintenance pass that is still deleting inside
+        // `staging/` must be finished before this command puts a live directory in it.
+        let claim = ActivityLock::hold(&self.root)?;
         let dir = self.root.join(STAGING_DIR).join(id.to_string());
         DirBuilder::new()
             .mode(0o700)
@@ -810,6 +901,7 @@ impl ArtifactStore for LocalStore {
             globals,
             sealed_payload: AtomicBool::new(false),
             sealed_globals: AtomicBool::new(false),
+            _claim: claim,
         })
     }
 
@@ -952,6 +1044,7 @@ impl ArtifactStore for LocalStore {
             return Ok(LocalPlaintext {
                 path: artifact.payload.clone(),
                 scratch: None,
+                _claim: None,
             });
         }
         // The recorded plaintext size is the bound: a ciphertext that inflates past what
@@ -969,6 +1062,7 @@ impl ArtifactStore for LocalStore {
             return Ok(LocalPlaintext {
                 path: stage.payload.clone(),
                 scratch: None,
+                _claim: None,
             });
         }
         // A stage has no manifest yet, so only the format-wide cap applies.
@@ -984,6 +1078,7 @@ impl ArtifactStore for LocalStore {
             return Ok(LocalPlaintext {
                 path: path.clone(),
                 scratch: None,
+                _claim: None,
             });
         }
         // Globals carry no recorded plaintext size, so the cap here is the format's own;

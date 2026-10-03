@@ -20,8 +20,8 @@ use backup_domain::{
     is_utc_timestamp, profile_fingerprint, source_fingerprint,
 };
 use backup_inventory::{
-    AuditAction, Estate, INVENTORY_FILE, JobGuard, JobLock, JobScope, JobState, SCHEMA_VERSION,
-    Shape, State,
+    ACTIVITY_FILE, ActivityLock, AuditAction, Estate, INVENTORY_FILE, JobGuard, JobLock, JobScope,
+    JobState, SCHEMA_VERSION, Shape, State,
 };
 use backup_local::LocalStore;
 use common::{
@@ -592,13 +592,23 @@ fn a_signed_backup_records_a_finished_job_and_the_trail_that_shows_how() {
         }
     }
 
-    // The scope is free again with the command over, and only its own lock file was left behind.
+    // The scope is free again with the command over, and the only files left are the scope's own
+    // lock plus ADR 0004's fixed-named activity claim. Neither carries anything an operator
+    // configured: the scope is two fingerprints, the claim is a constant.
     let locks: Vec<String> = fs::read_dir(fixture.store_root.join("locks"))
         .unwrap()
         .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
         .collect();
+    assert!(
+        locks.iter().any(|name| name == ACTIVITY_FILE),
+        "a finished command released its claim by deleting it: {locks:?}"
+    );
     assert_eq!(
-        locks,
+        locks
+            .iter()
+            .filter(|name| name.as_str() != ACTIVITY_FILE)
+            .cloned()
+            .collect::<Vec<_>>(),
         vec![format!(
             "{}-{}.lock",
             estate.source_fingerprint,
@@ -637,6 +647,9 @@ struct MidDump {
     /// The id of the job opened for a *different* profile, which is `failed` once its own drop
     /// runs — the real writer for that state, reached through the real command path.
     other_scope: String,
+    /// Whether a maintenance claim was refused while this dump was mid-write, which is ADR 0004's
+    /// proof that the live stage is under a claim rather than merely present.
+    maintenance_refused: bool,
 }
 
 /// ADR 0003's gate 9, asked at the only moment it means anything: while the first dump is still
@@ -676,6 +689,9 @@ fn a_second_dump_of_one_scope_is_refused_while_the_first_is_still_running() {
                 .unwrap()
                 .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
                 .collect();
+            seen.maintenance_refused = ActivityLock::hold_maintenance(&store_root)
+                .unwrap()
+                .is_none();
             // The live row is the only one, and it is still `running`: the refusal has to leave
             // the history exactly as it found it.
             let index =
@@ -724,10 +740,21 @@ fn a_second_dump_of_one_scope_is_refused_while_the_first_is_still_running() {
         Err(_) => panic!("the dump hook still holds the report"),
     };
 
+    // The scope lock and ADR 0004's fixed-named claim: two files, and neither names a database, a
+    // profile, a host, or a key.
+    let mut locks = seen.lock_files.clone();
+    locks.sort();
     assert_eq!(
-        seen.lock_files,
-        vec![format!("{fingerprint}-{profile}.lock")],
+        locks,
+        vec![
+            format!("{fingerprint}-{profile}.lock"),
+            ACTIVITY_FILE.to_string()
+        ],
         "the running dump's lock is not the only file, or is not named by two fingerprints"
+    );
+    assert!(
+        seen.maintenance_refused,
+        "a live dump held no claim on the store's working directories"
     );
     assert_eq!(
         seen.rows,

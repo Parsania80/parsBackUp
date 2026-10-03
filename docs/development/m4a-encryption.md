@@ -54,7 +54,7 @@ different path at the prompt.
 | Recorded `format` | `m1-development-plaintext` | `m4a-development-age` |
 | `pg_dump`/`pg_dumpall` | writes `--file` into staging | writes to standard output, piped into the age sink |
 | Extra manifest fields | — | `recipient_suite = "mlkem768x25519-v0"`, `payload_plaintext_bytes` |
-| Reading the payload | opened directly | decrypted into `<storage-root>/scratch/<id>/`, removed on drop and purged at startup |
+| Reading the payload | opened directly | decrypted into `<storage-root>/scratch/<id>/`, removed on drop, and cleared by `backup create`'s recovery pass when no operation holds the store |
 | An artifact holding both `payload.dump` and `payload.age` | n/a | refused as a store that does not know what it contains |
 
 The sink is the store's decision, so `backup-application` and `backup-postgres` hold no key

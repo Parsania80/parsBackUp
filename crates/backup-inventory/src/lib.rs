@@ -21,11 +21,13 @@
 //! There is no async here and no connection pool: this tool is a synchronous CLI, so an
 //! [`Inventory`] is one opened connection, held for the duration of one command.
 
+mod activity;
 mod artifact;
 mod job;
 mod job_lock;
 mod schema;
 
+pub use activity::{ACTIVITY_FILE, ActivityLock};
 pub use artifact::{ArtifactRow, Shape, State};
 pub use job::{AuditAction, AuditEvent, JobGuard, JobRow, JobScope, JobState};
 pub use job_lock::{JobLock, LOCK_DIR};
@@ -141,21 +143,12 @@ impl Inventory {
     /// `Estate` is checked, not assumed: a database left behind by a different source is refused
     /// rather than adopted, because merging two estates into one index would make every "newest
     /// backup for this source" answer wrong for both of them.
+    ///
+    /// Opening corrects nothing. An earlier build swept interrupted rows here, which meant that
+    /// *any* write open — including one that was about to be refused — could rewrite a live job's
+    /// history; ADR 0004 moves that into the maintenance pass, where it happens under an exclusive
+    /// claim on the store.
     pub fn open(path: &Path, estate: &Estate) -> Result<Self> {
-        // The sweep below needs the store root to find `locks/`, and this path is the only evidence
-        // a caller hands over of where the file sits. A bare relative name has no parent to derive
-        // one from, and guessing the current directory would have the probe look for locks nobody
-        // put there and mark live jobs dead.
-        let root = path
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-            .with_context(|| {
-                format!(
-                    "inventory {} is not inside a storage root, so a job left non-terminal by a \
-                     crash could not be checked against its lock",
-                    path.display()
-                )
-            })?;
         // `Connection::open` *creates* a missing file, which is what makes the read-only open
         // below a separate function rather than a flag: an audit read must never be able to
         // invent an inventory.
@@ -174,8 +167,54 @@ impl Inventory {
             estate: estate.clone(),
         };
         this.bind_or_check(path)?;
-        this.sweep_interrupted(root)?;
         Ok(this)
+    }
+
+    /// Opens an existing inventory for writing without being told which source it indexes.
+    ///
+    /// The recovery pass needs to correct rows in a store whose source fingerprint it cannot
+    /// compute: that fingerprint is made from a resolved connection plus the server major a preflight
+    /// reads off the database, and a housekeeping run cannot ask the database anything. Reading the
+    /// binding off the file is the honest version of the same check — the estate is what the
+    /// inventory already says it is, and a file that disagrees with its own rows is refused by
+    /// [`Inventory::open`] all the same later.
+    ///
+    /// `Ok(None)` means there is no inventory to recover, which is every store before its first
+    /// job. It never creates one: a command whose whole job is deleting leftovers inventing an
+    /// index would leave a file nothing wrote.
+    pub fn open_bound(path: &Path) -> Result<Option<Self>> {
+        if !path.exists() {
+            return Ok(None);
+        }
+        let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)
+            .with_context(|| format!("cannot open inventory {}", path.display()))?;
+        Self::configure(&conn, path, false)?;
+        let version = schema::user_version(&conn)?;
+        ensure!(
+            version != 0,
+            "{} is not a backupctl inventory: it declares no schema version, which means it holds \
+             no tables this build knows. A zero-byte file and a foreign database both read to \
+             SQLite as a valid empty database, and a recovery pass must not build tables into one.",
+            path.display()
+        );
+        let version = schema::migrate(&conn)
+            .with_context(|| format!("cannot migrate inventory {}", path.display()))?;
+        ensure!(
+            version <= SCHEMA_VERSION,
+            "inventory {} is schema version {version}; this build understands up to {SCHEMA_VERSION}. Upgrade backupctl before writing to it.",
+            path.display()
+        );
+        let found = Self::binding(&conn)?.with_context(|| {
+            format!(
+                "{} is an inventory a recovery pass has to correct, but it carries no source \
+                 binding; refusing to guess whose estate it indexes",
+                path.display()
+            )
+        })?;
+        Ok(Some(Self {
+            conn,
+            estate: Estate::new(found)?,
+        }))
     }
 
     /// Opens an existing inventory without writing, creating, or migrating anything.
@@ -257,7 +296,7 @@ impl Inventory {
 
     /// Records the estate on a fresh inventory, or holds an existing one to it.
     fn bind_or_check(&self, path: &Path) -> Result<()> {
-        match self.binding()? {
+        match Self::binding(&self.conn)? {
             None => self.set_binding().with_context(|| {
                 format!("cannot record which source {} belongs to", path.display())
             }),
@@ -266,7 +305,7 @@ impl Inventory {
     }
 
     fn check_binding(&self, path: &Path) -> Result<()> {
-        let found = self.binding()?.with_context(|| {
+        let found = Self::binding(&self.conn)?.with_context(|| {
             format!(
                 "{} is an inventory at a schema version this build knows but carries no source \
                  binding; refusing to guess whose estate it indexes",
@@ -286,9 +325,8 @@ impl Inventory {
         Ok(())
     }
 
-    fn binding(&self) -> Result<Option<String>> {
-        Ok(self
-            .conn
+    fn binding(conn: &Connection) -> Result<Option<String>> {
+        Ok(conn
             .query_row(
                 "SELECT value FROM meta WHERE key = 'source_fingerprint'",
                 [],
@@ -424,7 +462,8 @@ impl Inventory {
         job::events(&self.conn)
     }
 
-    /// Marks every row left non-terminal by a process that no longer holds its lock.
+    /// Marks every row left non-terminal by a process that no longer holds its lock, and returns the
+    /// jobs it actually moved.
     ///
     /// The kernel is the only witness here. A row in `running` says "a process is dumping right
     /// now", and the one thing that can answer whether that is still true is [`JobLock::is_free`],
@@ -432,29 +471,32 @@ impl Inventory {
     /// tests. A timestamp cannot answer it: a dump of a large database legitimately sits in
     /// `running` for hours.
     ///
-    /// This runs on a *write* open only. A read-only open cannot correct the row it noticed, and
-    /// reporting an `interrupted` state it did not write would make a DR read of a copied store
-    /// claim a transition that never happened on that host.
+    /// Callers take the store's exclusive maintenance claim first (ADR 0004): this corrects the
+    /// history of operations that are provably finished, so running it beside a live job would
+    /// produce a report about a job that is not done yet. Each transition is a conditional update
+    /// rather than an assignment, because the decision above came from a read taken before the lock
+    /// probe; a job that reached a terminal state inside that window is left exactly as it is, since
+    /// a `complete` row read back as `interrupted` would tell an operator that a backup they can
+    /// restore never happened.
     ///
     /// Two limits carry over from the probe itself and are documented rather than engineered away:
     /// a holder that has created its lock file but not yet locked it reads as free, so its row can
     /// be marked `interrupted` a moment too early; and the sweep's own instant of holding can
     /// refuse a genuine second `backup create` of that scope. Both are windows of microseconds, and
     /// ADR 0003's standing answer is that the files, not this table, are the truth.
-    fn sweep_interrupted(&self, root: &Path) -> Result<()> {
+    pub fn sweep_interrupted(&self, root: &Path) -> Result<Vec<Uuid>> {
+        let mut swept = Vec::new();
         for row in job::open(&self.conn)? {
             // Probed per row rather than once for the file, because the scope is per lock: one
             // dead `running` row must not stand in for a live row of a different profile, which is
             // exactly how a sweep would kill a job that is running right now.
-            if JobLock::is_free(root, &row.source_fingerprint, &row.profile_fingerprint)? {
-                self.set_job_state(
-                    row.job_id,
-                    JobState::Interrupted,
-                    AuditAction::JobInterrupted,
-                )?;
+            if JobLock::is_free(root, &row.source_fingerprint, &row.profile_fingerprint)?
+                && job::mark_interrupted(&self.conn, row.job_id)?
+            {
+                swept.push(row.job_id);
             }
         }
-        Ok(())
+        Ok(swept)
     }
 }
 
@@ -582,7 +624,10 @@ mod tests {
         assert_eq!(again.artifacts().unwrap().len(), 1);
         // The binding survived, and it is the estate rather than a path: a copy of the root is a
         // copy of the index.
-        assert_eq!(again.binding().unwrap().as_deref(), Some(SOURCE));
+        assert_eq!(
+            Inventory::binding(&again.conn).unwrap().as_deref(),
+            Some(SOURCE)
+        );
 
         drop(again);
         fs::remove_dir_all(&dir).unwrap();
@@ -1013,8 +1058,12 @@ mod tests {
     /// The case ADR 0003 chose persisted states for, and the reason the sweep asks the kernel
     /// rather than a timestamp: a dump of a large database legitimately sits in `running` for
     /// hours, and only a free lock says nobody is dumping.
+    ///
+    /// ADR 0004 moved the sweep out of [`Inventory::open`], so this also proves the other half: an
+    /// open — which every writable command performs, including one that then refuses — corrects
+    /// nothing until a maintenance pass asks it to.
     #[test]
-    fn a_sweep_marks_a_dead_row_interrupted_and_leaves_a_live_one_alone() {
+    fn only_an_explicit_pass_marks_a_dead_row_interrupted_and_a_live_one_is_left_alone() {
         let (root, path) = created("sweep");
         let live = JobGuard::begin(&root, &scope(PROFILE)).unwrap();
         let live_id = live.id();
@@ -1036,18 +1085,28 @@ mod tests {
         other.begin_job(&dead).unwrap();
         drop(other);
 
-        let swept = Inventory::open(&path, &estate()).unwrap();
+        let opened = Inventory::open(&path, &estate()).unwrap();
         assert_eq!(
-            swept.job(dead_id).unwrap().unwrap().state,
+            opened.job(dead_id).unwrap().unwrap().state,
+            JobState::Running,
+            "opening swept a row nothing asked it to sweep"
+        );
+        assert_eq!(
+            opened.sweep_interrupted(&root).unwrap(),
+            vec![dead_id],
+            "the pass reported something other than the one job it moved"
+        );
+        assert_eq!(
+            opened.job(dead_id).unwrap().unwrap().state,
             JobState::Interrupted
         );
         assert_eq!(
-            swept.job(live_id).unwrap().unwrap().state,
+            opened.job(live_id).unwrap().unwrap().state,
             JobState::Running
         );
         // The sweep is the writer of `job_interrupted`, so the trail says when the gap became
         // known as well as that it happened.
-        let interrupted = swept
+        let interrupted = opened
             .audit_events()
             .unwrap()
             .into_iter()
@@ -1057,10 +1116,22 @@ mod tests {
         assert_eq!(interrupted[0].job_id, Some(dead_id));
         // Marking a row is a transition, so `updated_at_utc` moves and `started_at_utc` does not.
         assert_eq!(
-            swept.job(dead_id).unwrap().unwrap().started_at_utc,
+            opened.job(dead_id).unwrap().unwrap().started_at_utc,
             dead.started_at_utc
         );
-        drop(swept);
+        // And once is enough: the row is terminal now, so a second pass on the same handle moves
+        // nothing and appends nothing.
+        assert!(opened.sweep_interrupted(&root).unwrap().is_empty());
+        assert_eq!(
+            opened
+                .audit_events()
+                .unwrap()
+                .iter()
+                .filter(|event| event.action == AuditAction::JobInterrupted)
+                .count(),
+            1
+        );
+        drop(opened);
 
         // A guard dropped *cleanly* is a job that finished with, not an interrupted one: `failed`
         // is what its own drop writes, and the sweep exists only for the case where no code ran on
@@ -1068,6 +1139,7 @@ mod tests {
         drop(live);
         let after = Inventory::open(&path, &estate()).unwrap();
         assert_eq!(after.job(live_id).unwrap().unwrap().state, JobState::Failed);
+        assert!(after.sweep_interrupted(&root).unwrap().is_empty());
         assert_eq!(
             after
                 .audit_events()
@@ -1079,8 +1151,8 @@ mod tests {
         );
         drop(after);
 
-        // And once each is enough: both terminal states stay put, so a later open neither repeats
-        // the sweep nor grows the trail.
+        // And once each is enough across handles too: both terminal states stay put, so a later open
+        // neither repeats the sweep nor grows the trail.
         let again = Inventory::open(&path, &estate()).unwrap();
         assert_eq!(
             again.job(dead_id).unwrap().unwrap().state,
@@ -1097,6 +1169,76 @@ mod tests {
             1
         );
 
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// ADR 0004's conditional transition, which is what §18's "must not overwrite a job that
+    /// completed after a snapshot read" is made of. The sweep reads the open rows, then probes each
+    /// scope's lock; a job that reaches a terminal state inside that window has already answered the
+    /// question the pass was about to write, so the update has to miss.
+    #[test]
+    fn a_row_that_finished_after_the_snapshot_is_not_written_as_interrupted() {
+        let (root, path) = created("late");
+        let inventory = Inventory::open(&path, &estate()).unwrap();
+        let row = job_row(PROFILE);
+        let id = row.job_id;
+        inventory.begin_job(&row).unwrap();
+        // The snapshot has been taken — and before the pass writes, this job completes.
+        inventory
+            .set_job_state(id, JobState::Complete, AuditAction::JobCompleted)
+            .unwrap();
+
+        assert!(
+            !job::mark_interrupted(&inventory.conn, id).unwrap(),
+            "a completed job was rewritten as interrupted"
+        );
+        assert_eq!(
+            inventory.job(id).unwrap().unwrap().state,
+            JobState::Complete
+        );
+        assert_eq!(
+            inventory
+                .audit_events()
+                .unwrap()
+                .iter()
+                .filter(|event| event.action == AuditAction::JobInterrupted)
+                .count(),
+            0,
+            "the trail records a transition that did not happen"
+        );
+
+        // The same write on a row that really is still open lands, once.
+        let abandoned = job_row(OTHER_PROFILE);
+        inventory.begin_job(&abandoned).unwrap();
+        assert!(job::mark_interrupted(&inventory.conn, abandoned.job_id).unwrap());
+        assert!(!job::mark_interrupted(&inventory.conn, abandoned.job_id).unwrap());
+        drop(inventory);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// The recovery pass cannot compute a source fingerprint — that needs a live database to learn
+    /// the server major — so it reads the estate off the file it is correcting, and a store with no
+    /// index at all gets no index invented for it.
+    #[test]
+    fn a_bound_open_reads_the_estate_off_the_file_and_creates_nothing() {
+        let (root, path) = created("bound");
+        let inventory = Inventory::open(&path, &estate()).unwrap();
+        let dead = job_row(PROFILE);
+        let dead_id = dead.job_id;
+        inventory.begin_job(&dead).unwrap();
+        drop(inventory);
+
+        let recovered = Inventory::open_bound(&path).unwrap().unwrap();
+        assert_eq!(recovered.estate().source_fingerprint, SOURCE);
+        assert_eq!(recovered.sweep_interrupted(&root).unwrap(), vec![dead_id]);
+        drop(recovered);
+
+        // No file, nothing to recover — and the pass that deletes things is the last one that
+        // should be able to leave a database behind.
+        let dir = temp_dir("unbound");
+        let missing = dir.join(INVENTORY_FILE);
+        assert!(Inventory::open_bound(&missing).unwrap().is_none());
+        assert!(!missing.exists());
         fs::remove_dir_all(&root).unwrap();
     }
 
