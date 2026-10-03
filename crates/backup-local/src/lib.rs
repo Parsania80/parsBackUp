@@ -9,36 +9,47 @@
 
 mod layout;
 
+#[cfg(test)]
+mod fixture;
+mod keys;
+mod stage;
+mod store;
+
 use anyhow::{Context, Result, bail};
 use backup_application::{
     ArtifactHandle, ArtifactStore, JobHandle, JobRequest, PayloadSink, PlaintextView,
-    SignedArtifactHandle, SignedKeyFacts, StageHandle, StagedBytes, StoreListing, WriteOptions,
+    SignedArtifactHandle, SignedKeyFacts, StageHandle, StoreListing, WriteOptions,
 };
 use backup_crypto::HybridRecipient;
 use backup_crypto::keyid::{recipient_id, signer_id};
 pub use backup_crypto::keystore::KeyStatus;
-use backup_crypto::keystore::{IdentityProvider, KeyFile, KeyRole, status as read_key_file};
+use backup_crypto::keystore::{IdentityProvider, KeyFile};
 use backup_crypto::protocol::{DIGEST_BYTES, HYBRID_SIGNATURE_BYTES};
-use backup_crypto::signing::{SigningKeyFile, signature_tuple, status as signing_status};
+use backup_crypto::signing::{SigningKeyFile, signature_tuple};
 pub use backup_crypto::signing::{SigningKeyStatus, SigningRole};
 use backup_crypto::stream::{EncryptSink, decrypt, decrypt_with_limit};
 use backup_domain::{
     AGE_FORMAT, ArtifactManifest, DevelopmentManifest, GLOBALS_POLICY_EXPORTED,
     GLOBALS_POLICY_SKIPPED, MAX_PUBLIC_JSON_BYTES, PublicHeader, RestorePlan, profile_fingerprint,
 };
-use backup_inventory::{ActivityLock, ArtifactRow, Estate, Inventory, Shape, State};
+use backup_inventory::{ActivityLock, ArtifactRow, Estate, Shape, State};
+pub use keys::{
+    generate_key_pair, generate_signing_pair, key_status, publish_recipient, publish_verifying,
+    signing_key_status,
+};
 use layout::{
     AGE_GLOBALS_FILE, AGE_MANIFEST_FILE, AGE_PAYLOAD_FILE, ARTIFACTS_DIR, COMPLETE_MARKER,
-    GLOBALS_FILE, INVENTORY_FILE, LOCKS_DIR, MANIFEST_FILE, MANIFEST_TMP_FILE, MAX_MANIFEST_BYTES,
-    MAX_PLAN_BYTES, PAYLOAD_FILE, PLAN_SUFFIX, PLANS_DIR, PUBLIC_FILE, SCRATCH_DIR, SIGNATURE_FILE,
-    STAGING_DIR,
+    GLOBALS_FILE, INVENTORY_FILE, MANIFEST_FILE, MANIFEST_TMP_FILE, MAX_MANIFEST_BYTES,
+    MAX_PLAN_BYTES, PAYLOAD_FILE, PLANS_DIR, PUBLIC_FILE, SCRATCH_DIR, SIGNATURE_FILE, STAGING_DIR,
 };
 use sha2::{Digest, Sha256};
+use stage::Target;
 use std::fs::{self, DirBuilder, File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{Read, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+pub use store::Recovery;
 use uuid::Uuid;
 
 /// The key material a store holds.
@@ -132,49 +143,6 @@ pub struct LocalPlaintext {
     _claim: Option<ActivityLock>,
 }
 
-/// What one maintenance pass did, as its caller reports it.
-#[derive(Clone, Debug, Default)]
-pub struct Recovery {
-    /// `false` means the store was busy: nothing was examined, swept, or removed.
-    pub claimed: bool,
-    /// Jobs a dead process left non-terminal, which this pass moved to `interrupted`.
-    pub interrupted: Vec<Uuid>,
-    /// Working directories this pass removed.
-    pub removed: Vec<PathBuf>,
-    /// Names under `staging/` or `scratch/` this tool would not have written, left alone on purpose.
-    pub refused: Vec<PathBuf>,
-}
-
-/// Which half of a stage a sink writes.
-#[derive(Clone, Copy)]
-enum Target {
-    Payload,
-    Globals,
-}
-
-impl Target {
-    fn name(self) -> &'static str {
-        match self {
-            Self::Payload => "payload file",
-            Self::Globals => "globals file",
-        }
-    }
-}
-
-enum Writer {
-    /// Plaintext mode: the bytes land in the file exactly as they were written.
-    Plain { file: File, written: u64 },
-    /// Encrypted mode: age authenticates every chunk on its way into the file.
-    Age(EncryptSink<File>),
-}
-
-struct StageSink<'a> {
-    /// `None` only after the sink has been finished; a sealed stream cannot be reopened.
-    writer: Option<Writer>,
-    target: Target,
-    stage: &'a LocalStage,
-}
-
 impl Drop for LocalStage {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.dir);
@@ -192,60 +160,6 @@ impl Drop for LocalPlaintext {
 impl PlaintextView for LocalPlaintext {
     fn path(&self) -> &Path {
         &self.path
-    }
-}
-
-impl Write for StageSink<'_> {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        match self.writer.as_mut() {
-            None => Err(io::Error::other("staged stream was already finished")),
-            Some(Writer::Plain { file, written }) => {
-                let n = file.write(buf)?;
-                *written += n as u64;
-                Ok(n)
-            }
-            Some(Writer::Age(stream)) => stream.write(buf),
-        }
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        match self.writer.as_mut() {
-            None => Err(io::Error::other("staged stream was already finished")),
-            Some(Writer::Plain { file, .. }) => file.flush(),
-            Some(Writer::Age(stream)) => stream.flush(),
-        }
-    }
-}
-
-impl PayloadSink for StageSink<'_> {
-    fn finish(&mut self) -> Result<StagedBytes> {
-        let writer = self
-            .writer
-            .take()
-            .context("staged stream was already finished")?;
-        let staged = match writer {
-            Writer::Plain { mut file, written } => {
-                file.flush()?;
-                file.sync_all()?;
-                StagedBytes {
-                    plaintext_bytes: written,
-                    recipient_suite: None,
-                }
-            }
-            Writer::Age(stream) => {
-                let (file, outcome) = stream.finish()?;
-                file.sync_all()?;
-                StagedBytes {
-                    plaintext_bytes: outcome.plaintext_bytes,
-                    recipient_suite: Some(outcome.suite),
-                }
-            }
-        };
-        match self.target {
-            Target::Payload => self.stage.sealed_payload.store(true, Ordering::Relaxed),
-            Target::Globals => self.stage.sealed_globals.store(true, Ordering::Relaxed),
-        }
-        Ok(staged)
     }
 }
 
@@ -299,227 +213,6 @@ impl ArtifactHandle for LocalArtifact {
 }
 
 impl LocalStore {
-    /// A store that publishes plaintext artifacts.
-    pub fn new(root: PathBuf) -> Result<Self> {
-        Self::open(root, None)
-    }
-
-    /// A store that seals every artifact it publishes.
-    ///
-    /// Both files are loaded before the storage root is touched, and the recipient must
-    /// be the one the configured identity can open: sealing under a stranger's recipient
-    /// would publish an artifact this deployment can never restore.
-    pub fn with_keys(
-        root: PathBuf,
-        identity_file: impl AsRef<Path>,
-        recipient_file: impl AsRef<Path>,
-    ) -> Result<Self> {
-        let (identity, recipient) = load_pair(identity_file.as_ref(), recipient_file.as_ref())?;
-        Self::open(
-            root,
-            Some(StoreKeys {
-                identity,
-                recipient: Some(recipient),
-                signing: None,
-                verifying: None,
-            }),
-        )
-    }
-
-    /// A store that writes signed v1 artifacts: it seals to the configured recipient and
-    /// signs with the configured signing key.
-    ///
-    /// The two signing halves are loaded together and required to be the *same* key, because
-    /// a store that signs under one key while trusting another publishes artifacts its own
-    /// next command refuses to read. That failure is cheap to detect here and expensive to
-    /// discover during a restore.
-    #[allow(clippy::too_many_arguments)]
-    pub fn with_signing_keys(
-        root: PathBuf,
-        identity_file: impl AsRef<Path>,
-        recipient_file: impl AsRef<Path>,
-        signing_key_file: impl AsRef<Path>,
-        verifying_key_file: impl AsRef<Path>,
-    ) -> Result<Self> {
-        let (identity, recipient) = load_pair(identity_file.as_ref(), recipient_file.as_ref())?;
-        let signing = SigningKeyFile::load(signing_key_file.as_ref(), SigningRole::Signing)
-            .with_context(|| {
-                format!(
-                    "load signing key file {}",
-                    signing_key_file.as_ref().display()
-                )
-            })?;
-        let verifying = SigningKeyFile::load(verifying_key_file.as_ref(), SigningRole::Verifying)
-            .with_context(|| {
-            format!(
-                "load verifying key file {}",
-                verifying_key_file.as_ref().display()
-            )
-        })?;
-        if signing.verifier() != verifying.verifier() {
-            bail!(
-                "verifying key file {} is not the public half of signing key file {}",
-                verifying_key_file.as_ref().display(),
-                signing_key_file.as_ref().display()
-            );
-        }
-        Self::open(
-            root,
-            Some(StoreKeys {
-                identity,
-                recipient: Some(recipient),
-                signing: Some(signing),
-                verifying: Some(verifying),
-            }),
-        )
-    }
-
-    /// A store that reads, verifies, and restores v1 artifacts, and cannot write any.
-    ///
-    /// This is the disaster-recovery shape: the decryption identity plus the trusted
-    /// verifying key, with no recipient and no signing secret to lose. `publish` and
-    /// [`LocalStore::publish_signed`] both refuse here rather than producing something this
-    /// host could not have authenticated.
-    pub fn for_reading(
-        root: PathBuf,
-        identity_file: impl AsRef<Path>,
-        verifying_key_file: impl AsRef<Path>,
-    ) -> Result<Self> {
-        let identity = KeyFile::load(identity_file.as_ref(), KeyRole::Identity)
-            .with_context(|| format!("load identity file {}", identity_file.as_ref().display()))?;
-        let verifying = SigningKeyFile::load(verifying_key_file.as_ref(), SigningRole::Verifying)
-            .with_context(|| {
-            format!(
-                "load verifying key file {}",
-                verifying_key_file.as_ref().display()
-            )
-        })?;
-        Self::open(
-            root,
-            Some(StoreKeys {
-                identity,
-                recipient: None,
-                signing: None,
-                verifying: Some(verifying),
-            }),
-        )
-    }
-
-    fn open(root: PathBuf, keys: Option<StoreKeys>) -> Result<Self> {
-        if !root.is_absolute() {
-            bail!("storage root must be absolute");
-        }
-        fs::create_dir_all(&root).context("create storage root")?;
-        ensure_real_dir(&root)?;
-        let mut dirs = vec![STAGING_DIR, ARTIFACTS_DIR, PLANS_DIR, LOCKS_DIR];
-        if keys.is_some() {
-            dirs.push(SCRATCH_DIR);
-        }
-        for name in dirs {
-            let dir = root.join(name);
-            if !dir.exists() {
-                DirBuilder::new().mode(0o700).create(&dir)?;
-            }
-            ensure_real_dir(&dir)?;
-        }
-        // Nothing is removed here. Every command opens a store, including the ones that only read,
-        // and ADR 0004 makes clearing a working directory a decision that requires proof someone
-        // else is not using it — which is [`LocalStore::recover`], under the store's exclusive
-        // maintenance claim.
-        Ok(Self { root, keys })
-    }
-
-    /// Clears working directories this store can prove are abandoned, and corrects the job rows a
-    /// dead process left behind.
-    ///
-    /// The exclusive activity claim is the proof. While any operation holds the store shared, an
-    /// entry in `staging/` or `scratch/` may be mid-write, so a busy store makes this pass examine
-    /// nothing and remove nothing and the report says so; housekeeping that queued behind a two-hour
-    /// dump would turn a cosmetic gap into an outage. That also means an abandoned entry can survive
-    /// indefinitely on a continuously busy store, which is a documented limit rather than a bug.
-    ///
-    /// It runs before a scope is claimed, because after that the old row and the new job are
-    /// indistinguishable to [`backup_inventory::JobLock::is_free`] — see ADR 0004's decision 6.
-    pub fn recover(&self) -> Result<Recovery> {
-        let Some(claim) = ActivityLock::hold_maintenance(&self.root)? else {
-            return Ok(Recovery::default());
-        };
-        // The inventory is opened through its own binding: this pass cannot compute a source
-        // fingerprint, because that needs the server major a preflight reads off a live database.
-        let interrupted = match Inventory::open_bound(&self.root.join(INVENTORY_FILE))? {
-            None => Vec::new(),
-            Some(inventory) => inventory.sweep_interrupted(&self.root)?,
-        };
-        let mut removed = Vec::new();
-        let mut refused = Vec::new();
-        for name in [STAGING_DIR, SCRATCH_DIR] {
-            self.clear_working_dir(&self.root.join(name), &mut removed, &mut refused)?;
-        }
-        // The claim drops after the removals, so a competing command cannot create a working
-        // directory while this one is still deleting inside it.
-        drop(claim);
-        Ok(Recovery {
-            claimed: true,
-            interrupted,
-            removed,
-            refused,
-        })
-    }
-
-    /// Removes the entries of one working directory that can only be leftovers.
-    ///
-    /// Qualification is by name and by type: a UUID-named *directory* is the only shape this tool
-    /// writes there, so anything else — a symlink, a plain file, a name it did not make — is
-    /// reported and left alone. Refusing is not a failure of the pass; an operator's own file in
-    /// `staging/` is not evidence of a dirty store, and deleting it would make a backup tool the
-    /// thing that loses data here.
-    fn clear_working_dir(
-        &self,
-        dir: &Path,
-        removed: &mut Vec<PathBuf>,
-        refused: &mut Vec<PathBuf>,
-    ) -> Result<()> {
-        // A store configured without keys has no `scratch/` to clear, and an absent directory is
-        // not a problem: there is nothing in it either way.
-        let entries = match fs::read_dir(dir) {
-            Ok(entries) => entries,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-            Err(error) => {
-                return Err(error).with_context(|| format!("read {}", dir.display()));
-            }
-        };
-        for entry in entries {
-            let path = entry
-                .with_context(|| format!("read {}", dir.display()))?
-                .path();
-            // `symlink_metadata` does not follow the name, so a symlink here reports as a symlink
-            // rather than as the directory it points at.
-            let meta = fs::symlink_metadata(&path)
-                .with_context(|| format!("inspect {}", path.display()))?;
-            let name = path.file_name().unwrap_or_default().to_string_lossy();
-            if Uuid::parse_str(name.as_ref()).is_err() || !meta.is_dir() {
-                refused.push(path);
-                continue;
-            }
-            fs::remove_dir_all(&path)
-                .with_context(|| format!("remove abandoned {}", path.display()))?;
-            removed.push(path);
-        }
-        Ok(())
-    }
-
-    fn encrypted(&self) -> bool {
-        self.keys.is_some()
-    }
-
-    fn artifact_dir(&self, id: Uuid) -> PathBuf {
-        self.root.join(ARTIFACTS_DIR).join(id.to_string())
-    }
-
-    fn plan_path(&self, id: Uuid) -> PathBuf {
-        self.root.join(PLANS_DIR).join(format!("{id}{PLAN_SUFFIX}"))
-    }
-
     /// Adds the just-published artifact to the store's inventory index.
     ///
     /// Every discovery field is read from the [`PublicHeader`] this command sealed, because that
@@ -561,48 +254,6 @@ impl LocalStore {
             )
         })?;
         Ok(())
-    }
-
-    fn stage_sink<'a>(
-        &'a self,
-        stage: &'a LocalStage,
-        target: Target,
-    ) -> Result<Box<dyn PayloadSink + 'a>> {
-        let path = match target {
-            Target::Payload => stage.payload.clone(),
-            Target::Globals => stage
-                .globals
-                .clone()
-                .with_context(|| format!("stage has no {}", target.name()))?,
-        };
-        // Resolved before the file is created: a store that cannot seal a stream should not
-        // leave an empty staged file behind on its way to refusing the call.
-        let writer = match &self.keys {
-            None => None,
-            Some(keys) => Some(
-                keys.recipient
-                    .as_ref()
-                    .context("this store holds no recipient file, so it cannot seal a new dump")?,
-            ),
-        };
-        let file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&path)
-            .with_context(|| format!("create staged {}", target.name()))?;
-        let writer = match writer {
-            None => Writer::Plain { file, written: 0 },
-            Some(recipient) => Writer::Age(
-                EncryptSink::new(recipient.recipient(), file)
-                    .with_context(|| format!("open {} stream", target.name()))?,
-            ),
-        };
-        Ok(Box::new(StageSink {
-            writer: Some(writer),
-            target,
-            stage,
-        }))
     }
 
     /// Decrypts an age file into a fresh scratch directory.
@@ -1459,186 +1110,6 @@ impl ArtifactStore for LocalStore {
     }
 }
 
-/// Loads both halves of a configured key pair and refuses a pair that cannot open
-/// the artifacts it seals.
-fn load_pair(identity_file: &Path, recipient_file: &Path) -> Result<(KeyFile, KeyFile)> {
-    let identity = KeyFile::load(identity_file, KeyRole::Identity)?;
-    let recipient = KeyFile::load(recipient_file, KeyRole::Recipient)?;
-    if recipient.recipient() != identity.recipient() {
-        bail!(
-            "recipient key file {} is not the recipient of identity key file {}",
-            recipient.path().display(),
-            identity.path().display()
-        );
-    }
-    Ok((identity, recipient))
-}
-
-/// Reports the two configured key files: path, role, suite, permission bits, and the
-/// public recipient. Nothing secret is in the result, which is what makes this safe to
-/// run on a host that may only write backups.
-///
-/// The files are loaded with the store's own rules before their status is read, so a
-/// pair this reports as usable is a pair `with_keys` will accept.
-pub fn key_status(
-    identity_file: impl AsRef<Path>,
-    recipient_file: impl AsRef<Path>,
-) -> Result<(KeyStatus, KeyStatus)> {
-    let (identity, recipient) = load_pair(identity_file.as_ref(), recipient_file.as_ref())?;
-    Ok((
-        read_key_file(identity.path(), KeyRole::Identity)?,
-        read_key_file(recipient.path(), KeyRole::Recipient)?,
-    ))
-}
-
-/// Refuses a key path that already holds something, a dangling symlink included, so
-/// no key command can replace material an existing artifact depends on.
-fn refuse_occupied(path: &Path) -> Result<()> {
-    // Checked through the symlink so a dangling link is treated as the occupied path
-    // it is, rather than as free space to write into.
-    if fs::symlink_metadata(path).is_ok() {
-        bail!(
-            "refusing to overwrite the existing key file {}; a new key orphans every \
-             artifact encrypted to the current one",
-            path.display()
-        );
-    }
-    Ok(())
-}
-
-/// Creates the directory a key file is configured into when it does not exist yet.
-/// The configured location is the operator's own directory, and a first run is the
-/// normal case, so it is created here rather than left as a write error. It is
-/// private because it will hold a key: the same reason the key itself is 0600.
-fn ensure_private_parent(path: &Path) -> Result<()> {
-    let Some(parent) = path.parent() else {
-        return Ok(());
-    };
-    if !parent.exists() {
-        DirBuilder::new()
-            .mode(0o700)
-            .recursive(true)
-            .create(parent)?;
-    }
-    Ok(())
-}
-
-/// Generates the identity and publishes its recipient half, in one deliberate step.
-///
-/// Neither file is created unless neither already exists: an identity whose recipient
-/// was never written cannot be encrypted to, and an operator who re-runs the command
-/// after a half-finished attempt would silently generate an unrelated second key.
-pub fn generate_key_pair(
-    identity_file: impl AsRef<Path>,
-    recipient_file: impl AsRef<Path>,
-) -> Result<(KeyStatus, KeyStatus)> {
-    let identity_file = identity_file.as_ref();
-    let recipient_file = recipient_file.as_ref();
-    for path in [identity_file, recipient_file] {
-        refuse_occupied(path)?;
-    }
-    for path in [identity_file, recipient_file] {
-        ensure_private_parent(path)?;
-    }
-    let identity = KeyFile::create_identity(identity_file)?;
-    KeyFile::write_recipient(recipient_file, identity.recipient())?;
-    key_status(identity_file, recipient_file)
-}
-
-/// Publishes the recipient half of an identity this CLI did not generate, so an
-/// operator who supplied the seed themselves can make the store accept the pair.
-///
-/// Only the recipient file is written, and only into free space: the identity is read
-/// and never modified, because rewriting a seed is the one action that makes every
-/// artifact sealed under it permanently unreadable. The identity is loaded with the
-/// store's own rules first, so a file the store would refuse to open never gets a
-/// public half published beside it.
-pub fn publish_recipient(
-    identity_file: impl AsRef<Path>,
-    recipient_file: impl AsRef<Path>,
-) -> Result<(KeyStatus, KeyStatus)> {
-    let identity_file = identity_file.as_ref();
-    let recipient_file = recipient_file.as_ref();
-    refuse_occupied(recipient_file)?;
-    let identity = KeyFile::load(identity_file, KeyRole::Identity)?;
-    ensure_private_parent(recipient_file)?;
-    KeyFile::write_recipient(recipient_file, identity.recipient())?;
-    key_status(identity_file, recipient_file)
-}
-
-/// Generates the signing key and publishes its verifying half, in one deliberate step.
-///
-/// The same all-or-nothing rule as [`generate_key_pair`]: neither file is created unless
-/// neither already exists. A signing key whose verifying half was never written signs
-/// artifacts this deployment cannot read, and re-running the command to find out would
-/// replace the first key with an unrelated second one.
-pub fn generate_signing_pair(
-    signing_key_file: impl AsRef<Path>,
-    verifying_key_file: impl AsRef<Path>,
-) -> Result<Vec<SigningKeyStatus>> {
-    let signing_key_file = signing_key_file.as_ref();
-    let verifying_key_file = verifying_key_file.as_ref();
-    for path in [signing_key_file, verifying_key_file] {
-        refuse_occupied(path)?;
-    }
-    for path in [signing_key_file, verifying_key_file] {
-        ensure_private_parent(path)?;
-    }
-    let signing = SigningKeyFile::create_signing(signing_key_file)?;
-    SigningKeyFile::write_verifying(verifying_key_file, signing.verifier())?;
-    signing_key_status(Some(signing_key_file), verifying_key_file)
-}
-
-/// Publishes the verifying half of a signing key this CLI did not generate, so an operator
-/// who supplied the seed themselves can make the store trust the pair.
-///
-/// Only the verifying file is written, and only into free space: the signing seed is read
-/// and never modified, because rewriting it is the one action that makes every artifact
-/// signed under it unverifiable under the key a reader holds.
-pub fn publish_verifying(
-    signing_key_file: impl AsRef<Path>,
-    verifying_key_file: impl AsRef<Path>,
-) -> Result<Vec<SigningKeyStatus>> {
-    let signing_key_file = signing_key_file.as_ref();
-    let verifying_key_file = verifying_key_file.as_ref();
-    refuse_occupied(verifying_key_file)?;
-    let signing = SigningKeyFile::load(signing_key_file, SigningRole::Signing)
-        .with_context(|| format!("load signing key file {}", signing_key_file.display()))?;
-    ensure_private_parent(verifying_key_file)?;
-    SigningKeyFile::write_verifying(verifying_key_file, signing.verifier())?;
-    signing_key_status(Some(signing_key_file), verifying_key_file)
-}
-
-/// Reports the configured signing key files: path, role, suite, permission bits, and the
-/// public signer id. No secret is in the result, which is what makes it safe to print.
-///
-/// The verifying file is required and the signing file optional, because that is the split
-/// between the two hosts: a disaster-recovery machine trusts a public key and must not hold
-/// a private one. When both are named they have to be the same key, since a store that signs
-/// under one key while trusting another publishes artifacts its own next command refuses.
-pub fn signing_key_status(
-    signing_key_file: Option<&Path>,
-    verifying_key_file: &Path,
-) -> Result<Vec<SigningKeyStatus>> {
-    let verifying = SigningKeyFile::load(verifying_key_file, SigningRole::Verifying)
-        .with_context(|| format!("load verifying key file {}", verifying_key_file.display()))?;
-    let mut statuses = Vec::new();
-    if let Some(path) = signing_key_file {
-        let signing = SigningKeyFile::load(path, SigningRole::Signing)
-            .with_context(|| format!("load signing key file {}", path.display()))?;
-        if signing.verifier() != verifying.verifier() {
-            bail!(
-                "verifying key file {} is not the public half of signing key file {}",
-                verifying_key_file.display(),
-                path.display()
-            );
-        }
-        statuses.push(signing_status(signing.path(), SigningRole::Signing)?);
-    }
-    statuses.push(signing_status(verifying.path(), SigningRole::Verifying)?);
-    Ok(statuses)
-}
-
 fn ensure_real_dir(path: &Path) -> Result<()> {
     let meta = fs::symlink_metadata(path)?;
     if meta.file_type().is_symlink() || !meta.is_dir() {
@@ -1714,27 +1185,9 @@ fn digest_bytes(value: &str) -> Result<[u8; DIGEST_BYTES]> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use backup_crypto::protocol::{IDENTITY_MARKER, SUITE_HYBRID};
+    use crate::fixture::{key_pair, temp_keys, temp_root};
+    use backup_crypto::protocol::SUITE_HYBRID;
     use backup_domain::{DEV_FORMAT, PLAN_FORMAT, RestoreSecurityPolicy};
-    use std::os::unix::fs::PermissionsExt;
-
-    fn temp_root() -> PathBuf {
-        std::env::temp_dir().join(format!("backupctl-store-test-{}", Uuid::new_v4()))
-    }
-
-    fn temp_keys() -> PathBuf {
-        std::env::temp_dir().join(format!("backupctl-keys-test-{}", Uuid::new_v4()))
-    }
-
-    /// Writes a key pair outside any storage root and returns both paths.
-    fn key_pair(dir: &Path) -> (PathBuf, PathBuf) {
-        fs::create_dir_all(dir).unwrap();
-        let identity = dir.join("identity.key");
-        let recipient = dir.join("recipient.key");
-        let key = KeyFile::create_identity(&identity).unwrap();
-        KeyFile::write_recipient(&recipient, key.recipient()).unwrap();
-        (identity, recipient)
-    }
 
     /// Streams bytes through the store's own sinks, the only way a stage becomes
     /// publishable.
@@ -1991,25 +1444,6 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
-    /// Sealing under a recipient the configured identity cannot open would publish an
-    /// artifact this deployment can never restore.
-    #[test]
-    fn a_mismatched_key_pair_is_refused_before_the_store_is_created() {
-        let root = temp_root();
-        let first = temp_keys();
-        let second = temp_keys();
-        let (identity_a, _) = key_pair(&first);
-        let (_, recipient_b) = key_pair(&second);
-        let error = LocalStore::with_keys(root.clone(), &identity_a, &recipient_b)
-            .err()
-            .expect("a mismatched key pair must be refused")
-            .to_string();
-        assert!(error.contains("is not the recipient of"), "{error}");
-        assert!(!root.exists());
-        fs::remove_dir_all(first).unwrap();
-        fs::remove_dir_all(second).unwrap();
-    }
-
     #[test]
     fn dropped_stage_is_never_listed() {
         let root = temp_root();
@@ -2126,172 +1560,5 @@ mod tests {
         fs::write(&path, serde_json::to_vec_pretty(&expired).unwrap()).unwrap();
         assert!(store.load_plan(plan.id).is_err());
         fs::remove_dir_all(root).unwrap();
-    }
-
-    /// A generated pair reports the public recipient and the modes that make the
-    /// identity usable, and what it reports is what `with_keys` accepts.
-    #[test]
-    fn a_generated_pair_reports_public_facts_and_opens_the_store() {
-        let dir = temp_keys();
-        fs::create_dir_all(&dir).unwrap();
-        let identity = dir.join("identity.key");
-        let recipient = dir.join("recipient.key");
-        let (identity_status, recipient_status) = generate_key_pair(&identity, &recipient).unwrap();
-
-        assert_eq!(identity_status.mode, 0o600);
-        assert_eq!(recipient_status.mode, 0o644);
-        assert_eq!(identity_status.suite, SUITE_HYBRID);
-        assert_eq!(
-            identity_status.recipient_hex, recipient_status.recipient_hex,
-            "status is how an operator proves the two files match"
-        );
-        // The recipient is the 1216-byte public key; an identity-length seed here would
-        // mean the report carried secret material.
-        assert_eq!(identity_status.recipient_hex.len(), 2432);
-        assert_eq!(
-            key_status(&identity, &recipient).unwrap().0.recipient_hex,
-            identity_status.recipient_hex
-        );
-
-        let root = temp_root();
-        // A pair that reports these facts is a pair the store accepts: `key_status`
-        // loads under exactly the rules `with_keys` applies.
-        assert!(LocalStore::with_keys(root.clone(), &identity, &recipient).is_ok());
-        fs::remove_dir_all(root).unwrap();
-        fs::remove_dir_all(dir).unwrap();
-    }
-
-    /// Generating into a location the operator has not created yet is the normal
-    /// first run, and the directory that will hold the identity is private.
-    #[test]
-    fn generation_creates_a_private_parent() {
-        let dir = temp_keys();
-        let identity = dir.join("nested/deeper/identity.key");
-        let recipient = dir.join("nested/deeper/recipient.key");
-        let (identity_status, _) = generate_key_pair(&identity, &recipient).unwrap();
-
-        let parent = identity.parent().unwrap();
-        assert_eq!(
-            fs::metadata(parent).unwrap().permissions().mode() & 0o777,
-            0o700
-        );
-        assert_eq!(identity_status.mode, 0o600);
-        fs::remove_dir_all(dir).unwrap();
-    }
-
-    /// An identity the operator supplied is a key this CLI can still make usable: the
-    /// public half is derived and written, and the identity is read and never rewritten.
-    #[test]
-    fn publishing_writes_the_recipient_of_a_hand_written_identity() {
-        let dir = temp_keys();
-        let identity = dir.join("identity.key");
-        let recipient = dir.join("recipient.key");
-        fs::create_dir_all(&dir).unwrap();
-        // Any 32-byte seed is a valid identity. This one is fixed so the test stays
-        // reproducible and carries nothing that protects real data.
-        let seed = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-        fs::write(&identity, format!("{IDENTITY_MARKER}\n{seed}\n")).unwrap();
-        fs::set_permissions(&identity, fs::Permissions::from_mode(0o600)).unwrap();
-        let before = fs::read(&identity).unwrap();
-
-        let (identity_status, recipient_status) = publish_recipient(&identity, &recipient).unwrap();
-        assert_eq!(
-            fs::read(&identity).unwrap(),
-            before,
-            "the identity was rewritten"
-        );
-        assert_eq!(identity_status.mode, 0o600);
-        assert_eq!(recipient_status.mode, 0o644);
-        assert_eq!(
-            identity_status.recipient_hex,
-            recipient_status.recipient_hex
-        );
-        assert_eq!(identity_status.recipient_hex.len(), 2432);
-        // A published pair is a pair the store opens, which is the whole point: a
-        // backup written under this identity is readable by the same configuration.
-        let root = temp_root();
-        let store = LocalStore::with_keys(root.clone(), &identity, &recipient).unwrap();
-        assert!(store.list().is_ok());
-        fs::remove_dir_all(root).unwrap();
-        fs::remove_dir_all(dir).unwrap();
-    }
-
-    /// Publishing is not a way to replace a published key.
-    #[test]
-    fn publishing_refuses_an_occupied_recipient() {
-        let dir = temp_keys();
-        let (identity, recipient) = key_pair(&dir);
-        let original = fs::read(&recipient).unwrap();
-        let error = publish_recipient(&identity, &recipient)
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("refusing to overwrite"), "{error}");
-        assert_eq!(fs::read(&recipient).unwrap(), original);
-        fs::remove_dir_all(dir).unwrap();
-    }
-
-    /// The identity is loaded under the store's own rules before its half is written,
-    /// so a key the store would refuse never acquires a usable partner.
-    #[test]
-    fn publishing_refuses_an_identity_the_store_would_not_open() {
-        let dir = temp_keys();
-        let identity = dir.join("identity.key");
-        let recipient = dir.join("recipient.key");
-        fs::create_dir_all(&dir).unwrap();
-        fs::write(
-            &identity,
-            format!("{IDENTITY_MARKER}\n{}\n", "ab".repeat(32)),
-        )
-        .unwrap();
-        fs::set_permissions(&identity, fs::Permissions::from_mode(0o644)).unwrap();
-
-        assert!(publish_recipient(&identity, &recipient).is_err());
-        assert!(
-            !recipient.exists(),
-            "a refused identity still got a public half"
-        );
-        fs::remove_dir_all(dir).unwrap();
-    }
-
-    /// Generating over a key would orphan every artifact sealed to it, so neither
-    /// file is touched when the other already exists.
-    #[test]
-    fn generation_refuses_an_occupied_path_before_writing() {
-        let dir = temp_keys();
-        fs::create_dir_all(&dir).unwrap();
-        let identity = dir.join("identity.key");
-        let recipient = dir.join("recipient.key");
-        let (first, _) = generate_key_pair(&identity, &recipient).unwrap();
-
-        let error = format!(
-            "{:#}",
-            generate_key_pair(&identity, &recipient).err().unwrap()
-        );
-        assert!(error.contains("refusing to overwrite"), "got: {error}");
-
-        // An occupied recipient with a free identity is refused the same way: writing a
-        // new identity there would seal artifacts nobody can open.
-        fs::remove_file(&identity).unwrap();
-        let error = format!(
-            "{:#}",
-            generate_key_pair(&identity, &recipient).err().unwrap()
-        );
-        assert!(error.contains("refusing to overwrite"), "got: {error}");
-        assert!(
-            !identity.exists(),
-            "a refused generation must not leave an unusable identity behind"
-        );
-
-        // The refusal left the original recipient intact, so the pair still resolves to
-        // the key it was generated with.
-        assert_eq!(
-            KeyFile::load(&recipient, KeyRole::Recipient)
-                .unwrap()
-                .recipient()
-                .to_string(),
-            first.recipient_hex
-        );
-
-        fs::remove_dir_all(dir).unwrap();
     }
 }
