@@ -16,7 +16,7 @@ use backup_domain::{
 };
 use std::cell::RefCell;
 use std::fs;
-use std::io::Read;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use uuid::Uuid;
@@ -36,6 +36,13 @@ pub fn archive_bytes() -> Vec<u8> {
 pub struct Capture {
     reads: RefCell<Vec<(PathBuf, Vec<u8>)>>,
     created: RefCell<Vec<String>>,
+    /// Fired once, from the first byte a dump's stream is actually read.
+    ///
+    /// That instant is the point. It is mid-dump, on a real `backup create`, with no SQL
+    /// transaction open anywhere — the only window in which two overlapping dumps are
+    /// distinguished by the kernel's lock rather than by SQLite's, and so the only honest place
+    /// to ask whether a second one is refused.
+    mid_dump: RefCell<Option<Box<dyn Fn()>>>,
 }
 
 impl Capture {
@@ -56,6 +63,31 @@ impl Capture {
     /// The databases this stub was asked to create, in call order.
     pub fn created(&self) -> Vec<String> {
         self.created.borrow().clone()
+    }
+
+    /// Installs the mid-dump hook. It runs once, on the first read, and never again.
+    pub fn on_dump_read(&self, hook: impl Fn() + 'static) {
+        *self.mid_dump.borrow_mut() = Some(Box::new(hook));
+    }
+
+    fn fire(&self) {
+        let Some(hook) = self.mid_dump.borrow_mut().take() else {
+            return;
+        };
+        hook();
+    }
+}
+
+/// A reader that reports the first read to a [`Capture`] before passing it on.
+struct MidDump<'a> {
+    inner: io::Cursor<Vec<u8>>,
+    capture: &'a Capture,
+}
+
+impl Read for MidDump<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.capture.fire();
+        self.inner.read(buf)
     }
 }
 
@@ -90,8 +122,13 @@ impl DatabaseAdapter for StubEngine<'_> {
         consume: &mut dyn FnMut(&mut dyn Read) -> Result<()>,
     ) -> Result<()> {
         // `pg_dump` writes its archive to standard output when given no file, which is
-        // the shape this stub reproduces; only the bytes come from a fixture.
-        consume(&mut archive_bytes().as_slice())
+        // the shape this stub reproduces; only the bytes come from a fixture. The wrapper
+        // gives a test one moment *inside* the dump to look at the store.
+        let mut archive = MidDump {
+            inner: io::Cursor::new(archive_bytes()),
+            capture: self.capture,
+        };
+        consume(&mut archive)
     }
 
     fn dump_globals_stream(

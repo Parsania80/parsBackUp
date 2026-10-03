@@ -3,7 +3,9 @@
 //! A published artifact already proves its own existence, integrity and origin — that is what
 //! artifact v1 froze. What no file in `artifacts/<id>/` can state is lifecycle: whether anyone
 //! ever verified it, whether it is protected, whether a newer one exists. That is this crate, and
-//! it is a single SQLite file beside the store it describes.
+//! it is a single SQLite file beside the store it describes. Alongside lifecycle sits the record of
+//! operations: a [`JobRow`] is one command that held resources and could be interrupted, which no
+//! artifact file can describe about itself at all.
 //!
 //! Two properties are load-bearing and the open rules below exist to keep them true:
 //!
@@ -20,10 +22,12 @@
 //! [`Inventory`] is one opened connection, held for the duration of one command.
 
 mod artifact;
+mod job;
 mod job_lock;
 mod schema;
 
 pub use artifact::{ArtifactRow, Shape, State};
+pub use job::{AuditAction, AuditEvent, JobGuard, JobRow, JobScope, JobState};
 pub use job_lock::{JobLock, LOCK_DIR};
 pub use schema::SCHEMA_VERSION;
 
@@ -31,6 +35,7 @@ use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OptionalExtension};
 use std::path::Path;
 use std::time::Duration;
+use uuid::Uuid;
 
 /// The name of the inventory inside a storage root. It is not a layout constant of
 /// `backup-local`, because the store's frozen six-file artifact shape is a format decision while
@@ -56,6 +61,47 @@ pub(crate) fn is_hex(text: &str, len: usize) -> bool {
 /// A `signer_id`, `recipient_id`, `source_fingerprint` or `profile_fingerprint`.
 pub(crate) fn is_hex_id(text: &str) -> bool {
     is_hex(text, backup_domain::ID_HEX_LEN)
+}
+
+/// The instant a row is written, in the one timestamp form this file stores.
+///
+/// Produced here rather than passed in by callers: a state and its timestamp written from two
+/// separate clock reads are a claim about ordering nothing checks, and a caller that forgot to ask
+/// would store an empty string in a NOT NULL column.
+pub(crate) fn now_utc() -> Result<String> {
+    let since_epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .context("system clock predates the Unix epoch")?;
+    let unix_ms: i128 = since_epoch
+        .as_millis()
+        .try_into()
+        .context("system clock is past the year this format can hold")?;
+    backup_domain::format_utc(unix_ms)
+}
+
+/// Runs one write inside an exclusive transaction, rolling back on any error.
+///
+/// Statements here are otherwise autocommitted one at a time, which is fine for a single row. It is
+/// not fine for a transition, which is an `UPDATE` and an `INSERT`: half of a job's state change
+/// would leave the audit trail contradicting the status column it describes. `IMMEDIATE` because
+/// the second statement must not be the one that discovers another writer holds the database.
+pub(crate) fn in_transaction(
+    conn: &Connection,
+    write: impl FnOnce(&Connection) -> Result<()>,
+) -> Result<()> {
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    // Shaped like `schema::migrate` on purpose, including rolling back a failed `COMMIT`: a
+    // connection left inside a transaction still holds the write lock, so a refusal here would
+    // make every later command on this host wait out the busy timeout.
+    let outcome = (|| -> Result<()> {
+        write(conn)?;
+        conn.execute_batch("COMMIT")?;
+        Ok(())
+    })();
+    if outcome.is_err() {
+        let _ = conn.execute_batch("ROLLBACK");
+    }
+    outcome
 }
 
 /// Which estate an inventory belongs to, checked on every open.
@@ -96,6 +142,20 @@ impl Inventory {
     /// rather than adopted, because merging two estates into one index would make every "newest
     /// backup for this source" answer wrong for both of them.
     pub fn open(path: &Path, estate: &Estate) -> Result<Self> {
+        // The sweep below needs the store root to find `locks/`, and this path is the only evidence
+        // a caller hands over of where the file sits. A bare relative name has no parent to derive
+        // one from, and guessing the current directory would have the probe look for locks nobody
+        // put there and mark live jobs dead.
+        let root = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .with_context(|| {
+                format!(
+                    "inventory {} is not inside a storage root, so a job left non-terminal by a \
+                     crash could not be checked against its lock",
+                    path.display()
+                )
+            })?;
         // `Connection::open` *creates* a missing file, which is what makes the read-only open
         // below a separate function rather than a flag: an audit read must never be able to
         // invent an inventory.
@@ -114,6 +174,7 @@ impl Inventory {
             estate: estate.clone(),
         };
         this.bind_or_check(path)?;
+        this.sweep_interrupted(root)?;
         Ok(this)
     }
 
@@ -278,11 +339,22 @@ impl Inventory {
     /// Inserts or replaces the row for one artifact. Idempotent by design: a successful backup and
     /// a reconcile pass both land here, and re-recording what the files already say is not an
     /// error — see [`UPSERT`][artifact::UPSERT_ARTIFACT] for why replacement, not merge.
+    ///
+    /// The [`AuditAction::ArtifactRegistered`] event carries no job id, because the store's publish
+    /// path is what calls this and it holds no job; the link back to a `backup create` is the
+    /// `backup_id` the job row already names.
     pub fn register(&self, row: &ArtifactRow) -> Result<()> {
         row.validate(&self.estate)
             .with_context(|| format!("cannot register backup {}", row.backup_id))?;
-        artifact::write(&self.conn, row)?;
-        Ok(())
+        in_transaction(&self.conn, |conn| {
+            artifact::write(conn, row)?;
+            job::record(
+                conn,
+                AuditAction::ArtifactRegistered,
+                None,
+                Some(row.backup_id),
+            )
+        })
     }
 
     /// Every row, oldest completion first, with the never-completed ones last.
@@ -318,6 +390,71 @@ impl Inventory {
             found.push(ArtifactRow::from_row(row)?);
         }
         Ok(found)
+    }
+
+    /// Opens one job row alongside its `job_started` event. [`JobGuard::begin`] is the only caller
+    /// that can reach this, which is what keeps a non-terminal row from ever existing without a
+    /// held lock to make it true.
+    pub(crate) fn begin_job(&self, row: &JobRow) -> Result<()> {
+        job::start(&self.conn, row)
+    }
+
+    /// Moves one job and appends the event for that transition, together or not at all.
+    pub(crate) fn set_job_state(
+        &self,
+        job_id: Uuid,
+        to: JobState,
+        action: AuditAction,
+    ) -> Result<()> {
+        job::transition(&self.conn, job_id, to, action)
+    }
+
+    /// Every job, oldest start first, across all scopes.
+    pub fn jobs(&self) -> Result<Vec<JobRow>> {
+        job::all(&self.conn)
+    }
+
+    /// The row for one job id, if this index has seen it.
+    pub fn job(&self, job_id: Uuid) -> Result<Option<JobRow>> {
+        job::one(&self.conn, job_id)
+    }
+
+    /// The whole audit trail, in the order it was written.
+    pub fn audit_events(&self) -> Result<Vec<AuditEvent>> {
+        job::events(&self.conn)
+    }
+
+    /// Marks every row left non-terminal by a process that no longer holds its lock.
+    ///
+    /// The kernel is the only witness here. A row in `running` says "a process is dumping right
+    /// now", and the one thing that can answer whether that is still true is [`JobLock::is_free`],
+    /// because `flock` is released by death of any kind — including the `SIGKILL` ADR 0003 gate 1
+    /// tests. A timestamp cannot answer it: a dump of a large database legitimately sits in
+    /// `running` for hours.
+    ///
+    /// This runs on a *write* open only. A read-only open cannot correct the row it noticed, and
+    /// reporting an `interrupted` state it did not write would make a DR read of a copied store
+    /// claim a transition that never happened on that host.
+    ///
+    /// Two limits carry over from the probe itself and are documented rather than engineered away:
+    /// a holder that has created its lock file but not yet locked it reads as free, so its row can
+    /// be marked `interrupted` a moment too early; and the sweep's own instant of holding can
+    /// refuse a genuine second `backup create` of that scope. Both are windows of microseconds, and
+    /// ADR 0003's standing answer is that the files, not this table, are the truth.
+    fn sweep_interrupted(&self, root: &Path) -> Result<()> {
+        for row in job::open(&self.conn)? {
+            // Probed per row rather than once for the file, because the scope is per lock: one
+            // dead `running` row must not stand in for a live row of a different profile, which is
+            // exactly how a sweep would kill a job that is running right now.
+            if JobLock::is_free(root, &row.source_fingerprint, &row.profile_fingerprint)? {
+                self.set_job_state(
+                    row.job_id,
+                    JobState::Interrupted,
+                    AuditAction::JobInterrupted,
+                )?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -375,7 +512,7 @@ mod tests {
     /// The first file an operator ever writes: nothing exists, and opening must not merely
     /// tolerate that but *report* the mode and the version it settled on.
     #[test]
-    fn opening_creates_a_version_one_inventory_in_the_mode_the_format_needs() {
+    fn opening_creates_a_versioned_inventory_in_the_mode_the_format_needs() {
         let (dir, path) = created("create");
         let inventory = Inventory::open(&path, &estate()).unwrap();
 
@@ -397,7 +534,30 @@ mod tests {
         let version: i64 = raw
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 1);
+        assert_eq!(version, SCHEMA_VERSION);
+        // Every table this build's statements name, read back from the file rather than trusted to
+        // have been created: a migration that ran half its statements would still set the version.
+        let mut tables: Vec<String> = raw
+            .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        tables.sort();
+        assert_eq!(tables, ["artifact", "audit_event", "job", "meta"]);
+        assert_eq!(
+            tables,
+            vec![
+                "artifact".to_string(),
+                "audit_event".to_string(),
+                "job".to_string(),
+                "meta".to_string()
+            ]
+        );
+        // And with it the jobs the sweep reads.
+        assert_eq!(inventory.jobs().unwrap(), Vec::new());
+        assert_eq!(inventory.audit_events().unwrap(), Vec::new());
         // No sidecars left behind at rest, which is the whole point of not being WAL.
         assert!(!dir.join(format!("{INVENTORY_FILE}-wal")).exists());
         assert!(!dir.join(format!("{INVENTORY_FILE}-shm")).exists());
@@ -407,8 +567,8 @@ mod tests {
         fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// Creating is not a special case: a brand-new database runs the same `0 -> 1` step an upgrade
-    /// from an older host's file runs, and a second open must find nothing to do.
+    /// Creating is not a special case: a brand-new database runs the same `0 -> 1`, then `1 -> 2`
+    /// steps an upgrade from an older host's file runs, and a second open must find nothing to do.
     #[test]
     fn reopening_is_idempotent_and_keeps_the_rows() {
         let (dir, path) = created("reopen");
@@ -508,21 +668,22 @@ mod tests {
 
         // And a real inventory at a version this build has never heard of.
         let newer = dir.join("newer.db");
+        let next = SCHEMA_VERSION + 1;
         {
             let inventory = Inventory::open(&newer, &estate()).unwrap();
             inventory
                 .conn
-                .execute_batch("PRAGMA user_version=2; DROP TABLE meta;")
+                .execute_batch(&format!("PRAGMA user_version={next}; DROP TABLE meta;"))
                 .unwrap();
         }
         let error = Inventory::open_read_only(&newer, &estate())
             .expect_err("a newer schema is not this build's schema")
             .to_string();
-        assert!(error.contains("schema version 2"), "{error}");
+        assert!(error.contains(&format!("schema version {next}")), "{error}");
         let error = Inventory::open(&newer, &estate())
             .expect_err("and it is not writable by this build either")
             .to_string();
-        assert!(error.contains("schema version 2"), "{error}");
+        assert!(error.contains(&format!("schema version {next}")), "{error}");
 
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -717,6 +878,340 @@ mod tests {
 
         drop(writer);
         drop(blocker);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    const PROFILE: &str = "651dd7a74505b176";
+    const OTHER_PROFILE: &str = "1111111111111111";
+
+    fn scope(profile: &str) -> JobScope {
+        JobScope {
+            source_fingerprint: SOURCE.to_string(),
+            profile_fingerprint: profile.to_string(),
+            backup_id: Uuid::new_v4(),
+        }
+    }
+
+    /// A job row built by hand, for the test that needs one to exist without a guard holding its
+    /// lock — which is exactly what a process killed mid-dump leaves behind.
+    fn job_row(profile: &str) -> JobRow {
+        let now = now_utc().unwrap();
+        JobRow {
+            job_id: Uuid::new_v4(),
+            backup_id: None,
+            source_fingerprint: SOURCE.to_string(),
+            profile_fingerprint: profile.to_string(),
+            state: JobState::Running,
+            started_at_utc: now.clone(),
+            updated_at_utc: now,
+        }
+    }
+
+    /// The trail as a *later* command sees it: a second handle, opened read-only, so what a test
+    /// asserts is what is on the file rather than what a guard remembers writing.
+    fn trail(root: &std::path::Path) -> Vec<(AuditAction, Option<Uuid>)> {
+        let inventory = Inventory::open_read_only(&root.join(INVENTORY_FILE), &estate()).unwrap();
+        inventory
+            .audit_events()
+            .unwrap()
+            .into_iter()
+            .map(|event| (event.action, event.job_id))
+            .collect()
+    }
+
+    /// Every state has a writer, and every write leaves an event behind. This is the whole
+    /// vocabulary in one run.
+    #[test]
+    fn a_job_walks_its_states_and_the_trail_records_every_move() {
+        let (root, _) = created("walk");
+        let scope = scope(PROFILE);
+        let backup_id = scope.backup_id;
+        let guard = JobGuard::begin(&root, &scope).unwrap();
+
+        assert_eq!(guard.state().unwrap(), JobState::Running);
+        guard.staged().unwrap();
+        guard.complete().unwrap();
+        let state = guard.state().unwrap();
+        assert_eq!(state, JobState::Complete);
+        assert!(state.is_terminal());
+
+        let events = trail(&root);
+        assert_eq!(
+            events.iter().map(|(action, _)| *action).collect::<Vec<_>>(),
+            vec![
+                AuditAction::JobStarted,
+                AuditAction::JobStaged,
+                AuditAction::JobCompleted
+            ]
+        );
+        // Every event names this job, so the trail can be read per job rather than per file, and
+        // the row names the artifact the job was for.
+        assert!(
+            events.iter().all(|(_, job)| *job == Some(guard.id())),
+            "{events:?}"
+        );
+        let row = Inventory::open_read_only(&root.join(INVENTORY_FILE), &estate())
+            .unwrap()
+            .job(guard.id())
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.backup_id, Some(backup_id));
+        assert_eq!(row.source_fingerprint, SOURCE);
+        assert_eq!(row.profile_fingerprint, PROFILE);
+
+        // A finished job cannot be moved again, so the trail cannot gain a second completion.
+        let error = chain(
+            guard
+                .complete()
+                .expect_err("a complete job is not completing a second time"),
+        );
+        assert!(
+            error.contains("cannot move to complete from a finished state"),
+            "{error}"
+        );
+        assert_eq!(trail(&root), events);
+
+        // And the drop after a terminal state writes nothing at all.
+        drop(guard);
+        assert_eq!(trail(&root), events);
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// `failed` has no call site that writes it, and that is the design: an ordinary `Err` return
+    /// from anywhere in a command reaches it through the guard's drop, so no error path in the
+    /// tool has to remember to report — and none can forget.
+    #[test]
+    fn a_guard_dropped_on_the_error_path_reads_as_failed_and_frees_the_lock() {
+        let (root, _) = created("dropped");
+        let guard = JobGuard::begin(&root, &scope(PROFILE)).unwrap();
+        let id = guard.id();
+        guard.staged().unwrap();
+        drop(guard);
+
+        let inventory = Inventory::open_read_only(&root.join(INVENTORY_FILE), &estate()).unwrap();
+        assert_eq!(inventory.job(id).unwrap().unwrap().state, JobState::Failed);
+        assert_eq!(
+            inventory
+                .audit_events()
+                .unwrap()
+                .into_iter()
+                .map(|event| event.action)
+                .collect::<Vec<_>>(),
+            vec![
+                AuditAction::JobStarted,
+                AuditAction::JobStaged,
+                AuditAction::JobFailed
+            ]
+        );
+        // A `failed` row is finished with, so the scope is open for the next run.
+        assert!(JobLock::is_free(&root, SOURCE, PROFILE).unwrap());
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// The case ADR 0003 chose persisted states for, and the reason the sweep asks the kernel
+    /// rather than a timestamp: a dump of a large database legitimately sits in `running` for
+    /// hours, and only a free lock says nobody is dumping.
+    #[test]
+    fn a_sweep_marks_a_dead_row_interrupted_and_leaves_a_live_one_alone() {
+        let (root, path) = created("sweep");
+        let live = JobGuard::begin(&root, &scope(PROFILE)).unwrap();
+        let live_id = live.id();
+
+        // A second write open while the first job is still running — `backup list` during a nightly
+        // dump. Same process here, which is the harder direction to get wrong: a rule that trusted
+        // the pid would see its own holder and call it dead.
+        let other = Inventory::open(&path, &estate()).unwrap();
+        assert_eq!(
+            other.job(live_id).unwrap().unwrap().state,
+            JobState::Running,
+            "a bystander's open must not interrupt a live job"
+        );
+
+        // A row for a scope that holds no lock at all, which is what a killed process leaves once
+        // the kernel closed its descriptor.
+        let dead = job_row(OTHER_PROFILE);
+        let dead_id = dead.job_id;
+        other.begin_job(&dead).unwrap();
+        drop(other);
+
+        let swept = Inventory::open(&path, &estate()).unwrap();
+        assert_eq!(
+            swept.job(dead_id).unwrap().unwrap().state,
+            JobState::Interrupted
+        );
+        assert_eq!(
+            swept.job(live_id).unwrap().unwrap().state,
+            JobState::Running
+        );
+        // The sweep is the writer of `job_interrupted`, so the trail says when the gap became
+        // known as well as that it happened.
+        let interrupted = swept
+            .audit_events()
+            .unwrap()
+            .into_iter()
+            .filter(|event| event.action == AuditAction::JobInterrupted)
+            .collect::<Vec<_>>();
+        assert_eq!(interrupted.len(), 1);
+        assert_eq!(interrupted[0].job_id, Some(dead_id));
+        // Marking a row is a transition, so `updated_at_utc` moves and `started_at_utc` does not.
+        assert_eq!(
+            swept.job(dead_id).unwrap().unwrap().started_at_utc,
+            dead.started_at_utc
+        );
+        drop(swept);
+
+        // A guard dropped *cleanly* is a job that finished with, not an interrupted one: `failed`
+        // is what its own drop writes, and the sweep exists only for the case where no code ran on
+        // the way out. So this row never enters the interrupted count.
+        drop(live);
+        let after = Inventory::open(&path, &estate()).unwrap();
+        assert_eq!(after.job(live_id).unwrap().unwrap().state, JobState::Failed);
+        assert_eq!(
+            after
+                .audit_events()
+                .unwrap()
+                .iter()
+                .filter(|event| event.action == AuditAction::JobInterrupted)
+                .count(),
+            1
+        );
+        drop(after);
+
+        // And once each is enough: both terminal states stay put, so a later open neither repeats
+        // the sweep nor grows the trail.
+        let again = Inventory::open(&path, &estate()).unwrap();
+        assert_eq!(
+            again.job(dead_id).unwrap().unwrap().state,
+            JobState::Interrupted
+        );
+        assert_eq!(again.job(live_id).unwrap().unwrap().state, JobState::Failed);
+        assert_eq!(
+            again
+                .audit_events()
+                .unwrap()
+                .iter()
+                .filter(|event| event.action == AuditAction::JobInterrupted)
+                .count(),
+            1
+        );
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// The refusal [`crate::artifact`] applies to `state`, applied to the two tables that leave
+    /// their vocabulary to Rust: `job.state` has no `CHECK`, and a word from a later build is
+    /// reported rather than defaulted to something a retention rule could act on.
+    #[test]
+    fn an_edited_job_row_is_refused_rather_than_defaulted() {
+        let (root, path) = created("edited-job");
+        let guard = JobGuard::begin(&root, &scope(PROFILE)).unwrap();
+        let id = guard.id();
+        let inventory = Inventory::open(&path, &estate()).unwrap();
+
+        inventory
+            .conn
+            .execute(
+                "UPDATE job SET state = 'planned' WHERE job_id = ?1",
+                [id.to_string()],
+            )
+            .unwrap();
+        let error = inventory
+            .jobs()
+            .expect_err("a state no build of this tool writes is not a state")
+            .to_string();
+        assert!(error.contains("planned"), "{error}");
+
+        // The timestamps carry the same rule as the artifact's: a value that is not the artifact
+        // form would put a job in the wrong place in an ordering nothing else checks.
+        inventory
+            .conn
+            .execute(
+                "UPDATE job SET state = 'running', started_at_utc = 'yesterday' WHERE job_id = ?1",
+                [id.to_string()],
+            )
+            .unwrap();
+        let error = inventory
+            .job(id)
+            .expect_err("and a timestamp nobody wrote is refused too")
+            .to_string();
+        assert!(error.contains("not the artifact timestamp form"), "{error}");
+
+        drop(guard);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A refusal that leaves nothing behind is what makes the overlap rule safe to run on a store
+    /// an operator is also reading: two fingerprints, no more.
+    #[test]
+    fn a_second_holder_of_one_scope_is_refused_without_touching_the_inventory() {
+        let (root, path) = created("overlap");
+        let held = JobGuard::begin(&root, &scope(PROFILE)).unwrap();
+        let before = fs::read(&path).unwrap();
+
+        let error = chain(
+            JobGuard::begin(&root, &scope(PROFILE))
+                .expect_err("one scope cannot have two running jobs"),
+        );
+        assert!(error.contains("already running"), "{error}");
+        assert_eq!(fs::read(&path).unwrap(), before, "a refusal wrote");
+        assert_eq!(
+            trail(&root)
+                .iter()
+                .map(|(action, _)| *action)
+                .collect::<Vec<_>>(),
+            vec![AuditAction::JobStarted]
+        );
+
+        // Another profile of the same source is another scope, and runs.
+        let weekly = JobGuard::begin(&root, &scope(OTHER_PROFILE)).unwrap();
+        assert_ne!(weekly.lock_path(), held.lock_path());
+
+        drop(weekly);
+        drop(held);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A registered artifact is an event even though it is not a job: the publish path holds no
+    /// lock, so `job_id` is NULL and the link back to a `backup create` is the `backup_id` that
+    /// job's own row already names.
+    #[test]
+    fn registering_an_artifact_appends_an_event_naming_no_job() {
+        let (dir, path) = created("register-event");
+        let inventory = Inventory::open(&path, &estate()).unwrap();
+        let row = signed_row("3f7a1c92-8a3e-4b6d-9c21-0d5f7a1c928a");
+        inventory.register(&row).unwrap();
+        inventory.register(&row).unwrap();
+
+        let events = inventory.audit_events().unwrap();
+        assert_eq!(events.len(), 2, "a re-registration is still an event");
+        assert!(
+            events
+                .iter()
+                .all(|event| event.action == AuditAction::ArtifactRegistered)
+        );
+        assert!(events.iter().all(|event| event.job_id.is_none()));
+        assert!(
+            events
+                .iter()
+                .all(|event| event.backup_id == Some(row.backup_id))
+        );
+        // A backup id is random and orders nothing, so the trail's ordering is its own rowid.
+        assert_eq!(
+            events.iter().map(|event| event.id).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+
+        // And a refused registration writes neither half, which is what the transaction is for: a
+        // trail claiming an artifact the table does not hold would be read as a lost backup.
+        let mut foreign = signed_row("11111111-1111-4111-8111-111111111111");
+        foreign.source_fingerprint = OTHER_SOURCE.to_string();
+        assert!(inventory.register(&foreign).is_err());
+        assert_eq!(inventory.audit_events().unwrap().len(), 2);
+        assert_eq!(inventory.artifacts().unwrap().len(), 1);
+
+        drop(inventory);
         fs::remove_dir_all(&dir).unwrap();
     }
 }

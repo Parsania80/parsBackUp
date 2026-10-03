@@ -32,4 +32,4 @@ Architecture, threat, PostgreSQL content, and artifact contracts are linked from
 
 Current progress (2026-10-03): M0–M4b are complete and M5a is underway. Backup creation records SQLite jobs and audit events and holds a source/profile lock. The revised [implementation roadmap](project.md#26-roadmap-and-implementation-tasks) puts the live staging/scratch cleanup fix first, then a dedicated clean-code phase to simplify modules and make operation order easier to read, then the remaining inventory/job/recovery work. Retention, scheduling and production release follow their own acceptance gates. The [design review](project.md#32-design-and-roadmap-review--2026-10-03) explains the confirmed cleanup blocker. The roadmap revision specifies future work; those changes are not implemented yet.
 
-Each roadmap phase is complete only after its stated acceptance checks pass.
+Each roadmap phase is complete only after its stated acceptance checks pass. The current persisted backup jobs have passed workspace tests; the full-process cleanup and recovery gates remain open.

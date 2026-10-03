@@ -3,13 +3,15 @@
 Status: **accepted** (2026-10-01). This is a scoping document: it states what M5 has to make
 true, what the code can do today, and the seven decisions the increment turns on. The operator
 accepted all seven **exactly as recommended** on 2026-10-01, so every "Recommendation" line below
-is a decision rather than a proposal, and "Choices (accepted)" is their short form. M5a's first
-increment has since landed: `crates/backup-inventory`, whose schema v1 sits behind a
+is a decision rather than a proposal, and "Choices (accepted)" is their short form. M5a has since
+landed three increments: `crates/backup-inventory`, whose schema v1 sits behind a
 `user_version` migration, whose open rules assert the pragmas below, and whose single-instance
-lock is the `flock` file finding 9 asked for. Two lines that the running code had to change are
-marked **Implementation revision** at the line itself rather than corrected quietly here — one in
-choice 5, one in gate 2 — and both are consequences of the freeze, not of a mistake in this
-document. The dependency question was deliberately left to a spike; the spike has now run
+lock is the `flock` file finding 9 asked for; then the publish path that writes a real row; then
+the `job` and `audit_event` tables behind a `1 -> 2` step, with `backup create` as the first
+writer of both. Four lines that the running code had to change are marked **Implementation
+revision** at the line itself rather than corrected quietly here — choice 4, choice 5, gate 2 and
+gate 9 — and all of them are consequences of the freeze or of writing the thing
+down instead of listing it, not of a mistake in this document. The dependency question was deliberately left to a spike; the spike has now run
 (`/tmp/m5-catalog`, nine rounds, 2026-10-01) and its measured answers are under
 "Implementation dependencies" at the end of this document. One of them changed a recommendation:
 the inventory is **not** in WAL mode, and the reason is a read-only directory, not concurrency.
@@ -184,6 +186,36 @@ milestone. The lock mechanism was left as a spike question; the spike ran it (ro
 answer is in finding 9 below — **a separate `flock` file, not the database's write transaction**,
 because the two do not cover the same interval.
 
+**Implementation revision (2026-10-03), four parts, all forced by writing the states rather than
+listing them.**
+
+1. **The vocabulary is `running`, `staged`, `complete`, `failed`, `interrupted` — no `planned` and
+   no `verified`.** Roadmap §6's sketch names both, and the first cut of this table kept them; the
+   code that landed has no writer for either. `planned` would be a row opened before the process
+   that intends the work, which in a synchronous CLI is the same process at the same instant, so it
+   can only ever be a row that is one statement older. `verified` would belong to `backup verify`,
+   which this choice records as an audit event and not a job. The rule the schema now holds is that
+   **every state has a writer that means something**, and a state nobody writes is a state an
+   operator will read and misinterpret.
+2. **`failed` is written by `Drop` on the guard, and the `job` table has no reason column.** A
+   guard that goes out of scope while its row is still non-terminal writes `failed`; a process that
+   dies without running any destructor leaves `running` and is picked up as `interrupted` by the
+   next open, which is the distinction the two states exist to make. The reason an operation failed
+   is an `anyhow` chain that can name a database, a host, or `127.0.0.1`, and gate 5 greps this
+   file's raw bytes for exactly those — so the reason goes to the operator's terminal and the
+   inventory holds only that the attempt ended. Stated as a limit: after the fact, the index says
+   *which* scope failed and *when*, never *why*.
+3. **The interrupted sweep probes the lock per row, not once per file.** One dead `running` row must
+   not stand in for a live row of another profile. Two limits follow and are written as limits: a
+   read-only open never sweeps (it could not write the finding even if it made one), and between the
+   probe and the write the procee can still be re-locked by a new holder, so a sweep marks a row
+   interrupted only when its lock file was free at the moment it looked.
+4. **Every store gets jobs and the lock, including the plaintext development store.** Its `job` rows
+   may point at `backup_id`s the `artifact` table has never seen, which is already that store's
+   documented state from increment 2: the files are authoritative for existence and the index is an
+   index over them. A development store that recorded no history would be the one case in which
+   "did last night's backup run?" has no answer at all.
+
 ## Choice 5 — retention, and the shape of a deletion
 
 The invariants are already written (§10) and are not up for re-litigation: never delete the only
@@ -229,7 +261,13 @@ majors 16/17/18, refusals asserted as exact sentences, secrets grepped for rathe
    and from a rebuild agree; kill the process mid-dump and the next command reports `interrupted`
    with no artifact and an empty `scratch/`; start a second `backup create` for the same profile
    while one runs and it is refused; delete `inventory.db` and T12's rebuild finds every artifact
-   through `public.json` with no key material.
+   through `public.json` with no key material. **Implementation revision (2026-10-03): the row and
+   state half of this is already asserted without a database** — a real `backup create` writes the
+   `running` row before its dump and the `complete` row after, an abandoned guard is read back as
+   `failed`, and a hand-written `running` row whose lock is free is marked `interrupted` by the next
+   `Inventory::open`, with the event recorded against the command that found it. What is still
+   genuinely this script's is the `SIGKILL`, the empty `scratch/` afterwards, and the
+   two-process version of gates 1 and 9.
 2. Schema migration: open a db from an older `user_version` and upgrade it transactionally; open
    one from a newer version and refuse; open a db that belongs to a different `source_fingerprint`
    and refuse rather than merge two estates into one index. **Implementation revision (2026-10-03):
@@ -264,7 +302,15 @@ majors 16/17/18, refusals asserted as exact sentences, secrets grepped for rathe
 9. The overlap refusal is asserted **mid-dump**, with the first process holding no SQL
    transaction open at all. That is the window where the database lock does not exist and only the
    `flock` does (finding 9); a test that starts the second `backup create` after the first has
-   written its rows proves nothing about the real clash.
+   written its rows proves nothing about the real clash. **Implementation revision (2026-10-03):
+   this is asserted, in the half that a crate-level test can reach.** `signed_write_path` installs a
+   hook in the stub dump's first `read`, so the second `JobGuard::begin` for the same
+   (`source_fingerprint`, `profile_fingerprint`) happens while the first is streaming, and the test
+   reads the live row back at that same instant to show the refusal wrote nothing. Stated as a
+   limit: that is one process with two open file descriptions — which is the mechanism, since
+   finding 10 measured that `flock` belongs to the description and not the pid — but it is not two
+   processes, and the `SIGKILL` between the dump's first byte and its last belongs to
+   `tests/m5a_docker_smoke.sh` with gate 1.
 
 ## Implementation dependencies (the spike decided these, 2026-10-01)
 

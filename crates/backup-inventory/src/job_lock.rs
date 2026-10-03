@@ -48,17 +48,7 @@ impl JobLock {
         source_fingerprint: &str,
         profile_fingerprint: &str,
     ) -> Result<Self> {
-        for (kind, fingerprint) in [
-            ("source", source_fingerprint),
-            ("profile", profile_fingerprint),
-        ] {
-            ensure!(
-                crate::is_hex_id(fingerprint),
-                "a job lock is named by fingerprints, so the {kind} must be {id} lowercase hex \
-                 characters, not {fingerprint:?}",
-                id = backup_domain::ID_HEX_LEN
-            );
-        }
+        check_scope(source_fingerprint, profile_fingerprint)?;
         let dir = root.join(LOCK_DIR);
         DirBuilder::new()
             .mode(0o700)
@@ -95,7 +85,7 @@ impl JobLock {
         };
         if outcome != 0 {
             let error = std::io::Error::last_os_error();
-            if error.raw_os_error() == Some(libc::EWOULDBLOCK) {
+            if would_block(&error) {
                 bail!(
                     "a job for source {source_fingerprint} and profile {profile_fingerprint} is \
                      already running: {} is held by another process. Two dumps of one scope at the \
@@ -111,6 +101,53 @@ impl JobLock {
         Ok(Self { file, path })
     }
 
+    /// Whether nothing holds a scope's lock, which is how [`crate::Inventory`] decides that a row
+    /// left in a non-terminal state belongs to a process that died rather than one still running.
+    ///
+    /// Unlike [`JobLock::acquire`] this creates nothing: an absent lock file means no holder, and a
+    /// probe that made one would leave every later reader looking at a lock nobody owns. Taking and
+    /// immediately releasing is the only test available, and it is a real one even within a single
+    /// process, because `flock` locks belong to the open file description rather than the pid.
+    ///
+    /// Two limits are worth stating rather than discovering. A holder that is between creating the
+    /// file and locking it reads as free, so its row can be marked `interrupted` by a sweep that ran
+    /// at the wrong microsecond — the row is the record and the lock is the truth, and ADR 0003 keeps
+    /// saying so because the inventory is not a witness. And the probe's own instant of holding is
+    /// long enough to refuse a genuine second `backup create` of that scope, which is the same
+    /// window seen from the other side.
+    pub fn is_free(
+        root: &Path,
+        source_fingerprint: &str,
+        profile_fingerprint: &str,
+    ) -> Result<bool> {
+        check_scope(source_fingerprint, profile_fingerprint)?;
+        let path = Self::path_for(root, source_fingerprint, profile_fingerprint);
+        let file = match File::open(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+            Err(error) => {
+                return Err(anyhow::Error::new(error))
+                    .with_context(|| format!("cannot check job lock {}", path.display()));
+            }
+        };
+        let outcome = unsafe {
+            libc::flock(
+                std::os::fd::AsRawFd::as_raw_fd(&file),
+                libc::LOCK_EX | libc::LOCK_NB,
+            )
+        };
+        if outcome != 0 {
+            let error = std::io::Error::last_os_error();
+            if would_block(&error) {
+                return Ok(false);
+            }
+            return Err(anyhow::Error::new(error))
+                .with_context(|| format!("cannot check job lock {}", path.display()));
+        }
+        let _ = unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(&file), libc::LOCK_UN) };
+        Ok(true)
+    }
+
     /// The path a scope's lock lives at. Public so `backup list` and the operator guide can name
     /// the file a refusal pointed at, and so a test can prove two profiles cannot collide.
     pub fn path_for(root: &Path, source_fingerprint: &str, profile_fingerprint: &str) -> PathBuf {
@@ -122,6 +159,29 @@ impl JobLock {
     pub fn path(&self) -> &Path {
         &self.path
     }
+}
+
+/// A scope is two fingerprints and nothing else, and the holder and the prober must say so in the
+/// same sentence: a caller that passed a profile name would otherwise create a lock file that
+/// discloses it, in a directory an operator copies off-site.
+fn check_scope(source_fingerprint: &str, profile_fingerprint: &str) -> Result<()> {
+    for (kind, fingerprint) in [
+        ("source", source_fingerprint),
+        ("profile", profile_fingerprint),
+    ] {
+        ensure!(
+            crate::is_hex_id(fingerprint),
+            "a job lock is named by fingerprints, so the {kind} must be {id} lowercase hex \
+             characters, not {fingerprint:?}",
+            id = backup_domain::ID_HEX_LEN
+        );
+    }
+    Ok(())
+}
+
+/// Whether a `flock` refusal means someone else holds the lock rather than that the call failed.
+fn would_block(error: &std::io::Error) -> bool {
+    error.raw_os_error() == Some(libc::EWOULDBLOCK)
 }
 
 impl Drop for JobLock {
@@ -319,6 +379,48 @@ mod tests {
         assert!(JobLock::acquire(&root, SOURCE, NIGHTLY).is_err());
 
         drop(again);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// The probe the interrupted sweep depends on, and the three answers it has to be able to
+    /// trust: a scope with no lock file is free and asking must not *make* one, a lock this process
+    /// already holds on another descriptor reads as held, and a released lock reads as free again.
+    #[test]
+    fn probing_a_lock_answers_what_is_held_and_creates_nothing() {
+        let root = temp_root("probe");
+        let dir = root.join(LOCK_DIR);
+
+        // No `locks/` directory at all, which is every store before its first job.
+        assert!(JobLock::is_free(&root, SOURCE, NIGHTLY).unwrap());
+        assert!(
+            !dir.exists(),
+            "a probe created the directory it was only asking about"
+        );
+
+        // Held — and held by *this* process, on a descriptor the probe does not have. `flock` locks
+        // belong to the open file description rather than the pid, so this is the same answer a
+        // second process gets, which is exactly why a sweep cannot mistake a live job for a dead
+        // one from inside the tool that is running it.
+        let held = JobLock::acquire(&root, SOURCE, NIGHTLY).unwrap();
+        assert!(!JobLock::is_free(&root, SOURCE, NIGHTLY).unwrap());
+
+        // Another scope's answer says nothing about this one, and asking does not create it.
+        assert!(JobLock::is_free(&root, SOURCE, WEEKLY).unwrap());
+        assert!(
+            !JobLock::path_for(&root, SOURCE, WEEKLY).exists(),
+            "a question about one scope left a file behind for another"
+        );
+
+        drop(held);
+        assert!(JobLock::is_free(&root, SOURCE, NIGHTLY).unwrap());
+
+        // And the same validation as `acquire`, so a caller that passed a profile *name* gets that
+        // sentence rather than a free answer about a file nothing will ever lock.
+        let error = JobLock::is_free(&root, "nightly", NIGHTLY)
+            .expect_err("a name is not a fingerprint")
+            .to_string();
+        assert!(error.contains("named by fingerprints"), "{error}");
+
         std::fs::remove_dir_all(&root).unwrap();
     }
 }

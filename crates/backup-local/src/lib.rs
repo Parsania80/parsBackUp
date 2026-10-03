@@ -11,8 +11,8 @@ mod layout;
 
 use anyhow::{Context, Result, bail};
 use backup_application::{
-    ArtifactHandle, ArtifactStore, PayloadSink, PlaintextView, SignedArtifactHandle,
-    SignedKeyFacts, StageHandle, StagedBytes, StoreListing, WriteOptions,
+    ArtifactHandle, ArtifactStore, JobHandle, JobRequest, PayloadSink, PlaintextView,
+    SignedArtifactHandle, SignedKeyFacts, StageHandle, StagedBytes, StoreListing, WriteOptions,
 };
 use backup_crypto::HybridRecipient;
 use backup_crypto::keyid::{recipient_id, signer_id};
@@ -24,12 +24,14 @@ pub use backup_crypto::signing::{SigningKeyStatus, SigningRole};
 use backup_crypto::stream::{EncryptSink, decrypt, decrypt_with_limit};
 use backup_domain::{
     AGE_FORMAT, ArtifactManifest, DevelopmentManifest, GLOBALS_POLICY_EXPORTED,
-    GLOBALS_POLICY_SKIPPED, MAX_PUBLIC_JSON_BYTES, PublicHeader, RestorePlan,
+    GLOBALS_POLICY_SKIPPED, MAX_PUBLIC_JSON_BYTES, PublicHeader, RestorePlan, profile_fingerprint,
 };
+use backup_inventory::{ArtifactRow, Estate, Shape, State};
 use layout::{
     AGE_GLOBALS_FILE, AGE_MANIFEST_FILE, AGE_PAYLOAD_FILE, ARTIFACTS_DIR, COMPLETE_MARKER,
-    GLOBALS_FILE, MANIFEST_FILE, MANIFEST_TMP_FILE, MAX_MANIFEST_BYTES, MAX_PLAN_BYTES,
-    PAYLOAD_FILE, PLAN_SUFFIX, PLANS_DIR, PUBLIC_FILE, SCRATCH_DIR, SIGNATURE_FILE, STAGING_DIR,
+    GLOBALS_FILE, INVENTORY_FILE, LOCKS_DIR, MANIFEST_FILE, MANIFEST_TMP_FILE, MAX_MANIFEST_BYTES,
+    MAX_PLAN_BYTES, PAYLOAD_FILE, PLAN_SUFFIX, PLANS_DIR, PUBLIC_FILE, SCRATCH_DIR, SIGNATURE_FILE,
+    STAGING_DIR,
 };
 use sha2::{Digest, Sha256};
 use std::fs::{self, DirBuilder, File, OpenOptions};
@@ -88,6 +90,24 @@ pub struct LocalStage {
     /// written an age header and nothing else, which is not a backup.
     sealed_payload: AtomicBool,
     sealed_globals: AtomicBool,
+}
+
+/// A held job, from this store.
+///
+/// The newtype is not ceremony: `backup_application` owns the `JobHandle` trait and
+/// `backup_inventory` owns the guard, and neither of them may write an `impl` for the other's
+/// type. This crate is the one place that is allowed to know both, so the seam between a port the
+/// service can call and a row the index can write is stated here rather than in either of them.
+pub struct LocalJob(backup_inventory::JobGuard);
+
+impl JobHandle for LocalJob {
+    fn staged(&self) -> Result<()> {
+        self.0.staged()
+    }
+
+    fn complete(&self) -> Result<()> {
+        self.0.complete()
+    }
 }
 
 pub struct LocalArtifact {
@@ -372,7 +392,7 @@ impl LocalStore {
         }
         fs::create_dir_all(&root).context("create storage root")?;
         ensure_real_dir(&root)?;
-        let mut dirs = vec![STAGING_DIR, ARTIFACTS_DIR, PLANS_DIR];
+        let mut dirs = vec![STAGING_DIR, ARTIFACTS_DIR, PLANS_DIR, LOCKS_DIR];
         if keys.is_some() {
             dirs.push(SCRATCH_DIR);
         }
@@ -412,6 +432,49 @@ impl LocalStore {
 
     fn plan_path(&self, id: Uuid) -> PathBuf {
         self.root.join(PLANS_DIR).join(format!("{id}{PLAN_SUFFIX}"))
+    }
+
+    /// Adds the just-published artifact to the store's inventory index.
+    ///
+    /// Every discovery field is read from the [`PublicHeader`] this command sealed, because that
+    /// is the record a keyless reader will rebuild the index from later: a row stating anything
+    /// the file does not would make an honest rebuild look like a corrupt one. Only the profile
+    /// and the completion time come from the sealed manifest, and only because the writer host
+    /// holds the key that just read it — the whole reason those two columns are nullable.
+    ///
+    /// Runs after `complete`, so a failure here cannot un-publish a backup. ADR 0003 makes the
+    /// files authoritative for existence and the inventory an index over them, which means this
+    /// is exactly the state the reconcile pass was designed for and the one retention can never
+    /// act on: the artifact is reported as unregistered, never deleted as an unknown.
+    fn record_published(&self, manifest: &ArtifactManifest, header: &PublicHeader) -> Result<()> {
+        let estate = Estate::new(manifest.source_fingerprint.clone())?;
+        let path = self.root.join(INVENTORY_FILE);
+        let inventory = backup_inventory::Inventory::open(&path, &estate)
+            .with_context(|| format!("cannot open inventory {}", path.display()))?;
+        let row = ArtifactRow {
+            backup_id: header.backup_id,
+            source_fingerprint: estate.source_fingerprint,
+            profile_fingerprint: Some(profile_fingerprint(&manifest.profile_snapshot.name)),
+            shape: Shape::V1Signed,
+            signer_id: Some(header.signer_id.clone()),
+            recipient_id: Some(header.recipient_id.clone()),
+            payload_sha256: Some(header.payload_sha256.clone()),
+            manifest_sha256: Some(header.manifest_sha256.clone()),
+            recipient_suite: Some(header.recipient_suite.clone()),
+            signature_suite: Some(header.signature_suite.clone()),
+            payload_bytes: Some(header.payload_ciphertext_bytes),
+            manifest_bytes: Some(header.manifest_ciphertext_bytes),
+            completed_at_utc: Some(manifest.completed_at_utc.clone()),
+            state: State::Registered,
+        };
+        inventory.register(&row).with_context(|| {
+            format!(
+                "backup {} is published and restorable; only its inventory row failed, so it is \
+                 unregistered until a reconcile pass adopts it",
+                header.backup_id
+            )
+        })?;
+        Ok(())
     }
 
     fn stage_sink<'a>(
@@ -750,6 +813,20 @@ impl ArtifactStore for LocalStore {
         })
     }
 
+    /// Claims the scope and opens the row, in the inventory's own terms: two fingerprints and an
+    /// artifact id. The name-to-digest step lives here rather than in the service, which hands
+    /// over what an operator typed.
+    fn begin_job(&self, request: &JobRequest) -> Result<Box<dyn JobHandle>> {
+        let scope = backup_inventory::JobScope {
+            source_fingerprint: request.source_fingerprint.clone(),
+            profile_fingerprint: profile_fingerprint(&request.profile_name),
+            backup_id: request.backup_id,
+        };
+        Ok(Box::new(LocalJob(backup_inventory::JobGuard::begin(
+            &self.root, &scope,
+        )?)))
+    }
+
     fn payload_sink<'a>(&'a self, stage: &'a LocalStage) -> Result<Box<dyn PayloadSink + 'a>> {
         self.stage_sink(stage, Target::Payload)
     }
@@ -1069,6 +1146,7 @@ impl ArtifactStore for LocalStore {
             .open(marker)?;
         marker_file.sync_all()?;
         File::open(&final_dir)?.sync_all()?;
+        self.record_published(manifest, &header)?;
         Ok(header)
     }
 

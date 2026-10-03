@@ -11,8 +11,9 @@ use backup_application::{BackupService, Created, RestoreService, VerifyService};
 use backup_crypto::protocol::SUITE_HYBRID;
 use backup_domain::{
     AGE_FORMAT, DEV_FORMAT, RestoreSections, RestoreSecurityPolicy, VERIFY_ARCHIVE,
-    VERIFY_SIGNATURE,
+    VERIFY_SIGNATURE, WHOLE_DATABASE_PROFILE, profile_fingerprint, source_fingerprint,
 };
+use backup_inventory::{AuditAction, Estate, INVENTORY_FILE, JobLock, JobState};
 use backup_local::LocalStore;
 use common::{
     ARCHIVE_MARKER, Capture, GLOBALS_MARKER, Keys, StubEngine, archive_bytes, config, files_under,
@@ -163,6 +164,66 @@ fn a_backup_without_key_files_is_still_written_as_plaintext() {
     assert!(
         reads[0].0.starts_with(store_root.join("staging")),
         "a plaintext stage is inspected where it was written, not after publication"
+    );
+    fs::remove_dir_all(base).unwrap();
+}
+
+/// A development store is a store too: it gets a job table and a lock, even though its `job`
+/// rows can point at a `backup_id` the artifact table has never heard of. That is not a
+/// contradiction to refuse — the unsigned shape registers nothing on purpose, since a row describing
+/// an artifact anyone could forge would be a claim the index cannot support. What has to hold is
+/// that the operation itself is recorded, and that a second dump of one scope cannot start while
+/// the first is running.
+#[test]
+fn a_development_store_records_the_job_it_runs() {
+    let base = temp_root("write-path");
+    let store_root = base.join("data");
+    let capture = Capture::default();
+    let config = config(&store_root, None, None);
+    let manifest = BackupService::new(
+        StubEngine { capture: &capture },
+        LocalStore::new(store_root.clone()).unwrap(),
+    )
+    .create(&config, None)
+    .unwrap()
+    .id();
+
+    let estate = Estate::new(source_fingerprint(&config.source, 16)).unwrap();
+    let index =
+        backup_inventory::Inventory::open_read_only(&store_root.join(INVENTORY_FILE), &estate)
+            .unwrap();
+    let jobs = index.jobs().unwrap();
+    assert_eq!(jobs.len(), 1, "{jobs:?}");
+    assert_eq!(jobs[0].state, JobState::Complete);
+    assert_eq!(jobs[0].backup_id, Some(manifest));
+    assert_eq!(
+        jobs[0].profile_fingerprint,
+        profile_fingerprint(WHOLE_DATABASE_PROFILE)
+    );
+    // The unregistered-artifact half of the point: the row names an id the index holds no
+    // artifact for, and the store recorded the run anyway.
+    assert!(index.artifacts().unwrap().is_empty());
+    assert_eq!(
+        index
+            .audit_events()
+            .unwrap()
+            .iter()
+            .map(|event| event.action)
+            .collect::<Vec<_>>(),
+        vec![
+            AuditAction::JobStarted,
+            AuditAction::JobStaged,
+            AuditAction::JobCompleted
+        ]
+    );
+    assert!(
+        JobLock::is_free(
+            &store_root,
+            &estate.source_fingerprint,
+            &profile_fingerprint(WHOLE_DATABASE_PROFILE)
+        )
+        .unwrap(),
+        "a finished development backup still holds its scope"
     );
     fs::remove_dir_all(base).unwrap();
 }

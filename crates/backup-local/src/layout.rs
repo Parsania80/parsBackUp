@@ -5,6 +5,11 @@
 pub(crate) const STAGING_DIR: &str = "staging";
 pub(crate) const ARTIFACTS_DIR: &str = "artifacts";
 pub(crate) const PLANS_DIR: &str = "plans";
+/// The inventory index and the directory of kernel-held job locks. Both names belong to
+/// `backup-inventory` — this layout records where an operator finds them, not what they are
+/// called, so the same string cannot be written two ways.
+pub(crate) const INVENTORY_FILE: &str = backup_inventory::INVENTORY_FILE;
+pub(crate) const LOCKS_DIR: &str = backup_inventory::LOCK_DIR;
 /// Decrypted payloads live here, and only for as long as one view is alive.
 pub(crate) const SCRATCH_DIR: &str = "scratch";
 pub(crate) const PAYLOAD_FILE: &str = "payload.dump";

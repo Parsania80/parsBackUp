@@ -17,15 +17,21 @@ use backup_domain::{
     ARTIFACT_FORMAT_VERSION, ArtifactManifest, Config, ENGINE_POSTGRESQL, GLOBALS_POLICY_EXPORTED,
     ID_HEX_LEN, PublicHeader, RestoreSections, RestoreSecurityPolicy, SIGNATURE_SUITES,
     VERIFICATION_NONE, VERIFY_ARCHIVE, VERIFY_CHECKSUM, VERIFY_SIGNATURE, WHOLE_DATABASE_PROFILE,
-    source_fingerprint,
+    is_utc_timestamp, profile_fingerprint, source_fingerprint,
+};
+use backup_inventory::{
+    AuditAction, Estate, INVENTORY_FILE, JobGuard, JobLock, JobScope, JobState, SCHEMA_VERSION,
+    Shape, State,
 };
 use backup_local::LocalStore;
 use common::{
     ARCHIVE_MARKER, Capture, GLOBALS_MARKER, Keys, StubEngine, archive_bytes, artifact_dir, config,
     failure, files_under, holds, signing_block, temp_root,
 };
+use std::cell::RefCell;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use uuid::Uuid;
 
 const SOURCE_DATABASE: &str = "backupctl_fixture_m4b";
@@ -79,6 +85,15 @@ impl Fixture {
 /// PostgreSQL tool boundary was handed and whether a database was ever created.
 fn write_signed(capture: &Capture) -> Fixture {
     let base = temp_root("signed-write-path");
+    write_signed_in(capture, base).expect("a fresh store root wrote a v1 artifact")
+}
+
+/// [`write_signed`], at a root the caller chose.
+///
+/// A test that has to look at the store *while* the dump runs needs the path first. The failure is
+/// returned rather than panicked with, because the caller is the one holding what the store looked
+/// like at the moment the dump stopped.
+fn write_signed_in(capture: &Capture, base: PathBuf) -> std::result::Result<Fixture, String> {
     let store_root = base.join("data");
     let keys = Keys::generate(&base.join("keys"));
     let mut config = config(
@@ -87,7 +102,7 @@ fn write_signed(capture: &Capture) -> Fixture {
         Some(signing_block(&keys)),
     );
     config.source.database = SOURCE_DATABASE.to_string();
-    let Created::Signed { header, manifest } = BackupService::new(
+    let created = BackupService::new(
         StubEngine { capture },
         LocalStore::with_signing_keys(
             store_root.clone(),
@@ -98,12 +113,15 @@ fn write_signed(capture: &Capture) -> Fixture {
         )
         .unwrap(),
     )
-    .create(&config, None)
-    .unwrap() else {
+    .create(&config, None);
+    let Created::Signed { header, manifest } = (match created {
+        Ok(created) => created,
+        Err(error) => return Err(format!("{error:#}")),
+    }) else {
         panic!("a store with [encryption] and [signing] writes a v1 artifact");
     };
     assert_eq!(header.backup_id, manifest.backup_id);
-    Fixture {
+    Ok(Fixture {
         base,
         store_root,
         keys,
@@ -111,7 +129,7 @@ fn write_signed(capture: &Capture) -> Fixture {
         id: manifest.backup_id,
         header: *header,
         manifest: *manifest,
-    }
+    })
 }
 
 /// Every file of one artifact with its bytes, so a later "nothing changed" claim covers the
@@ -386,6 +404,104 @@ fn a_forged_signature_is_refused_before_the_target_database_is_created() {
     fixture.remove();
 }
 
+/// A real `backup create` is the only writer the inventory has today, so the row it lands is
+/// checked against both records it must agree with: `public.json` for everything a keyless
+/// reader can re-derive later, and the sealed manifest for the two fields only the writer host
+/// can know. Then the negative half, which is the reason the index is a separate file with its
+/// own threat model: an operator copies `inventory.db` off-site without copying a single key,
+/// so a row that named the database, the host, or the profile in plaintext would undo what
+/// `manifest.age` exists to hide.
+#[test]
+fn a_signed_backup_registers_a_row_that_leaks_nothing_the_sealed_manifest_hides() {
+    let capture = Capture::default();
+    let fixture = write_signed(&capture);
+
+    let inventory_path = fixture.store_root.join(INVENTORY_FILE);
+    assert!(
+        inventory_path.is_file(),
+        "publishing left no inventory at {}",
+        inventory_path.display()
+    );
+    assert!(fixture.store_root.join("locks").is_dir());
+
+    // Read-only, because that is the open a DR host can perform: it creates nothing, migrates
+    // nothing, and refuses a file it did not find. The estate is recomputed from the
+    // configuration rather than reused from the row, so a row written for a stranger's source
+    // would fail the binding check instead of being read.
+    let estate = Estate::new(source_fingerprint(&fixture.config.source, 16)).unwrap();
+    let index = backup_inventory::Inventory::open_read_only(&inventory_path, &estate)
+        .expect("the inventory a signed publish wrote opens read-only for its own estate");
+    assert_eq!(index.schema_version().unwrap(), SCHEMA_VERSION);
+    assert!(index.integrity_problems().unwrap().is_empty());
+
+    let rows = index.artifacts().unwrap();
+    assert_eq!(rows.len(), 1);
+    let row = &rows[0];
+    assert_eq!(row.backup_id, fixture.id);
+    assert_eq!(row.source_fingerprint, estate.source_fingerprint);
+    assert_eq!(row.shape, Shape::V1Signed);
+    assert_eq!(row.state, State::Registered);
+
+    // Every field a rebuild reads back off `public.json` must already equal it exactly.
+    assert_eq!(
+        row.signer_id.as_deref(),
+        Some(fixture.header.signer_id.as_str())
+    );
+    assert_eq!(
+        row.recipient_id.as_deref(),
+        Some(fixture.header.recipient_id.as_str())
+    );
+    assert_eq!(
+        row.payload_sha256.as_deref(),
+        Some(fixture.header.payload_sha256.as_str())
+    );
+    assert_eq!(
+        row.manifest_sha256.as_deref(),
+        Some(fixture.header.manifest_sha256.as_str())
+    );
+    assert_eq!(
+        row.recipient_suite.as_deref(),
+        Some(fixture.header.recipient_suite.as_str())
+    );
+    assert_eq!(
+        row.signature_suite.as_deref(),
+        Some(fixture.header.signature_suite.as_str())
+    );
+    assert_eq!(
+        row.payload_bytes,
+        Some(fixture.header.payload_ciphertext_bytes)
+    );
+    assert_eq!(
+        row.manifest_bytes,
+        Some(fixture.header.manifest_ciphertext_bytes)
+    );
+
+    // The two columns a rebuild cannot fill, filled because this host just sealed the manifest.
+    assert_eq!(
+        row.profile_fingerprint.as_deref(),
+        Some(profile_fingerprint(&fixture.manifest.profile_snapshot.name).as_str())
+    );
+    assert_eq!(
+        row.profile_fingerprint.as_deref(),
+        Some(profile_fingerprint(WHOLE_DATABASE_PROFILE).as_str())
+    );
+    assert_eq!(
+        row.completed_at_utc.as_deref(),
+        Some(fixture.manifest.completed_at_utc.as_str())
+    );
+
+    let stored = fs::read(&inventory_path).unwrap();
+    for secret in [SOURCE_DATABASE, "127.0.0.1", "backupctl_fixture"] {
+        assert!(
+            !stored
+                .windows(secret.len())
+                .any(|window| window == secret.as_bytes()),
+            "the inventory holds {secret:?} in plaintext, beside an artifact tree that hides it"
+        );
+    }
+    fixture.remove();
+}
+
 #[test]
 fn an_artifact_signed_for_a_different_source_is_refused_while_planning() {
     let capture = Capture::default();
@@ -416,5 +532,243 @@ fn an_artifact_signed_for_a_different_source_is_refused_while_planning() {
         "the refused plan created {:?}",
         capture.created()
     );
+    fixture.remove();
+}
+
+/// The job half of the same real path. A store an operator reads after the fact has to be able to
+/// say which operation produced an artifact and that it finished, which no file inside
+/// `artifacts/<id>/` states about the command that wrote it.
+#[test]
+fn a_signed_backup_records_a_finished_job_and_the_trail_that_shows_how() {
+    let capture = Capture::default();
+    let fixture = write_signed(&capture);
+
+    let estate = Estate::new(source_fingerprint(&fixture.config.source, 16)).unwrap();
+    let index = backup_inventory::Inventory::open_read_only(
+        &fixture.store_root.join(INVENTORY_FILE),
+        &estate,
+    )
+    .unwrap();
+
+    let jobs = index.jobs().unwrap();
+    assert_eq!(jobs.len(), 1, "{jobs:?}");
+    let job = &jobs[0];
+    assert_eq!(job.state, JobState::Complete);
+    assert!(job.state.is_terminal());
+    assert_eq!(job.backup_id, Some(fixture.id));
+    assert_eq!(job.source_fingerprint, estate.source_fingerprint);
+    // The scope is the digest of what the command was configured with, and this one configured no
+    // profile at all — which the reserved whole-database name is what it selected.
+    assert_eq!(
+        job.profile_fingerprint,
+        profile_fingerprint(WHOLE_DATABASE_PROFILE)
+    );
+    // The job opens before the dump starts and updates when it ends. Timestamps carry second
+    // resolution, so a stub dump that finishes inside one second legitimately writes the same
+    // string twice; what the pair can prove is that they are UTC and in the right order.
+    assert!(is_utc_timestamp(&job.started_at_utc));
+    assert!(is_utc_timestamp(&job.updated_at_utc));
+    assert!(job.updated_at_utc >= job.started_at_utc, "{job:?}");
+
+    let events = index.audit_events().unwrap();
+    assert_eq!(
+        events.iter().map(|event| event.action).collect::<Vec<_>>(),
+        vec![
+            AuditAction::JobStarted,
+            AuditAction::JobStaged,
+            // Registration is part of publication, so the artifact is in the index before the
+            // operation that wrote it reports itself finished.
+            AuditAction::ArtifactRegistered,
+            AuditAction::JobCompleted,
+        ]
+    );
+    for event in &events {
+        if event.action == AuditAction::ArtifactRegistered {
+            // The publish path holds no job of its own; the link is the artifact id.
+            assert_eq!(event.job_id, None);
+            assert_eq!(event.backup_id, Some(fixture.id));
+        } else {
+            assert_eq!(event.job_id, Some(job.job_id));
+        }
+    }
+
+    // The scope is free again with the command over, and only its own lock file was left behind.
+    let locks: Vec<String> = fs::read_dir(fixture.store_root.join("locks"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(
+        locks,
+        vec![format!(
+            "{}-{}.lock",
+            estate.source_fingerprint,
+            profile_fingerprint(WHOLE_DATABASE_PROFILE)
+        )],
+        "a lock file names more than two fingerprints"
+    );
+    assert!(
+        JobLock::is_free(
+            &fixture.store_root,
+            &estate.source_fingerprint,
+            &profile_fingerprint(WHOLE_DATABASE_PROFILE)
+        )
+        .unwrap()
+    );
+
+    let stored = fs::read(fixture.store_root.join(INVENTORY_FILE)).unwrap();
+    for secret in [SOURCE_DATABASE, "127.0.0.1", "backupctl_fixture"] {
+        assert!(
+            !stored
+                .windows(secret.len())
+                .any(|window| window == secret.as_bytes()),
+            "the inventory holds {secret:?} in plaintext, beside an artifact tree that hides it"
+        );
+    }
+    fixture.remove();
+}
+
+/// What the store looked like from inside a dump that was still running.
+#[derive(Default)]
+struct MidDump {
+    lock_files: Vec<String>,
+    refused: String,
+    /// Every job row and its state, read at the moment the refusal happened.
+    rows: Vec<(String, JobState)>,
+    /// The id of the job opened for a *different* profile, which is `failed` once its own drop
+    /// runs — the real writer for that state, reached through the real command path.
+    other_scope: String,
+}
+
+/// ADR 0003's gate 9, asked at the only moment it means anything: while the first dump is still
+/// writing, with no SQL transaction open anywhere. A second `backup create` started after the
+/// first had written its rows would be refused by SQLite's lock and would prove nothing about the
+/// overlap rule, because in the real window there is no database lock to refuse with — only the
+/// kernel's.
+///
+/// Stated as a limit: this is one process with two open file descriptions, which is the same
+/// mechanism `flock` gives two processes (the spike measured that locks belong to the description,
+/// not the pid). The two-process version, with a `SIGKILL` between the dump's first byte and its
+/// last, belongs to `tests/m5a_docker_smoke.sh`.
+#[test]
+fn a_second_dump_of_one_scope_is_refused_while_the_first_is_still_running() {
+    let base = temp_root("signed-overlap");
+    let store_root = base.join("data");
+    // The same helper the fixture builds its own configuration from, so the source this test
+    // expects and the source the dump runs with cannot be two different things.
+    let mut source = config(&store_root, None, None).source;
+    source.database = SOURCE_DATABASE.to_string();
+    let fingerprint = source_fingerprint(&source, 16);
+    let profile = profile_fingerprint(WHOLE_DATABASE_PROFILE);
+    let other_profile = "aabbccddeeff0011";
+
+    let seen = Rc::<RefCell<MidDump>>::default();
+    let capture = Capture::default();
+    {
+        let seen = seen.clone();
+        let store_root = store_root.clone();
+        let fingerprint = fingerprint.clone();
+        let profile = profile.clone();
+        capture.on_dump_read(move || {
+            let mut seen = seen.borrow_mut();
+            let inventory_path = store_root.join(INVENTORY_FILE);
+            let estate = Estate::new(fingerprint.clone()).unwrap();
+            seen.lock_files = fs::read_dir(store_root.join("locks"))
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            // The live row is the only one, and it is still `running`: the refusal has to leave
+            // the history exactly as it found it.
+            let index =
+                backup_inventory::Inventory::open_read_only(&inventory_path, &estate).unwrap();
+            seen.rows = index
+                .jobs()
+                .unwrap()
+                .into_iter()
+                .map(|row| (row.profile_fingerprint, row.state))
+                .collect();
+
+            let outcome = JobGuard::begin(
+                &store_root,
+                &JobScope {
+                    source_fingerprint: fingerprint.clone(),
+                    profile_fingerprint: profile.clone(),
+                    backup_id: Uuid::new_v4(),
+                },
+            );
+            seen.refused = match outcome {
+                Ok(_) => String::new(),
+                Err(error) => format!("{error:#}"),
+            };
+
+            // Another profile of one source is another scope, so it runs — and its guard dropping
+            // without finishing is what writes a real `failed` row through the real command path.
+            let other = JobGuard::begin(
+                &store_root,
+                &JobScope {
+                    source_fingerprint: fingerprint.clone(),
+                    profile_fingerprint: other_profile.to_string(),
+                    backup_id: Uuid::new_v4(),
+                },
+            )
+            .expect("a different profile is a different scope");
+            seen.other_scope = other.id().to_string();
+            drop(other);
+        });
+    }
+
+    let fixture = write_signed_in(&capture, base).expect("the first dump was not disturbed by it");
+    // The hook itself holds a reference to the report, so it has to go before the report can.
+    drop(capture);
+    let seen = match Rc::try_unwrap(seen) {
+        Ok(cell) => cell.into_inner(),
+        Err(_) => panic!("the dump hook still holds the report"),
+    };
+
+    assert_eq!(
+        seen.lock_files,
+        vec![format!("{fingerprint}-{profile}.lock")],
+        "the running dump's lock is not the only file, or is not named by two fingerprints"
+    );
+    assert_eq!(
+        seen.rows,
+        vec![(profile.clone(), JobState::Running)],
+        "the refusal left a row of its own behind"
+    );
+    assert!(
+        seen.refused.contains("already running"),
+        "a second dump of one scope was accepted mid-dump: {:?}",
+        seen.refused
+    );
+    assert!(
+        seen.refused.contains(
+            &store_root
+                .join("locks")
+                .join(format!("{fingerprint}-{profile}.lock"))
+                .display()
+                .to_string()
+        ),
+        "the refusal did not name the lock it met: {}",
+        seen.refused
+    );
+
+    let estate = Estate::new(fingerprint).unwrap();
+    let index =
+        backup_inventory::Inventory::open_read_only(&store_root.join(INVENTORY_FILE), &estate)
+            .unwrap();
+    let jobs = index.jobs().unwrap();
+    assert_eq!(jobs.len(), 2, "{jobs:?}");
+    let finished = jobs
+        .iter()
+        .find(|row| row.backup_id == Some(fixture.id))
+        .expect("the dump that ran has a job row");
+    assert_eq!(finished.state, JobState::Complete);
+    let abandoned = jobs
+        .iter()
+        .find(|row| row.job_id.to_string() == seen.other_scope)
+        .expect("the other scope's job is recorded too");
+    assert_eq!(abandoned.state, JobState::Failed);
+    assert_eq!(abandoned.profile_fingerprint, other_profile);
+    assert_ne!(abandoned.backup_id, Some(fixture.id));
+
     fixture.remove();
 }

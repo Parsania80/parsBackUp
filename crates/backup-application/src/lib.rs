@@ -97,6 +97,31 @@ pub struct WriteOptions {
     pub with_globals: bool,
 }
 
+/// The scope one operation claims, in the words its caller has: the fingerprint of the source it
+/// resolved, the profile *name* it was configured with, and the artifact id it is about to write.
+///
+/// The store, not the service, turns this into what it records. Name-to-digest is the store's
+/// business because the name is operator configuration and the row lands in the one file an
+/// operator copies off-site without copying a key — and because a service that digested it here
+/// would have to know a key-free index exists, which is exactly the dependency this layer avoids.
+pub struct JobRequest {
+    pub source_fingerprint: String,
+    pub profile_name: String,
+    pub backup_id: Uuid,
+}
+
+/// One operation the store is recording, seen from the caller's side.
+///
+/// Two moves and no reads, because the service has no business knowing the rest of the state
+/// machine: `staged` says every stream this operation sealed is finished, `complete` says the
+/// artifact is published. Every other way a row ends — `failed` when a command returns an error,
+/// `interrupted` when a process was killed — is decided below this trait, by the store and the
+/// kernel, because a command that dies cannot be trusted to report it.
+pub trait JobHandle {
+    fn staged(&self) -> Result<()>;
+    fn complete(&self) -> Result<()>;
+}
+
 pub trait StageHandle {
     fn payload_path(&self) -> &Path;
     fn globals_path(&self) -> Option<&Path>;
@@ -189,6 +214,13 @@ pub trait ArtifactStore {
     type Plaintext: PlaintextView;
 
     fn begin(&self, id: Uuid, options: &WriteOptions) -> Result<Self::Stage>;
+    /// Claims one scope for the duration of the returned handle, and records the operation that
+    /// holds it.
+    ///
+    /// A store that keeps no index still has to answer for the lock: "two dumps of one scope must
+    /// not run at once" is not a feature of the inventory, and the inventory is only where the
+    /// refusal becomes visible afterwards. Dropping the handle ends the claim.
+    fn begin_job(&self, request: &JobRequest) -> Result<Box<dyn JobHandle>>;
     /// The writer for the staged payload file.
     ///
     /// `'a` is shared between the store and the stage: sealing a stream also marks the
@@ -534,6 +566,18 @@ impl<E: DatabaseAdapter, S: ArtifactStore> BackupService<E, S> {
             exclude_extensions,
         };
         let id = Uuid::new_v4();
+        // Claimed before anything is staged, so a second dump of the same scope meets a refusal
+        // while the first is still writing rather than after it has produced a stage nobody knew
+        // about. The whole-database name is what a run that named no profile actually selected.
+        let fingerprint = source_fingerprint(&config.source, info.source_major);
+        let job = self.store.begin_job(&JobRequest {
+            source_fingerprint: fingerprint.clone(),
+            profile_name: profile
+                .as_ref()
+                .map(|profile| profile.name.clone())
+                .unwrap_or_else(|| WHOLE_DATABASE_PROFILE.to_string()),
+            backup_id: id,
+        })?;
         // Recorded before the dump runs, because a signed manifest states when the dump
         // started as well as when it finished, and the pair is inside the signature.
         let started_unix_ms = now_unix_ms()?;
@@ -591,6 +635,10 @@ impl<E: DatabaseAdapter, S: ArtifactStore> BackupService<E, S> {
         // sink, not a flag the service carries: the format tag follows that report.
         let encrypted = staged.recipient_suite.is_some();
         let created_unix_ms = now_unix_ms()?;
+        // Every stream this operation sealed is finished, and what remains is publication. Said
+        // here rather than at each store, because the store's own sink cannot tell a payload that
+        // is done from one whose globals are still running.
+        job.staged()?;
         // A signed store has one shape to write, and it is not this one: the record a v1
         // artifact publishes is inside `manifest.age`, sealed and signed, and what the writer
         // gets back is the discovery header the rename left behind.
@@ -617,7 +665,7 @@ impl<E: DatabaseAdapter, S: ArtifactStore> BackupService<E, S> {
                 signature_suite: facts.signature_suite.to_string(),
                 started_at_utc: format_utc(started_unix_ms.try_into()?)?,
                 completed_at_utc: format_utc(created_unix_ms.try_into()?)?,
-                source_fingerprint: source_fingerprint(&config.source, info.source_major),
+                source_fingerprint: fingerprint.clone(),
                 profile_snapshot: snapshot.clone(),
                 requested_selection: RequestedSelection::from_profile(&snapshot),
                 resolved_selection: resolved,
@@ -642,6 +690,7 @@ impl<E: DatabaseAdapter, S: ArtifactStore> BackupService<E, S> {
                 compatibility_notes: Vec::new(),
             };
             let header = self.store.publish_signed(stage, &manifest)?;
+            job.complete()?;
             return Ok(Created::Signed {
                 header: Box::new(header),
                 manifest: Box::new(manifest),
@@ -678,6 +727,7 @@ impl<E: DatabaseAdapter, S: ArtifactStore> BackupService<E, S> {
         };
         manifest.validate_shape()?;
         self.store.publish(stage, &manifest)?;
+        job.complete()?;
         Ok(Created::Development(Box::new(manifest)))
     }
 
