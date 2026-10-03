@@ -1,415 +1,569 @@
-# PostgreSQL Backup Platform — Project Roadmap
+# PostgreSQL Backup Platform — Implementation Roadmap
 
-## 1. Project vision
+Revision: 2026-10-03. This rewrite is authorized by the operator. It replaces the earlier mixed design/status document with an implementation handoff and adds a dedicated clean-code phase. It changes the work plan; it does not claim that planned behavior is implemented.
 
-Build `backupctl`, a reusable Rust backup service whose CLI, scheduled runner, future API, and future UI invoke the same application core. The first release backs up and restores PostgreSQL databases with a predictable artifact, verifiable completion, explicit restore safeguards, and Debian deployment. It is a modular monolith. Additional database engines must be possible through a narrow engine capability boundary, but PostgreSQL semantics must not be flattened into misleading generic promises.
+## 1. Project vision and how to use this document
 
-**Evidence labels used below:** **PG** means behavior documented by PostgreSQL; **Tool** means a practice observed in an existing backup product; **Decision** means this project's proposed design. PostgreSQL behavior is cited to the [PostgreSQL 18 backup chapter](https://www.postgresql.org/docs/18/backup.html), [`pg_dump`](https://www.postgresql.org/docs/18/app-pgdump.html), [`pg_restore`](https://www.postgresql.org/docs/18/app-pgrestore.html), [`pg_dumpall`](https://www.postgresql.org/docs/18/app-pg-dumpall.html), and [`pg_basebackup`](https://www.postgresql.org/docs/18/app-pgbasebackup.html). Before coding, recheck version-specific behavior for the selected 16–18 support matrix.
+Build `backupctl`, a Rust modular monolith for PostgreSQL logical backup and recovery. CLI commands, systemd invocations, and a future API must call the same application services. A future browser UI calls the API. Prefer a small number of testable recovery promises to a large feature list.
 
-## 2. Goals and non-goals
+The target is reproducible behavior and maintainable architecture across implementations. Identical source text is not required. Artifact bytes, cryptographic transcripts, validation order, public command contracts, persistence rules, and failure semantics are compatibility boundaries.
 
-**Goals:** consistent logical backup; explicit content selection; local encrypted artifacts; inspect, verify, list, restore, retention, scheduling, job status; secure service operation; documented limits and restore drills; stable core usable by future interfaces. Prioritize a small, tested set of promises over feature count.
+An implementing model must first read [AGENT.md](AGENT.md), this document, the latest entries of [session-log.md](session-log.md), and the contract documents for its task. Inspect the current working tree before editing: implemented increments may be uncommitted. Never discard another session's changes or reconstruct existing code from the roadmap alone.
 
-**Non-goals for the first production release:** physical/base backups, WAL archiving, PITR, zero data loss, cluster failover, incremental/differential backups, row filtering, arbitrary SQL object filtering, secrets/OS file backup, remote stores, cloud KMS, multi-tenancy, and a browser UI. A logical dump has an RPO of its snapshot time; it cannot recover intermediate transactions.
+Use these meanings throughout:
 
-## 3. Requirements and release boundaries
+| Label | Meaning |
+|---|---|
+| Implemented | Exists in the current working tree; acceptance evidence is stated separately. |
+| Verified this review | Checked on 2026-10-03 by the review preceding this rewrite. |
+| Historical evidence | Recorded in session history; not rerun by this documentation revision. |
+| Required | A condition the named future task must satisfy. |
+| Planned baseline | The concrete implementation direction introduced by this roadmap; record its design before code, and do not describe it as an older accepted ADR decision. |
+| Decision gate | An unresolved product/dependency choice that must be recorded before dependent implementation. |
 
-| Stage | Capability | Release bar |
-| --- | --- | --- |
-| Development MVP (M1–M2) | One database, full logical custom archive, local store, inspect/list, checksum, safe restore into a new database | Synthetic fixtures only; failure never publishes a complete artifact. Real-data use begins with an artifact v1 store, i.e. after the M4a hybrid encryption **and** the M4b origin signature. |
-| Hardened CLI | Profiles and supported selection, encryption, retention, scheduling, SQLite job catalog, Debian service | Documented restores, interrupted-job recovery, privilege tests, audit trail. |
-| Service | Authenticated asynchronous API and API-backed UI | Same core behavior, authorization, idempotency, rate limits, observability. |
+Contract authority: operator instructions and AGENT.md govern work; the [frozen v1 contract](docs/backup-format/manifest-v1.md) governs artifact bytes; accepted ADRs govern their recorded decisions; this roadmap governs sequencing and task acceptance. Historical ADR context describes its original date, not necessarily today's implementation. If an implementation requires changing an accepted contract, identify the conflict and resolve it explicitly before coding that change. Do not reinterpret old artifacts or silently widen a support claim.
 
-**Initial support policy (September 2026):** PostgreSQL 16, 17, and 18 sources; same-major restore first. Cross-major restore remains unsupported until each source/target pair passes real fixture tests. Select `pg_dump` and `pg_restore` from a configured absolute path matching the source major, record exact tool versions, and refuse missing/mismatched clients. The first `.deb` targets Debian 13 and Ubuntu 24.04 LTS on amd64. Depend on `postgresql-client-common`; operators install the required `postgresql-client-N` package from their distribution or the official PostgreSQL Apt repository. Review the matrix each release. PostgreSQL 19 is prerelease and 14 nears end of support as of this decision. [Version policy](https://www.postgresql.org/support/versioning/), [Debian packaging](https://www.postgresql.org/download/linux/debian/), [Ubuntu packaging](https://www.postgresql.org/download/linux/ubuntu/).
+## 2. Goals, scope and exclusions
 
-RPO and RTO are deployment properties. The example policy is daily backup, alert after 26 hours without a verified backup, and a weekly isolated restore drill. The nominal RPO is one day; actual RPO is the age of the latest *restorable* snapshot and can be worse after failures. Report measured restore time, not a universal RTO guarantee. Require two copies on different failure domains before claiming recovery from host loss; the first local-store release makes no such claim.
+The first production product is a hardened CLI: full and supported selective logical backups, signed encrypted local artifacts, inspect/list/verify, fresh-target restore, inventory/jobs, safe retention, systemd scheduling, Debian packaging and measured restore drills. API/UI are later releases; a CLI release must not wait for them.
 
-## 4. PostgreSQL backup model
+Initial scope is one configured source and one local storage root per configuration, with named profiles of that source. Multiple source estates in one inventory are not supported. A backup is a consistent logical snapshot of one database, not a complete deployment.
 
-### Mechanisms and limits
+First-release exclusions: physical/base backups, WAL archiving, PITR, incremental/differential backups, failover, zero data loss, row filtering, arbitrary SQL object filtering, arbitrary TOC editing, remote stores, cloud KMS, multi-tenancy, OS files, secrets and server configuration backups. A future engine implements a researched capability boundary; do not translate PostgreSQL flags into imaginary generic database promises.
 
-| Mechanism | Strengths | Limits and choice |
-| --- | --- | --- |
-| `pg_dump -Fc` + `pg_restore` | One database; portable logical archive; table of contents (TOC), selective restore, parallel restore | **MVP choice.** Single dump process; downtime-free consistent snapshot, but concurrent DDL/locks can interrupt it. |
-| `pg_dump -Fd` | TOC plus parallel dump and restore | Later performance option; multiple files require atomic directory publication and transport. `-j` uses `j+1` connections and raises server load. |
-| Plain SQL | Inspectable, restored with `psql` | No `pg_restore` TOC; poorer selective restore. Export/interoperability option only. |
-| Tar archive | Archive but constrained ordering and no built-in compression | No MVP advantage. |
-| `pg_dumpall` | Cluster SQL dump or globals-only roles/tablespaces | Global objects are separate from a database dump; `--globals-only` is opt-in and privileged. Do not silently attach it to every database backup. |
-| `pg_basebackup` + WAL | Entire physical cluster, foundation for PITR | Separate subsystem and operational contract. Cannot selectively back up a database/table. Future work. |
+Local artifacts share the host's failure domain. Do not claim host-loss recovery without an independently verified copy in another failure domain. RPO is the age of the latest restorable snapshot; RTO is measured restore duration in a stated environment. Example operating policy: daily backup, stale alert after 26 hours, weekly isolated restore drill. These are policy targets, not guarantees.
 
-**PG:** `pg_dump` is a consistent export of one database, not an entire deployment. Archive formats allow TOC selection. A newer `pg_dump` cannot dump a newer server; loading into an older target major is not guaranteed. Client and server versions and extensions must be preflighted. [Source](https://www.postgresql.org/docs/18/app-pgdump.html). **PG:** physical backups cover the cluster, while PITR requires a usable base backup plus a continuous WAL chain. [Source](https://www.postgresql.org/docs/18/continuous-archiving.html). **Decision:** do not describe logical backups as PITR or use `pg_verifybackup` on logical archives; it validates physical base backups.
+## 3. Current status and release boundaries
 
-### Content inventory and policy
+| Area | Delivered behavior | Remaining limitation |
+|---|---|---|
+| M0–M3 | Contracts, fixtures, local backup/inspect, safe fresh-target restore, profiles and restricted selection | Synthetic local fixture sources only. |
+| M4a | Streaming hybrid age encryption, key generation/publication/status and recovery drills | Unsigned development shape retains plaintext metadata. |
+| M4b | Signed artifact v1 with encrypted private manifest; frozen 2026-10-01 | Signature-only verification does not authenticate all public header claims. |
+| M5a increment 1 | `backup-inventory`, schema v1, estate binding, SQLite open rules and scope flock | Inventory reads/rebuild are not yet exposed through the CLI. |
+| M5a increment 2 | Signed publication registers an artifact row after the completion marker | Development artifacts remain unregistered. |
+| M5a increment 3 | Schema v2 jobs/audit; backup creation drives running/staged/complete | Restore jobs, verification events, reconcile/rebuild and crash matrix remain. |
+| Concurrency review | Same-scope job acquisition is tested mid-dump | Store initialization deletes live staging/scratch before locking: confirmed blocker. |
+| Operations/service | None yet | Scheduling, packaging, production hardening, API and UI remain planned. |
 
-In the tables, **tool** identifies the native mechanism; **place** says whether it logically belongs to a database backup; **plan** gives support/optionality; **restore** states the consequence; **record** states metadata needs. “Dump” means native `pg_dump` behavior subject to source privileges, version, and selection. The inventory must be turned into version-specific fixture tests before a support claim is published. [Sources: `pg_dump`](https://www.postgresql.org/docs/18/app-pgdump.html), [`pg_restore`](https://www.postgresql.org/docs/18/app-pgrestore.html), [`pg_dumpall`](https://www.postgresql.org/docs/18/app-pg-dumpall.html).
+Review evidence: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo test --workspace` passed; 167 tests passed, zero failed. Existing PostgreSQL 16/17/18 matrices have historical passing records through M4b. They were not rerun in the review or this rewrite. Test counts describe the baseline, not a target future count.
 
-| Category | Tool; place | Plan and optionality | Restore and record |
-| --- | --- | --- | --- |
-| Schemas; tables; table data; views; materialized views | Dump; database | Full profile default; schema/table/data selection where native flags permit | Restore dependencies and ownership; record selected schemas, resolved objects, TOC digest. Materialized view definitions/data need fixture checks. |
-| Indexes; primary, foreign, unique and check constraints; triggers; rules | Dump; database | Included with full schema; do not promise independently selectable dependency closure | Post-data order matters; filtered restore may lack referenced tables; record TOC entries. |
-| Sequences and current state; identity/generated columns; partitioning; inheritance | Dump; database | Full default; selective profile requires explicit dependency warnings | Restore state with data, not schema-only; partition children and parent selection need tested semantics; record selection and source version. |
-| Functions; procedures; types; domains; enums; collations; text-search objects | Dump; database | Full default; exact-object selection deferred to TOC research | May depend on extensions, OS locale, installed libraries; record dependency warnings and TOC. |
-| Extensions; foreign data wrappers; foreign servers; user mappings | Dump definitions where supported; database plus external dependencies | Full default for definitions; always treat the native archive as sensitive and encrypt it before real-data publication | Extension binaries and endpoints are not supplied by dump. User-mapping options **can contain passwords in the archive**; never echo them in metadata/logs. |
-| Grants, ownership, default privileges; comments; row-level-security policies; security labels | Dump; database | Full default; portable mode may opt out of owner/ACL; do not claim RLS enforces row filtering of a dump | Destination roles/provider must exist; record inclusion flags. Dump may bypass RLS or fail under insufficient privileges; test the privilege mode. |
-| Large objects | Dump by default for whole database, with selection caveats; database | Full default; explicit include for schema/table filtered dumps | Large-object references may not track selected tables; record inclusion and warn about orphans. |
-| Publications and subscriptions | Dump definitions according to tool/version; database with external replication state | Publication default; `--no-subscriptions` for first release, omission recorded | Subscription connection strings can contain passwords. Future opt-in restore requires separate activation; never silently connect or recreate slots. |
-| Database creation, database-level settings and privileges | `pg_dump` options / catalog; database-level, not schema-level | Capture supported definitions for full-database restore; optional `--create` workflow | Target names/settings may be unsafe or unavailable; record database attributes and validate before create. |
-| Roles/users, role memberships, role passwords, tablespaces, global parameter grants | `pg_dumpall --globals-only`; cluster-global | Separate privileged, opt-in global artifact in a later milestone; password hashes excluded by default | Can conflict with existing roles/paths and require superuser; never auto-apply; record global artifact reference and privileges. |
+Current guard: writes require `--confirm-synthetic`, source connections are local, and database names start with `backupctl_fixture_`. Encryption and signatures are necessary but insufficient to permit production use. Removing this guard belongs to the explicit CLI release gate after M5/M6 and production validation.
 
-| External category | Tool; place | Plan and optionality | Restore and record |
-| --- | --- | --- | --- |
-| OS cron, systemd units/timers, application jobs | No PostgreSQL dump; host/app | Outside database artifact. Document as deployment dependencies; later configuration export only if safe. | Never auto-install or start on restore; record operator checklist only. |
-| External files, filesystem data, environment variables, secrets, certificates | No PostgreSQL dump; host/app | Out of scope for MVP; separate file/secret backup mechanism | Never embed secrets; record dependency names and recovery checklist, not values. |
-| `postgresql.conf`, `pg_hba.conf`, `pg_ident.conf`, server TLS settings | No logical dump; server | Separate privileged configuration backup, future only | Unsafe to apply blindly across hosts/versions; record expected settings and validation steps. |
-| WAL archives and replication slots | No logical dump; cluster/replication | Separate physical backup/WAL subsystem, future only | Required for PITR, not part of logical restore; record that this artifact has no PITR coverage. |
+Chosen compatibility policy: PostgreSQL 16, 17 and 18 source servers, absolute source-major client directory, matching `pg_dump`/`pg_restore`, same-major restore. Cross-major restore requires a separately tested source/target pair and documented support change. Initial packaging targets are Debian 13 and Ubuntu 24.04 LTS, amd64. Recheck the supported-version lifecycle and package availability before release; this is a project policy, not a claim about the latest upstream version.
 
-**Selective operations:** support full, schema-only, data-only, named schemas, and named tables using native `pg_dump`/`pg_restore` switches. Resolve user patterns to exact source objects in preflight, fail on zero or ambiguous matches, and record both requested and resolved selection. Filtered dumps do **not** include all external dependencies; `pg_restore -t` is not a dependency resolver. Sequence state, large objects, extension-owned objects, foreign keys, partition children, and cross-schema references may make a partial archive unrestorable on a clean target. Table-data-only restore requires existing compatible schema. For selected partitioned/inherited parents, use `--table-and-children` and record all resolved children; reject parent-only selection as a full-family backup. Child-only selection remains an advanced partial operation. For schema/table filters, large objects are excluded by default; explicit `--large-objects` includes **all** large objects, not just referenced ones. [PostgreSQL 16 `pg_dump`](https://www.postgresql.org/docs/16/app-pgdump.html). Exact TOC item editing is an expert, later feature with a generated `pg_restore -l` plan; arbitrary object filters and row filters are not MVP promises. [Sources: `pg_dump`](https://www.postgresql.org/docs/18/app-pgdump.html), [`pg_restore`](https://www.postgresql.org/docs/18/app-pgrestore.html).
+## 4. Tech Stack Lock
 
-## 5. Architecture
+| Layer | Approved stack | Constraint |
+|---|---|---|
+| Core | Rust edition 2024, Cargo workspace | Synchronous core until M7 has a demonstrated async boundary. |
+| Database execution | Native PostgreSQL `pg_dump`, `pg_dumpall`, `pg_restore`, `psql`, `createdb` | Fixed absolute tools and argv vectors; no shell and no custom dump engine. |
+| Configuration | TOML through `toml` and `serde` | Strict fields; secrets referenced by protected paths. |
+| Interchange | JSON through `serde_json` | Versioned artifacts/plans; closed schemas at security boundaries. |
+| Inventory | `rusqlite` = 0.40.2, defaults disabled, bundled SQLite | DELETE journal, FULL synchronous writes, explicit timeout. |
+| Encryption | `age` = 0.12.1, `age-core` = 0.12.0, existing custom hybrid recipient | Keep the pinned pair and tested format compatible. |
+| Signatures | `ed25519-dalek` 2.2 line and `ml-dsa` 0.1.1 or reviewed compatible update | Required zeroization features; both signature legs verify. |
+| CLI | `clap` derive | Existing human/JSON modes; parsing/presentation only. |
+| Local coordination | Unix `flock` through `libc` | Kernel ownership; nonblocking scope acquisition; never unlink live lock files. |
 
-Workspace layout (planned, not yet implemented):
+Approved direct workspace libraries: `anyhow`, `clap`, `serde`, `serde_json`, `sha2`, `toml`, `uuid`, `age`, `age-core`, `base64`, `hkdf`, `libc`, `hpke`, `ml-kem`, `rand`, `sha3`, `typenum`, `x25519-dalek`, `rusqlite`, `ed25519-dalek`, `ml-dsa`, `zeroize`. [Cargo.toml](Cargo.toml) is the declaration and [Cargo.lock](Cargo.lock) records resolved versions and transitive dependencies. Preserve feature flags and exact pins unless a named task requires a reviewed upgrade.
+
+No new runtime, ORM, SQL driver, encryption container, logging framework, job queue, web framework or UI library during the cleanup/refactor phase. M7/M8 choose their framework at their decision gates. New dependencies need a concrete need, alternatives, compatibility/security/licensing review and a recorded decision. Do not add a dependency merely to replace a small readable helper.
+
+## 5. Architecture and code ownership
+
+Current workspace:
 
 ```text
 crates/
-  backup-domain/       # IDs, policies, artifact schema, capability types
-  backup-application/  # backup/restore/verify/prune use cases and ports
-  backup-postgres/     # pg_dump/pg_restore adapter and preflight
-  backup-local/        # local artifact storage and SQLite catalog
-  backup-crypto/       # streaming authenticated encryption and key providers
-  backupctl/           # CLI and optional daemon entry points
-  backup-api/          # future HTTP adapter
-deploy/ docs/ tests/
+  backup-domain/       pure configuration, profiles, selection, artifact and plan contracts
+  backup-application/  ports and backup/verify/restore orchestration
+  backup-postgres/     tool execution, catalog resolution, dump and restore adapter
+  backup-local/        local files, publication, plaintext views and crypto boundary
+  backup-crypto/       key files, hybrid recipient, age streams and signatures
+  backup-inventory/    key-free SQLite artifacts, jobs, audit, schema and scope locks
+  backupctl/           command parsing, dependency composition and reports
+docs/                 contracts, ADRs, security and operator/development guides
+config/               tested example configurations
+tests/                PostgreSQL matrices, drills and synthetic SQL fixtures
+archive/              preserved completed-session history
 ```
 
-The dependency direction is interface → application → domain; infrastructure implements application ports. A `DatabaseEngine` port owns capability discovery, backup planning/execution, and restore planning/execution. Keep engine-specific PostgreSQL selection and restore controls in typed PostgreSQL requests, not a lowest-common-denominator global interface. `ArtifactStore`, `Catalog`, `RecipientProvider`, `IdentityProvider`, `Signer`, `Verifier`, `Clock`, and `JobRunner` are separate ports where multiple implementations or deterministic tests justify them. The UI consumes the API; neither CLI nor API duplicates use-case rules. Avoid distributed queues or microservices until measured scaling requires them.
+Dependency direction: CLI/future API compose application services and concrete adapters; application depends on domain and port traits; PostgreSQL/local adapters implement those ports; local depends on crypto and inventory; crypto and inventory do not depend on local. Domain has no filesystem, database, subprocess or CLI dependencies. Its current crypto dependency is test-only, for suite-contract checks, and must not become a runtime dependency.
 
-| Execution option | Pros | Cons | Decision |
-| --- | --- | --- | --- |
-| PostgreSQL CLI tools | Mature, versioned native semantics, TOC support | Process supervision and tool provisioning | **Use** `pg_dump`/`pg_restore` with fixed executable paths and argv arrays. |
-| PostgreSQL client libraries | Direct catalog access and precise preflight | No replacement for complete dump/restore logic | Use only for metadata/preflight if it adds value. |
-| Custom dump engine | Full control | High compatibility and correctness burden | Reject. |
+Keep PostgreSQL-specific selection, globals and restore controls typed and visible. The implemented engine port is `DatabaseAdapter`; do not rename it to a speculative `DatabaseEngine` during a readability refactor. A future engine can justify a new boundary through a separate design decision.
 
-Processes never pass through a shell. Cap stdout/stderr capture, redact connection data, set timeouts and cancellation, verify executable provenance/version, and restrict inherited environment. Avoid passwords in argv and logged URLs.
+Application determines operation order and policy. Store adapter owns paths, atomic publication, scratch ownership and cleanup. Crypto owns key parsing, streams and transcript bytes. Inventory owns SQL persistence and kernel scope locks, and receives only typed key-free facts. CLI performs no retention, trust or restore policy decisions.
 
-## 6. Domain model
+Add an application port when a use case needs an independently testable adapter boundary. Do not add traits for pure helpers or manufacture a generic repository framework. Existing `ArtifactStore`, `JobHandle`, sink/view/handle traits are the starting point; future inventory operations can have a small dedicated port instead of indefinitely widening `ArtifactStore`.
 
-`BackupProfile` is immutable per job via a versioned snapshot. `Source` identifies an engine and connection reference, not a password. `Selection` is an engine-specific resolved scope. `BackupPlan` captures source capability/version, intended archive format, storage, compression, encryption, and estimated risks. `BackupRecord` holds status (`planned → running → staged → verified → complete`, or `failed/cancelled/quarantined`), artifact reference, hashes, and timestamps. `RestorePlan` holds target identity, selected TOC, compatibility checks, conflict mode, and an expiring plan digest. `Job` captures state, actor, retry/cancel state, and safe diagnostics. `RetentionPolicy` selects candidates but cannot delete until protected-backup invariants pass.
+## 6. Domain, identity and state contracts
 
-Ports should stream bounded chunks; no use case loads a whole archive into memory. Version artifact schemas and catalog migrations independently. Use UUID/ULID IDs, UTC timestamps, and stable JSON field names; never infer truth from a directory name alone.
+| Concept | Exact meaning |
+|---|---|
+| Backup ID/job ID/plan ID | UUIDv4 identities. They are never chronological sequences. |
+| Source fingerprint | Existing 16-hex, domain-separated digest; binds one source estate. Preserve its input and encoding. |
+| Profile fingerprint | Existing 16-hex digest of the profile name; no-profile uses reserved `whole-database`. It is not a hash of resolved content. |
+| Profile snapshot | Immutable configured profile copied into the manifest; describes content even when profile names are later reused. |
+| Artifact state | Existence/lifecycle facts in inventory; distinct from job state and verification results. |
+| Verification event | A host's observation about specific artifact bytes at a time; never a mutable claim inserted into v1. |
+| Restore/deletion plan | Immutable, expiring intent bound to exact inputs and explicit execution confirmation. |
 
-## 7. Backup artifact design
+Delivered backup job transitions: `running -> staged -> complete`. `running` or `staged` may end in `failed` on unfinished guard drop, or `interrupted` when a writable recovery open finds the scope lock free. Terminal states do not transition back. `JobGuard` currently permits running directly to complete; the real backup path still writes staged, and its trail test pins that sequence. Do not confuse a helper's permissive transition with an alternative backup workflow.
 
-**Published artifact v1:** `artifacts/<opaque-id>/public.json`, `manifest.age`, `payload.age`, `signature.hybrid`, and a completion marker. `payload.age` decrypts to a native PostgreSQL custom archive. The encrypted manifest and `public.json` name the **algorithm suite** — recipient construction (`x25519` or `mlkem768x25519-v0`), signature construction (`ed25519` or `ed25519+ml-dsa-65`), and the implementing versions — because a reader must be able to tell a hybrid artifact from a classical-only one and refuse a silent downgrade rather than assume. `public.json` contains only format version, opaque ID, suite, recipient/signer IDs, encrypted file sizes, and ciphertext checksums; it is untrusted until verified. The encrypted manifest contains ID, PostgreSQL/client/application versions, redacted source fingerprint, profile snapshot/hash, requested/resolved scope, TOC digest/summary, compression, timestamps, byte counts, duration, verification level, ciphertext digest, compatibility warnings, and status. It never copies passwords, connection strings, raw SQL, or key material into fields. The PostgreSQL archive itself may contain secrets.
+A job state write and its audit event must be one transaction. Audit order is monotone `event_id`, not second-resolution timestamps or random IDs. `Drop` does not panic; failure to write a terminal state leaves a recoverable non-terminal row. Reasons stay in safe command diagnostics; do not put arbitrary error chains, SQL or names into key-free SQLite columns.
 
-The decrypted manifest binds its ID and the SHA-256 digest of `payload.age`. On read: check the recorded suite is one this reader is allowed to accept, verify the detached hybrid signature against an independently trusted verifying key over ID and both ciphertext digests; authenticate/decrypt manifest; compare ID with path/public header; check payload digest; authenticate the entire payload before restore. A public header is a discovery aid, not security truth. Stage privately on the same filesystem, fsync files and directory, atomically publish, then write the completion marker; a missing marker or mismatch is incomplete. SQLite indexes validated manifests and job state; recovery with the decryption identity rebuilds it. M1 plaintext output is synthetic-data development output only, never a public artifact. Freeze published v1 at M4b after interoperability, corruption, and suite-downgrade tests. Readers accept known versions, reject unknown critical fields, and never rewrite immutable artifacts in place. Future remote storage commits payload, encrypted manifest, public header, then marker. Offline rollback/deletion still needs independent inventory or immutability; a signature does not reject an older valid artifact.
+Future restore jobs use running/complete/failure/interrupted without inventing a staged artifact phase. Add an operation kind and appropriate target/artifact associations through a migration before sharing job logic. Future cancellation states require an actual writer and tested semantics in M7; do not add unused enum variants now.
 
-## 8. Security model
+## 7. Artifact v1, crypto and publication contracts
 
-**Decision:** compress before encryption because ciphertext does not compress meaningfully. Use `pg_dump -Fc` with zstd if the source-major client supports it, otherwise gzip; record the exact method and do not double-compress. Use the maintained Rust [`age` crate](https://docs.rs/age/latest/age/) and its standard streaming format with a **hybrid classical + post-quantum recipient**: the payload key is agreed with X25519 *and* ML-KEM (FIPS 203) combined per [RFC 10024](https://www.rfc-editor.org/info/rfc10024/), never with the post-quantum primitive alone and never with the classical primitive alone for new writes. Age provides per-file data keys, recipient wrapping, authenticated streaming, and truncation detection. Whether the hybrid recipient is carried by age's own `age-encryption.org/v1` container or by a thin suite-labeled envelope around the same authenticated stream is the M4a spike's decision, not a settled fact; either way finish the stream writer and authenticate a complete read before passing plaintext to `pg_restore`, and do not design custom AEAD framing. [Age streaming API](https://docs.rs/age/latest/age/struct.Encryptor.html), [Age crate](https://docs.rs/age/latest/age/), [FIPS 203](https://csrc.nist.gov/pubs/fips/203/final).
+The [v1 contract](docs/backup-format/manifest-v1.md), [ADR 0001](docs/architecture/adr-0001-foundations.md) and [ADR 0002](docs/architecture/adr-0002-artifact-v1-and-signing.md) define exact fields, encodings, transcript values and key rules. Read them before modifying readers/writers. Do not derive wire formats from this summary.
 
-The initial provider reads a service-owned age identity file, mode 0600, outside the artifact store; the identity holds both halves of the hybrid recipient (X25519 and ML-KEM), so key files, sizes, and recovery instructions are named per suite rather than assumed. Configure the public recipient separately and maintain an offline recovery copy. A recipient/identity provider boundary permits later OS keyring, Vault, and cloud KMS integration. In v1, rotation decrypts and re-encrypts to a new recipient as a new validated artifact generation; do not promise cheap header-only rewrap. Password mode is deferred: standard age passphrase recipients use scrypt, whereas the earlier proposed Argon2id KEK would require another envelope format. If added, use age's standard passphrase mode with a human-provided secret, never an argv value. SHA-256 detects accidental corruption; age authenticates encrypted content but its public recipient does not authenticate the sender. Published v1 therefore requires a detached **hybrid Ed25519 + ML-DSA-65** signature from a distinct signing key outside the artifact store, with its verifying key trusted independently; keeping the classical half alongside the post-quantum half means a break in either primitive alone does not yield a forgery. See [ADR 0001](docs/architecture/adr-0001-foundations.md). Encryption and signatures cannot prevent deletion, rollback of an older valid artifact, or exfiltration from a compromised live host. Plaintext restore staging uses a private capacity-checked directory and best-effort removal, with SSD deletion limits documented.
-
-PostgreSQL credentials: prefer peer auth for local operation or a dedicated `PGPASSFILE` with mode 0600; require TLS verification for remote connections. The [PostgreSQL password-file documentation](https://www.postgresql.org/docs/current/libpq-pgpass.html) describes permission rules. No credentials in profiles, manifests, argv, logs, error messages, or environment inherited by unrelated children. Document minimum privileges by operation and test them: dump needs CONNECT/USAGE/SELECT or equivalent on selected objects; full cluster globals and some restore operations can require elevated privileges. Decline a requested feature when its privilege requirement cannot be met safely. `pg_dump` warns that restoring dumps can execute code selected by a source superuser; treat untrusted artifacts as executable input and require trusted origin/review before restore. [Source](https://www.postgresql.org/docs/18/app-pgdump.html).
-
-## 9. Threat model
-
-Maintain [the M0 threat model](docs/security/threat-model.md) at encryption, API, and release gates. Each entry records attacker, asset, attack, impact, mitigation, and residual risk.
-
-| Attacker / asset | Attack and impact | Mitigation |
-| --- | --- | --- |
-| Backup-file thief / data | Copy artifact and metadata; disclose now and decrypt later, when a quantum adversary makes a classical-only key exchange breakable | Hybrid AEAD encryption (X25519 + ML-KEM), separate KEK, minimal manifest, restrictive permissions. |
-| Compromised backup host / keys and data | Read live keys or plaintext; broad disclosure | Least privilege, key isolation, short secret lifetime, off-host monitoring; state residual risk explicitly. |
-| Stolen database credential / source | Unauthorized reads or modifications | Least-privilege dump role, TLS, credential rotation, connection audit. |
-| Malicious local user / artifact store | Path traversal, symlink swap, overwrite | Private dirs, relative opaque IDs, `openat`-style no-follow handling, ownership checks, atomic publication. |
-| Malicious API client / jobs | Restore/deletion abuse, replay, resource exhaustion | AuthN/AuthZ by operation, idempotency keys, quotas/rate limits, audit, explicit restore approval token. |
-| Tampering storage provider / backups | Replace/delete/replay old artifacts | Required hybrid (Ed25519 + ML-DSA-65) origin signature over recorded suite and ciphertext digests detects replacement; independent inventory/immutable copies and audit address deletion or replay. |
-| Crafted identifier or filename / process | Command injection or arbitrary file access | Typed inputs, argv arrays, no shell, canonical source-object resolution, fixed tool paths. |
-| Compromised backup SQL / target | Execute malicious SQL on restore | Trust boundary and review, isolated target, restricted restore role, preflight; never auto-restore unknown artifacts. |
-| Operator mistake / production | Destructive overwrite or incompatible restore | Target fingerprint, dry-run plan, explicit digest confirmation, default new database, version/extension checks. |
-| Privileged administrator / deletion | Remove all recoverable copies | Retention floor, protected backups, off-host copies/immutability later, audited break-glass flow. |
-
-## 10. Storage architecture
-
-`ArtifactStore` provides stage/write/read/commit/list/delete with immutable IDs and capability flags (atomic rename, conditional create, consistency). Local MVP uses a dedicated directory, restrictive umask, capacity checks, fsync of file and parent directory before commit, and quarantine of stale stages. Never follow user-controlled symlinks. Future S3/MinIO/SFTP adapters use multipart/resumable upload and commit markers; no reliance on rename. The core owns lifecycle rules; adapters own transport. An independent copy on a different failure domain is required for a strong disaster-recovery claim.
-
-Retention policies: `keep_last`, age limit, and later daily/weekly/monthly buckets, plus per-backup legal/protection flags. Preview is default for `prune`; execution requires explicit confirmation and audit. Never delete the only known valid backup for a source, an active/restoring backup, a protected backup, or a backup needed by an in-progress job. Count only verified/complete artifacts as valid. Tool observations: [pgBackRest](https://pgbackrest.org/user-guide.html) expires after successful new backup, [Barman](https://docs.pgbarman.org/release/3.13.1/user_guide/retention_policies.html) supports redundancy and recovery windows, and [WAL-G](https://github.com/wal-g/wal-g/blob/master/docs/PostgreSQL.md) protects permanent backups. These inform policy and safety, not implementation copying.
-
-## 11. Restore architecture
-
-1. Resolve artifact and verify manifest schema, checksum, AEAD, archive TOC, key availability, tool version, and source trust.
-2. Build a deterministic plan: target server/database identity, source/target versions, extensions/collations, roles/ownership, tablespaces, selected TOC entries, required privileges, likely conflicts, estimated size, and dry-run warnings. A dry-run does **not** execute SQL and cannot prove success.
-3. Default to a new database and `pg_restore --exit-on-error`; require a destination-name confirmation or exact plan digest for any operation that can replace existing objects. Destructive `--clean`, `--create`, and role/global restore are separate explicit choices. Noninteractive API requires an authorized plan token bound to target fingerprint, scope, expiration, and actor.
-4. Choose full, schema-only, data-only, selected schema, or selected table as supported by `pg_restore` and the artifact. No implicit dependency reconstruction. Ownership policy is explicit (`preserve` versus `--no-owner`); ACL policy likewise. Check extension availability. After restore, run required validation and `ANALYZE` where appropriate.
-5. Treat interrupted restore as potentially partial. Record exact state and recovery instructions; never auto-retry a destructive restore. `--single-transaction` is an optional compatible mode; parallel restore and single transaction are not combined. Prefer a fresh disposable target for test restore.
-
-Cross-server restore is allowed only after preflight and explicit target identity check. Active connections and database creation/drop privileges are checked before overwrite. Never assume a newer-to-older PostgreSQL restore works. [Source](https://www.postgresql.org/docs/18/app-pgrestore.html).
-
-## 12. CLI architecture
-
-| Command | Behavior |
-| --- | --- |
-| `backupctl backup create --profile NAME` | Plan, run, publish; `--dry-run` reports resolved scope. |
-| `backupctl backup list`, `inspect ID`, `verify ID`, `protect ID`, `delete ID`, `prune` | Search and lifecycle; delete/prune preview by default. |
-| `backupctl restore plan ID --target NAME`, `restore run PLAN_ID --confirm-target NAME` | Review then execute; destructive modes require a plan digest confirmation. |
-| `backupctl profile validate/list`, `schedule list/run`, `job list/inspect/cancel`, `config check`, `status`, `version`, `completion` | Administration and diagnostics. |
-
-Human tables by default, stable `--output json` for machines, `--quiet` for success output suppression, and `-v`/structured logs to stderr. Define exit codes: 0 success, 2 usage/config, 3 preflight/authorization, 4 backup/restore execution, 5 verification/integrity, 6 partial/cancelled. JSON errors carry machine code, safe message, job ID, and retryability. Config precedence: explicit CLI > allowlisted environment overrides > TOML file > defaults; secrets are references, not inline values. Shell completion is generated from the CLI parser.
-
-## 13. API architecture
-
-Future Rust HTTP adapter calls application use cases. `POST /api/v1/backups` and `/restores` create asynchronous jobs and return `202` plus job URL; `GET /api/v1/jobs/{id}`, `/backups`, `/backups/{id}`, `/profiles`, `/health` expose status. Use cursor pagination and a stable problem-style error shape. Backup creation and restore submission require idempotency keys bound to actor/request digest. Authentication can start with local service tokens or trusted reverse-proxy identity only after threat review; operation-level authorization separates backup, restore, delete, profile, and admin. Bind to loopback by default, require TLS at the deployment boundary, rate-limit expensive operations, redact request logs, and audit actor/target/decision. Never accept arbitrary paths or shell options from HTTP. API versioning covers wire contracts; artifact schema versions are separate.
-
-## 14. UI architecture
-
-After the API stabilizes, build a small independent web client (TypeScript with a mature component framework chosen at that milestone). It consumes only the API. Views: dashboard/health, backups/details, restore plan and confirmation, profiles, schedules, storage/key status without secrets, jobs/logs, and audit history. Present verification level and partial-backup warnings prominently. The UI cannot bypass plan confirmation or privilege checks. Accessibility and clear destructive-action UX are acceptance gates.
-
-## 15. Configuration and profile system
-
-**Decision:** versioned TOML for human-edited service config and profiles; JSON is API/artifact interchange; YAML adds parsing ambiguity without a needed feature. Strict schema validation rejects unknown fields and impossible combinations. Example shape (illustrative, no secrets):
-
-```toml
-version = 1
-name = "application-data-only"
-source = "production"
-format = "custom"
-mode = "schema-and-data"
-schemas = ["app"]
-tables = []
-large_objects = false
-compression = "zstd"
-storage = "local"
-encryption_key = "age:primary"
+```text
+artifacts/<backup-uuid>/
+  public.json          bounded discovery header, no descriptive source data
+  manifest.age         encrypted private JSON manifest
+  payload.age          encrypted native custom archive
+  globals.age          only for explicit globals export
+  signature.hybrid     64-byte Ed25519 signature followed by 3309-byte ML-DSA-65
+  complete             completion marker written last
 ```
 
-Profiles specify database/source reference, selection, mode, archive format, compression, storage, encryption-key reference, verification level, retention policy, and schedule reference. Global-object export is a distinct privileged operation, never a boolean silently merged into the same archive. Distinguish include from exclude rules, preserve exact resolved scope in each job, and reject profiles that advertise unsupported combinations. Config reload affects only new jobs.
+New signed writes use `mlkem768x25519-v0` and `ed25519+ml-dsa-65`. The recipient combines ML-KEM-768 then X25519 using the existing versioned combiner/transcript inside age's authenticated stream. It is project-specific and stock `rage` cannot decrypt it. Exactly one hybrid recipient stanza is allowed, with age's supported grease stanza; another recipient is refused. Never add classical-only recovery access to the same file key.
 
-## 16. Metadata database
+The 3373-byte signature authenticates the existing binary tuple containing the domain, backup ID and two ciphertext digests. It does not directly authenticate `public.json` suite/key claims or completion time. The encrypted manifest is authenticated indirectly through its ciphertext digest. `globals.age` is bound through the authenticated manifest's digest. Changing this tuple or the combiner is a version/suite change, not clean-code work.
 
-| Option | Pros | Cons | Decision |
-| --- | --- | --- | --- |
-| SQLite | Zero extra server; transactional local jobs and migrations | Single-host writer; needs careful backup/rebuild | **Choose** for monolith MVP; WAL mode, busy timeout, one owner. |
-| PostgreSQL | Multi-host concurrency and richer operations | Dependency cycle if service database shares source cluster | Defer until multi-node requirement exists. |
+Read order is required: check marker and allowed file shapes; parse bounded closed-schema header and ID; recompute ciphertext sizes/digests; verify both signature legs against an independently configured public key; when private metadata is required, authenticate/decrypt manifest and compare all bindings; authenticate the complete payload before PostgreSQL restore uses plaintext. Reject symlinks, unknown critical fields/versions, mismatches, truncation and unsupported suite combinations.
 
-Tables: sources (secret references only), profile versions, backup records, artifact locations, job leases/events, schedules, retention decisions, audit events, schema migrations. No payload bytes. Reconcile catalog from authenticated manifests after crash using the recovery identity; catalog loss must not make valid artifacts undiscoverable to a key holder. Keep catalog backups separate from the PostgreSQL sources it protects.
+Signature-level verification checks origin of the signed tuple and ciphertext bytes, without decrypting. A header whose suite claim was downgraded can still pass this level; checksum/archive/restore paths reject the mismatch against the decrypted manifest. Preserve that distinction in results and tests. A successful signature is not a trustworthy database or safe SQL guarantee.
 
-## 17. Scheduling
+Writer sequence: privately stage on the destination filesystem; stream native dumps through completed encryption sinks; inspect staged native archive/record TOC digest; seal the private manifest; derive public facts and sign; sync files and directory; atomically publish the immutable ID; write/sync completion marker and parent; register inventory; mark job complete. Use the frozen writer order in the canonical contract for exact details.
 
-| Scheduler | Pros | Cons | Decision |
-| --- | --- | --- | --- |
-| systemd timer | Native Debian lifecycle, persistence, service isolation | Linux-specific, one unit/profile or generated units | **MVP** scheduled invocation; package example timer, operator enablement. |
-| Internal scheduler | Dynamic API-managed schedules | Needs leader election, restart semantics, clock handling | Add only when API-managed schedules become necessary. |
-| cron | Widely known | Weak job state and package ownership | Document as external invocation option, no native management. |
+Registration currently follows publication. If registration fails, report that the artifact is published and restorable but unregistered; do not remove the artifact to make the error look atomic. Never modify published v1 in place. `verification_level` remains `none`; writer records TOC digest at creation. Later verification belongs in inventory.
 
-OS timers and cron jobs are not PostgreSQL objects and are absent from database dumps. Use UTC schedule definitions, document missed-run behavior, single-instance lock, overlap policy, and manual run interaction. Do not start a second dump for the same source/profile while one runs.
+Three shapes remain distinct: `plaintext-dev`, `age-unsigned`, `v1-signed`. Plaintext and unsigned development shapes are synthetic-only. Mixed-store discovery must report each shape without treating development output as trusted v1.
 
-## 18. Reliability and concurrency
+## 8. Security and process boundary
 
-Use a persisted job state machine and bounded worker pool: initial default one backup and one restore globally, with per-source exclusive restore lock and configurable dump limits. Reserve disk headroom before dump; enforce duration/size limits and cancellation by terminating the process group, then quarantine staged data. Retry only idempotent stages (e.g., future upload); a new dump is a new snapshot/job. On restart, mark orphaned running jobs interrupted, inspect/quarantine stages, and never infer success from process exit alone. Check exit status, stderr warnings, payload existence, checksum, archive TOC readability, durable commit, and catalog update before `complete`.
+Keep secret files outside the artifact root. Identity/signing secrets are regular non-symlink files with restrictive owner permissions and existing length/marker checks. Verify public keys from independent configuration. Preserve recovery copies and rotation-by-new-generation behavior described in [key lifecycle](docs/security/key-lifecycle.md). Every signing scheme and secret-bearing type retains required zeroization; compile-time bounds and golden vectors must remain.
 
-Failure matrix to test: PostgreSQL unavailable, lock timeout, disk full, killed process, encryption/key failure, corrupt archive, SQLite failure, interrupted restore, remote upload interruption, and host restart. Failed restore may have changed target; surface this explicitly and require operator repair. Do not silently delete forensic artifacts until retention policy permits it.
+Source archives can contain database-held passwords even when subscriptions and role password hashes are excluded. Never publish real data in the development shapes. Never log raw SQL, native stderr/stdout, connection strings or private keys. Fingerprints are labels, not authorization proofs or anonymization against an attacker who can guess inputs.
 
-## 19. Observability
+Native processes use absolute executables, version checks, argv arrays, an allowlisted environment, bounded diagnostic capture and timeouts. No shell, no password in argv, no implicit inherited `.pgpass`. Current synthetic execution uses local connections with TLS disabled and kills the immediate child on timeout. Process-group cancellation and secure remote TLS are production-hardening tasks, not implemented guarantees.
 
-Structured JSON logs for service and readable CLI output, with timestamps, job/backup IDs, source alias, phase, duration, bytes, throughput, and redacted failure code. No SQL payloads or credentials. Metrics later expose job counts/states, age of last verified backup, durations, throughput, verification failures, storage free space, scheduler misses, and queue depth. Prometheus-compatible endpoint belongs with authenticated service metrics, not a world-readable default. Audit records for backup, restore plan/run, delete, retention, key operations, and permission denials. Trace IDs connect API requests to jobs.
+Private staging/scratch must remain private throughout success, failure and interruption. Best-effort deletion is not secure erasure on SSDs. A compromised live host can see its usable keys/plaintext; signatures/encryption do not prevent deletion or targeted rollback of both artifacts and local inventory.
 
-## 20. Testing strategy
+## 9. Threat model and review triggers
 
-Unit tests cover profile validation, state transitions, retention invariants, manifest parsing, and plan digests. Integration tests run real PostgreSQL containers across supported majors and fixtures containing every content-inventory category, including large objects, extensions, partitions, RLS, roles, and globals where privileges allow. Round-trip restores into clean and populated targets validate schema, row counts/checksums, sequences, ownership/ACLs, constraints, and expected warnings. CLI contract tests cover JSON/exit codes; API tests cover authorization/idempotency; storage/crypto tests cover truncation, bit flips, wrong keys, reordered chunks, invalid signatures, manifest/payload swaps, and key rotation. Fault injection covers crash, disk full, subprocess kill, SQLite failure, and interrupted restore. Property tests target selection normalization, retention safety, and path/manifest parsing. Security tests exercise path traversal, symlink races, argv injection, and secret redaction. Mock ports for fast logic tests, but do not replace real PostgreSQL restore tests.
+[Threat model](docs/security/threat-model.md) is the detailed register. Reassess it after storage/concurrency changes, production configuration, API authorization, and release. Important open boundaries:
 
-Verification levels: `checksum` means bytes match stored digest; `archive` means `pg_restore --list` parses after decryption; `restore-tested` means isolated full restore and validation. No level alone guarantees future restore on a different version/host. Schedule recurring restore drills and record their result.
+| Threat | Required treatment |
+|---|---|
+| Storage tamper/substitution | Preserve signature-first checks and manifest/payload/globals binding. |
+| Replay/deletion (T03) | Local ledger is an accident warning only; off-host signed/immutable inventory remains future work. |
+| Inventory loss/corruption (T12) | Explicit scan/rebuild, unknown lifecycle facts, real integrity checks. |
+| Metadata disclosure (T13) | No database/host/profile names, resolved scope, SQL, credentials or arbitrary errors in SQLite. |
+| Overlap/resource exhaustion (T15) | Whole-operation scope locks, safe scratch ownership, bounded service work later. |
+| Restore SQL | Trusted origin still requires a controlled target and explicit operator intent. |
+| Path/symlink races | Validate paths and use no-follow/descriptor-based operations where needed; a path precheck alone is insufficient under concurrent mutation. |
+
+Do not mark a threat closed because one happy-path test passed. Record the attacker, trust assumption, test scene and residual risk. Preserve currently documented signature-only suite and lost-key limitations until an explicitly versioned change closes them.
+
+## 10. Storage, ownership and deletion invariants
+
+Files are authoritative for artifact existence; inventory is authoritative for what this host recorded. Missing files never count as a remaining valid backup. An artifact absent from inventory is unregistered and never an automatic retention candidate. Reconciliation must not imply adoption or authenticated verification.
+
+The confirmed blocker is `LocalStore::open` removing all directories below staging/scratch before a job lock is acquired. A second `backup list` can remove live working data while a scope flock remains held. Fix it before further feature work; do not rely on the current same-process overlap test to prove safety.
+
+Planned S02 ownership baseline: ordinary read opening never performs cleanup. Backup/restore/verify operations that use working directories hold shared store-activity ownership for the entire relevant resource lifetime. A cleanup operation requires exclusive store-activity ownership and fails/skips without deleting when an active operation holds it. Scope locks still reject duplicate source/profile backups; shared activity ownership must not serialize different profiles. Keep a fixed lock inode outside immutable artifact directories and never unlink it. Attach ownership to stage/plaintext guards so it outlives their users, not merely an early helper call.
+
+Record this new maintenance/activity design and lock acquisition order in `docs/architecture/adr-0004-working-directory-ownership.md` before implementation. It supplements ADR 0003 rather than pretending the old scope lock covers every scratch user. A nonmutating read can avoid the activity lock when it uses no working data. If a read-only artifact root requires decrypted scratch, use a separately private writable scratch area only after its configuration/lifetime contract is recorded; never write into the read-only root or silently fall back to a public temp directory.
+
+Cleanup treats errors as errors, not as evidence an entry is abandoned. Process age/PID alone is not liveness. Crash recovery preserves published artifacts, reports abandoned staging, and removes only working directories it owns exclusively. Do not reset protected or verified facts during reconciliation.
+
+M5b deletion has four hard exclusions: protected artifact, active/restoring artifact, artifact required by an in-progress job, and the last known valid artifact in its source/profile scope. Revalidate before execution, remove the completion marker first, sync the directory, remove files, retain tombstone/audit history. Interrupted deletion is never reported as an intact valid backup.
+
+## 11. PostgreSQL content and restore contracts
+
+Use [content matrix](docs/postgres/content-matrix.md), [privilege matrix](docs/postgres/privilege-matrix.md) and [fixture plan](docs/postgres/fixture-plan.md) for version-specific behavior and privileges. Required fixture coverage includes:
+
+| Group | Coverage and limit |
+|---|---|
+| Relations | Schemas, tables/data, views/materialized views, partition/inheritance families. |
+| Dependencies | Indexes, constraints, triggers/rules, sequences/state, identity/generated columns, functions/types/domains/collations/text search. |
+| Security | Roles/memberships where exported, ownership, ACL/default privileges, RLS, comments/security labels. |
+| External dependencies | Extensions/FDW definitions; external binaries, endpoints and files are not supplied by the dump. |
+| Special data | Large objects with explicit selection semantics; test references/state rather than row counts alone. |
+| Replication/globals | Subscriptions excluded; roles export opt-in; tablespaces and database-level ACL/config remain documented manual prerequisites. |
+
+Current selection accepts exact lower-case names, not arbitrary patterns. Resolve schemas/tables against the source catalog, reject missing/unsupported/dangling dependencies, expand selected partition families, and preserve requested plus resolved scope. Do not promise dependency closure beyond implemented/tested catalog checks; dynamic SQL references can escape catalog dependency analysis. Extension exclusion is version-gated; preserve current PostgreSQL 16 refusal.
+
+Data-only profiles can validate, but the current fresh-database restore cannot reconstruct absent schema. Do not advertise data-only restore to an existing database until a separately designed schema-compatibility and target-safety contract is implemented. Large-object behavior follows the current M3 refusals and fixtures; do not silently replace them with broader native-tool support claims.
+
+Restore plan validates artifact trust before any target creation, source identity, tool/server major, exact sections, role conflicts and target absence. Plan expires after the existing 15-minute interval; preserve the current digest encoding and bound fields until a versioned plan change. Execute repeats all relevant checks because artifact/target/configuration may have changed.
+
+Current policies: `dr` restores explicit exported roles/memberships, ownership and privileges; `portable` skips them. A section-limited restore requires portable policy and starts at pre-data, with no pre-data/post-data gap. Table-selected restore prepares required namespaces because the native table dump does not create them. Default target is a new database; do not add destructive overwrite during refactoring.
+
+Execution order: authenticate artifact; validate plan/confirmation/current source; recheck DR role conflicts; apply opt-in validated globals; recheck target absence; create fresh database; prepare required schemas; restore native archive; report outcome. Failure may leave cluster roles or target objects partially changed. Leave them for explicit operator repair, report that fact, and never auto-retry or auto-drop them.
+
+M5a adds restore job/resource ownership and audit. Successful native restore is `restore-completed`; `restore-tested` requires an isolated restore plus stated validation of the required fixture/content. Keep the distinction explicit so a partial section restore or successful process exit never claims more than it proves. Preserve legacy development-manifest updates for compatibility until an explicit migration decision removes them; do not alter v1.
+
+## 12. CLI contract and planned commands
+
+Implemented commands are defined in [cli.rs](crates/backupctl/src/cli.rs): `config check`, `key generate|publish|status`, `profile list|validate`, `backup create|list|inspect|verify`, `restore plan|run`. Current machine output is JSON, human mode is default. Current runtime result convention is success/failure; Clap has its own usage handling. The older proposed 0–6 error taxonomy is not shipped.
+
+Preserve existing command syntax, serialized keys, successful output meaning and asserted refusal text during C1. Correct unsafe behavior in S tasks; improve diagnostics in explicit A/H tasks with matching test/document changes. Avoid raw TOML parser snippets, which may reproduce secret input.
+
+New surface baseline, to be implemented in the named tasks:
+
+```text
+backupctl --config CONFIG job list
+backupctl --config CONFIG job inspect JOB_UUID
+backupctl --config CONFIG inventory check
+backupctl --config CONFIG inventory reconcile
+backupctl --config CONFIG inventory adopt BACKUP_UUID --source-fingerprint FINGERPRINT
+backupctl --config CONFIG inventory rebuild --source-fingerprint FINGERPRINT --dry-run
+backupctl --config CONFIG inventory rebuild --source-fingerprint FINGERPRINT --confirm-rebuild
+backupctl --config CONFIG backup protect BACKUP_UUID
+backupctl --config CONFIG backup unprotect BACKUP_UUID
+backupctl --config CONFIG backup prune --keep-last N
+backupctl --config CONFIG backup prune run PLAN_UUID --confirm-digest DIGEST
+backupctl --config CONFIG backup delete BACKUP_UUID
+backupctl --config CONFIG backup delete run PLAN_UUID --confirm-digest DIGEST
+```
+
+`--output json` applies to new commands too. Preview never deletes; execution always loads the saved plan. Rebuild is a distinct loss-of-lifecycle operation and its confirmation must explain lost protection/events; do not disguise it as an ordinary read. Adoption of a single ID and replacing the whole inventory are different actions.
+
+Before A01/B01, record JSON field names, operation/error codes, sort order, optional/null handling and examples in `docs/development/m5a-inventory.md` and `docs/development/m5b-retention.md` respectively. `--source-fingerprint` is the existing validated 16-lowercase-hex estate label; reject disagreement with an existing bound inventory before mutation. These keyless commands do not connect to PostgreSQL to guess an estate. Use UUID/digest inputs, never user-supplied arbitrary artifact paths. Pagination is only needed once a measured output-size problem exists; do not add a speculative cursor system to the synchronous CLI.
+
+## 13. API architecture — future M7
+
+The API calls application services, returns asynchronous job IDs and does not run long backups within an HTTP request. Planned routes: backups/restores creation, jobs and artifact reads, profiles and health, with a versioned OpenAPI contract. Use 202 for accepted jobs, explicit resource URLs, safe structured errors and bounded requests.
+
+M7 decision gates: HTTP/async framework, token custody/authentication, actor-to-operation authorization, idempotency storage and worker/cancellation strategy. Record choices before dependencies or routes land. Bind to loopback by default; require an explicit secure deployment boundary before remote exposure. No arbitrary executable paths, shell options or plaintext secret values in requests.
+
+Idempotency is bound to actor and request digest; retries must not create duplicate destructive work. Workers have bounded queues/concurrency; restart and cancellation states have real writers. API auth distinguishes backup, restore, delete, profile and administration. CLI can remain a direct local core caller; remote CLI mode is a separate contract.
+
+## 14. UI architecture — future M8
+
+Choose the UI framework only after M7/OpenAPI stabilizes. Use TypeScript and an API-only client after recording the dependency choice. Views: health, artifacts/verification, restore plan/confirmation, jobs/audit, profiles/schedules, storage/key status without secrets. Server enforces authorization and plan confirmation regardless of UI controls.
+
+Acceptance includes accessible navigation, XSS/error/loading states, clear partial-backup and verification levels, deliberate destructive confirmation and a full browser-to-API restore workflow. A green dashboard cannot imply host-loss recovery or restored-data validation.
+
+## 15. Configuration and profiles
+
+Current configuration is one `Source`, one local `Storage`, optional encryption/signing blocks, `export_globals`, timeout and `[[profile]]` entries. Examples under [config](config) are the current schema. Do not implement the earlier illustrative profile fields such as `schedule`, `retention`, compression or alternate source references as if they already existed.
+
+No key blocks means plaintext development output; encryption only means unsigned age development output; encryption plus signing secret means signed v1 writer. Signing without a signing secret selects the DR reader shape. Current constructors eagerly load configured identity/key pairs; public-only inventory discovery/rebuild needs an explicit keyless construction path in A03, not a claim that current CLI already needs no private key.
+
+For production, introduce a versioned configuration with explicit local/remote connection security and read/write roles after H01's decision gate. Configuration reload affects only new jobs. Reject unknown fields and incompatible combinations before database or store mutation. Profiles are snapped per job; reusing a name groups retention under the existing name fingerprint, so changed selection must be visible to operators. A content-hash scope redesign is a separate decision.
+
+The initial CLI release can remain local-only. Remote access, separate cross-server target connections, data-only restore and writer-without-identity operation are explicit extensions, not incidental outcomes of removing the fixture-name check.
+
+## 16. Inventory schema and migration rules
+
+Implemented schema v2: `meta` estate binding, `artifact` discovery/lifecycle fields, `job` rows and `audit_event`. Exact existing SQL is [schema.rs](crates/backup-inventory/src/schema.rs). Preserve dense migration history: fresh initialization runs the same steps an older database upgrades through. Never edit an already released migration to express a future schema.
+
+Use `journal_mode=DELETE`, `synchronous=FULL`, current explicit 2000 ms busy timeout; read back required pragmas. Read paths use `SQLITE_OPEN_READ_ONLY`, create/migrate nothing and do not sweep. Reject unknown/newer schema and foreign estate. Do not use `immutable=1` on a live store. Run `integrity_check`; a database answering a query can still be corrupt.
+
+Every column is an opaque ID, fingerprint, digest, bounded algorithm label, byte count, UTC timestamp, state, flag or safe event code. No source/target names, hosts, ports, profile names, resolved selection, SQL, credentials or arbitrary error chains. Nullable profile/completion means unknown. Keyless rebuild cannot invent values from UUID order, directory modification time or untrusted public header fields.
+
+Artifact schema changes, plan formats and wire artifact v1 version independently. Future additions: job operation/target associations, verification observations bound to current ciphertext digests, missing/deleted states, protection and local ledger. Add only what the next task writes. Use one transaction for each state/event pair and for each related protection/verification change.
+
+Current artifact registration uses replacement of all discovery columns. Before lifecycle columns exist, change it to a merge/upsert that preserves protection, observations and tombstones; a keyless refresh must not erase authenticated profile/time facts already known for the same bytes. If bytes changed, invalidate dependent observations and report conflict instead of carrying old verification forward.
+
+Rebuild restores discovery, not lost audit/protection/verification history. Stage a replacement inventory, validate it, take exclusive maintenance ownership, preserve a recoverable copy of the old database, then replace durably. No replacement while live jobs use it. Document the restart/copy and lost-history consequences.
+
+## 17. Scheduling and deployment policy
+
+M6 uses systemd service/timer, one explicit configuration/profile invocation per unit. No internal scheduler, distributed queue or worker pool in the CLI milestone. Document UTC schedule definitions, missed-run behavior, overlap refusal, operator enablement and manual-run interaction. A persistent timer does not mean every missed occurrence is replayed; measure the chosen unit behavior.
+
+Scheduled backup must use the same application and locking paths as manual backup. Dedicated service user, restrictive umask, explicit resource limits, protected credential references and a tested filesystem sandbox are required. Preserve data and key files on package upgrade/removal. Stale-backup alerts and recurring restore drills need an actual runner/integration before they are claimed.
+
+## 18. Reliability, locking and recovery
+
+Maintain separate purposes: source/profile lock rejects duplicate dumps; store activity protects live working resources from maintenance; target/artifact-use locks protect restore and deletion; SQLite transactions protect rows. Document acquisition order before combining them, and acquire nonblocking or under a stated bounded wait to avoid deadlocks. Do not hold a SQL transaction while streaming a dump/restore.
+
+Interrupted sweep must not overwrite a job that completed after a snapshot read. Use a conditional transition of a still-non-terminal row in its transaction, and hold sufficient lock ownership while deciding liveness. Cover restarting the same scope as well as unrelated profiles; the new holder must not hide old abandoned rows forever.
+
+Failures to test: unavailable server, lock timeout, client mismatch, disk/write failure, killed client and wrapper descendants, key failure, corrupt/truncated/swap artifacts, SQLite busy/corrupt/write failures, restart between publish/register/job completion, interrupted restore and interrupted deletion. A complete artifact and a failed/interrupted job can coexist if post-publication recording failed; expose both facts honestly.
+
+Reserve/check resource headroom before expensive work and bound decrypted size, capture, process duration and service concurrency. Do not claim a free-space check guarantees no disk-full failure. Retry only stages whose idempotence is documented; a new dump is a new snapshot/job.
+
+## 19. Observability and audit
+
+CLI reports safe operation/job/artifact IDs, state and exact verification level. M5a adds durable events for reads/verification/restore in writable mode. Truly read-only operation cannot persist an audit event; report `audit_recorded=false` rather than failing a valid read or secretly reopening read-write. This explicitly resolves the tension between audit reads and read-only DR media.
+
+Future service logs: UTC time, operation/phase, safe IDs, duration, bytes and stable failure code. No raw tool output/configuration/request bodies. Metrics later: last known restorable snapshot age, durations/throughput, failures, free space, scheduler misses and queue depth. A successful checksum and a successful validated restore remain separate observations.
+
+Audit is local lifecycle history, not independent anti-tamper evidence. Events bind to operation and artifact bytes when relevant. Keep diagnostics understandable without violating the key-free inventory rule.
+
+## 20. Test strategy and required commands
+
+Fast checks, in this order:
+
+```bash
+cargo fmt --all --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+git diff --check
+```
+
+Run the smallest meaningful tests during development. After a phase changes shared core/storage/process behavior, run the affected PostgreSQL fixture matrices, and at phase acceptance run all M1–M4b regressions:
+
+```bash
+bash tests/m1_docker_smoke.sh
+bash tests/m2_docker_smoke.sh
+bash tests/m3_docker_smoke.sh
+bash tests/m4a_docker_smoke.sh
+bash tests/m4b_docker_smoke.sh
+bash tests/m4a_key_drill.sh
+```
+
+Inspect each script's prerequisites, runtime and existing cleanup before execution. Use isolated synthetic databases, matching clients and disposable roots. Do not run fixtures against an operator's production database. A script file existing is not passing evidence; capture tested majors and failed scenes. If prerequisites are unavailable, report the gate unverified.
+
+Unit tests target pure policy and parsing; integration tests compose application with real local/crypto/inventory adapters; process tests exercise the full CLI startup path; Docker matrices validate native PostgreSQL behavior. Keep existing negative controls where valuable, revert them and inspect the diff. Avoid tests that only mirror helper implementation or reward an arbitrary function/file size.
+
+Golden cryptographic vectors, frozen v1 field/byte contracts and existing plan encoding are mandatory regression boundaries. Add a cross-build artifact fixture when there is an independently produced artifact; do not fabricate interoperability by checking in bytes generated by the same tested build and calling that cross-build proof.
 
 ## 21. CI/CD
 
-GitHub Actions gates: `cargo fmt --check`, `cargo clippy -- -D warnings`, unit tests, real-PostgreSQL integration/restore tests, build release binaries, build/install/uninstall `.deb`, and publish documentation. Pin action versions and toolchains; generate SBOM and checksums for releases. `cargo audit` checks known advisories; `cargo deny` checks licenses/sources if policy needs it. Keep security checks blocking only after a documented triage process, rather than accumulating noisy gates. Cache builds, but test clean package installs. Benchmark CI is scheduled/manual to avoid flaky PR gates. Release artifacts are signed when a signing key and trust workflow exist.
+No GitHub Actions workflow is currently delivered. Add minimum formatting/lint/unit jobs at H04; pin toolchain/action references and run PostgreSQL matrix jobs with matching native clients. Keep package install/upgrade/remove and release checks distinct from ordinary unit tests.
+
+Release pipeline must build reproducible artifacts, emit checksums/SBOM, check dependency advisories/licenses under a recorded policy and document exceptions. Bundled SQLite C source is part of the audit surface; a Rust advisory check alone does not cover it. Benchmark jobs are manual/scheduled with recorded environments, not flaky per-commit assertions. Never publish releases automatically before the applicable release gate is complete.
 
 ## 22. Debian packaging
 
-Install `/usr/bin/backupctl`, `/etc/backupctl/config.toml` and profile directory, `/var/lib/backupctl` for catalog/artifacts, and systemd service/timer units. Log to journald; avoid a separate log directory unless an explicit file-log mode is added. Create dedicated `backupctl` system user/group and restrictive directories via package/systemd rules; source database credentials use a separate protected path. Define `StateDirectory`, `ConfigurationDirectory` where supported, `UMask`, filesystem restrictions, and resource limits; test that they still permit PostgreSQL access. Depend on `postgresql-client-common` and require an installed `postgresql-client-16`, `-17`, or `-18` matching the source major; resolve its absolute path and check its version before each operation. Test Debian 13 and Ubuntu 24.04 LTS on amd64. Upgrades migrate SQLite transactionally with backup and rollback guidance; never delete artifacts or private keys on package removal. Purge requires an explicit documented data/key retention policy. APT repository publication is future distribution work.
+Planned installation: `/usr/bin/backupctl`, `/etc/backupctl/`, `/var/lib/backupctl/`, dedicated `backupctl` user/group and explicit systemd unit/timer. Credentials and private keys live separately with recorded ownership/permissions; they are never package contents. Depend on `postgresql-client-common`; document installation of the chosen major's client package through distribution/official repository. The binary still checks the absolute tool versions.
 
-## 23. Docker and development environment
+Build on Debian 13 and Ubuntu 24.04 amd64. Include the C toolchain needed by bundled SQLite in build dependencies. Test install, upgrade through an old inventory schema, ordinary removal, reinstall and purge policy. Ordinary removal never deletes artifacts/keys; purge behavior is explicit and cannot silently destroy operator recovery copies.
 
-Compose provides PostgreSQL, the service, and test volumes; optional MinIO and second PostgreSQL major are profile-gated future additions. Fixtures seed object categories and privilege modes. Container images run nonroot and are for development/integration testing; Debian/systemd remains the primary production target. Document Docker-free local development for contributors with PostgreSQL client tools.
+Use journald and service sandboxing/StateDirectory/UMask/resource controls as supported and verified on targets. Prove the sandbox permits PostgreSQL access, staging, scratch, locks and durable publication while refusing unrelated filesystem access.
 
-## 24. Benchmark strategy
+## 23. Development and Docker environment
 
-Use reproducibly generated 100 MB, 1 GB, and 10+ GB datasets with compressible and incompressible fields, many small tables, large tables, indexes, and large objects. Record PostgreSQL/client versions, schema/data generator seed, hardware, filesystem, compression/encryption settings, worker count, cache state, and command line. Measure backup and restore throughput, compression ratio, encryption overhead, CPU, peak RSS, I/O, server load, and total time including verification. Run repeated trials and report median/range; compare `-Fc` versus `-Fd`, and supported compression choices. Benchmarks inform defaults, not marketing claims.
+Existing shell matrices are the delivered integration environment. Compose/service/MinIO profiles are future conveniences, not prerequisites already implemented. Keep Docker-free development with installed matching clients possible; no native database install is required merely to run unit tests.
 
-## 25. Documentation strategy
+Fixtures cover normal and insufficient privileges, optional extensions/FDWs/publication where available, security objects and selection dependencies. Record optional-category skips. Ensure test teardown removes only its own containers/directories and leaves enough failure evidence to diagnose a refused gate.
 
-Start `README.md`, `ARCHITECTURE.md`, `SECURITY.md`, `CONTRIBUTING.md`, `LICENSE`, `CHANGELOG.md`, and `docs/`. Add focused guides for PostgreSQL content/privileges, artifact schema, backup/restore runbooks, profiles, CLI, API, deployment, development, threat model, and benchmarks as their features land. Show a worked recovery drill and explicit exclusions/RPO limits. Maintain versioned configuration and artifact migration notes. Keep `project.md` current through minimal edits when decisions change.
+## 24. Benchmarks and production limits
 
-## 26. Milestone roadmap
+At V02 generate reproducible 100 MB, 1 GB and 10+ GB datasets with compressible/incompressible data, many/small/large relations, indexes and large objects. Record generator seed, hardware/filesystem, OS, PostgreSQL/client/application versions, compression, concurrency and cache conditions.
 
-The following milestones are implementation handoffs. Paths are planned. Each milestone must update the relevant docs and pass its listed tests before the next starts. “DB” refers to service metadata schema; “none” is intentional. Do not implement during this roadmap phase.
+Measure full backup + verification + restore time, throughput, compression ratio, CPU, peak RSS, I/O and source load. Repeat and report median/range. Current v1 writes gzip compression; zstd/directory parallel dumps are future options only after native-version/format and restore tests. Never silently change recorded compression during cleanup.
 
-### M0 — Research and contracts
+Benchmarks determine documented limits and operating policy, not a universal RTO. Include disk headroom and scratch amplification. A data-integrity assertion accompanies every restore measurement.
 
-- **Objective/why:** turn PostgreSQL content and threat assumptions into testable contracts before writing the engine.
-- **Prerequisites:** none. **Architecture/files:** `ARCHITECTURE.md`, `docs/postgres/content-matrix.md`, `docs/security/threat-model.md`, `docs/backup-format/manifest-v1.md`, ADRs.
-- **APIs/DB/CLI:** versioned manifest and capability sketches; no DB migration or CLI command.
-- **Tests/security/docs:** synthetic fixtures and versioned test matrix, restore-trust boundary, privilege matrix, source citations; runtime validation follows in M1/M2.
-- **Acceptance/DoD:** supported version matrix, fixture SQL and assertions, artifact spec, threat model, and decisions recorded; no unsupported runtime restore claim.
-- **Pitfalls:** assuming all PostgreSQL versions or extension ecosystems behave alike. **Portfolio:** database internals, architecture, threat modeling.
+## 25. Documentation and handoff rules
 
-### M1 — Local full backup and inspect
+Maintain this canonical lower-case `project.md`, [README.md](README.md), [ARCHITECTURE.md](ARCHITECTURE.md), contracts, operator guides and append-only [session-log.md](session-log.md). Follow AGENT.md for log archival, file-change reporting and Q-prefixed questions. No new flow document is authorized by this roadmap rewrite.
 
-- **Objective/why:** establish a complete, durable local logical artifact. **Prerequisites:** M0.
-- **Architecture/files:** domain/application/PostgreSQL/local crates, `backupctl`, integration fixtures.
-- **APIs/DB/CLI:** `DatabaseEngine::backup`, `ArtifactStore::stage/commit`, development-only artifact record (not published v1); SQLite not required yet; `backup create/list/inspect`, `config check`.
-- **Tests/security/docs:** real `pg_dump -Fc`, zero-byte/disk-full/kill failures, redacted process invocation, local backup guide.
-- **Acceptance/DoD:** restored synthetic fixture can be read by native tools; only fully written/checksummed archive is listed complete; version and tool path recorded. Plaintext output remains development-only.
-- **Pitfalls:** `pg_dump` warnings, filesystem atomicity, permissions. **Portfolio:** Rust systems code, process supervision.
+Each task handoff records: task ID/status, exact files changed, behavior before/after, contract/version impact, executed checks and results, unexecuted gates, decisions and the next eligible task. Mark done only after its acceptance passes. Keep old evidence in logs rather than embedding long transcripts in this roadmap.
 
-**M1 status (2026-09-26):** Implemented for synthetic local fixture databases in the five-crate Rust workspace. The CLI create/list/inspect path, checksum-validated staged publication, same-major client preflight, and independent restore smoke checks pass on PostgreSQL 16–18. PostgreSQL 16 failure checks cover missing synthetic confirmation, simulated write error, empty output, timeout, client-version mismatch, and config-error redaction. Plaintext M1 artifacts remain development-only; encrypted/signed v1 and restore orchestration remain M4 and M2 work respectively. See [M1 guide](docs/development/m1-local-backup.md).
+A new model should be able to resume from status plus contracts without trusting comments that contradict code. Update stale claims in touched areas. Before release add SECURITY, CONTRIBUTING, selected LICENSE, CHANGELOG, deployment/recovery/retention guides and versioned compatibility notes. No license grant is implied by the current development snapshot.
 
-### M2 — Safe full restore and verification
+## 26. Roadmap and implementation tasks
 
-- **Objective/why:** prove backups are usable. **Prerequisites:** M1.
-- **Architecture/files:** restore planner/executor, verification module, restore runbook.
-- **APIs/DB/CLI:** `plan_restore`, `execute_restore`, `verify`; no DB migration; `backup verify`, `restore plan/run`.
-- **Tests/security/docs:** clean-target round trip, incompatible version/extension, wrong target, corrupted bytes, interrupted restore; explicit trust warning.
-- **Acceptance/DoD:** new-target restore succeeds and validates; destructive target requires bound confirmation; failure reports partial state.
-- **Pitfalls:** `pg_restore` can execute untrusted SQL and partial failure may leave objects. **Portfolio:** recovery engineering.
+| # | Task | Status | Notes |
+|---|---|---|---|
+| 1 | M0 research/contracts/fixtures | ✅ Done | Historical evidence in archived logs. |
+| 2 | M1 local backup/inspect | ✅ Done | Synthetic PG16–18 native round trip. |
+| 3 | M2 fresh-target restore/verification | ✅ Done | DR/portable policies and expiring plans. |
+| 4 | M3 profiles/selective operations | ✅ Done | Restricted names/dependencies/sections. |
+| 5 | M4a hybrid encryption/keys | ✅ Done | Streams, custody, recovery drills. |
+| 6 | M4b signing/v1 freeze | ✅ Done | Frozen 2026-10-01 with explicit limits. |
+| 7 | S — M5a cleanup/concurrency correction | 🔄 Current | Confirmed blocker; implementation not yet started. |
+| 8 | C1 — clean code and human readability | ⬜ Todo | Next, after S accepts; before new M5a features. |
+| 9 | A — complete M5a inventory/jobs/recovery | ⬜ Todo | Three earlier increments already implemented. |
+| 10 | B — M5b retention/protection/deletion | ⬜ Todo | Requires complete M5a and C1. |
+| 11 | H — M6 hardened CLI/systemd/Debian | ⬜ Todo | Production configuration and process/permission gates. |
+| 12 | V — CLI production validation/release | ⬜ Todo | Original M9 CLI track; precedes API/UI. |
+| 13 | P — M7 API/asynchronous service | ⬜ Todo | Requires hardened core and explicit decisions. |
+| 14 | U — M8 API-backed UI | ⬜ Todo | Requires stable API. |
+| 15 | F — platform validation/release | ⬜ Todo | Original M9 full-platform track. |
 
-**M2 status (2026-09-27):** Implemented for synthetic fixtures. `backup verify --level checksum|archive`, `restore plan`/`restore run` with an explicit `RestoreSecurityPolicy` (`dr` restores roles, memberships, ownership, and privileges; `portable` restores contents only), and JSON plans under `<storage-root>/plans/` with a 15-minute expiry and a `--confirm-target` equality check. Role, attribute, and membership metadata comes from opt-in `pg_dumpall --roles-only --no-role-passwords`, so no password verifier can enter an artifact and restored roles need an operator-assigned password; database-level `GRANT ... ON DATABASE` and tablespaces remain cluster prerequisites. Partial restore failure leaves the target in place and is reported. The Docker matrix passes on PostgreSQL 16–18 for DR restore, portable restore, plan expiry/binding, and tamper detection. See [M2 guide](docs/development/m2-restore-verify.md).
+### ➡️ Current: #7 - S — M5a cleanup/concurrency correction
+### ⏭️ Next: #8 - C1 — clean code and human readability
 
-### M3 — Profiles and selective logical operations
+Task IDs below remain stable even if a phase is split into several commits. Complete dependent tasks in listed order. Independent documentation can proceed alongside its owning task; later feature coding waits for the phase prerequisites.
 
-- **Objective/why:** support explicit scope without false dependency promises. **Prerequisites:** M2.
-- **Architecture/files:** TOML schema/validator, PostgreSQL selection resolver, TOC inspection fixtures, content matrix.
-- **APIs/DB/CLI:** typed profile and selection; no DB migration; `profile validate/list`, selective `backup create` and `restore plan`.
-- **Tests/security/docs:** schemas/tables, schema/data-only, sequence/large-object/partition/extension cases, zero matches, cross-schema dependencies.
-- **Acceptance/DoD:** manifest records exact resolved scope; unsupported or risky selections fail or issue actionable warnings; selective restores tested.
-- **Pitfalls:** native filters omit dependencies. **Portfolio:** PostgreSQL semantics, API design.
+### Completed milestones M0–M4b: preserve this baseline
 
-**M3 status (2026-09-27):** Implemented for synthetic fixtures. Typed `[[profile]]` blocks in the service TOML (exact lower-case names, no wildcards, no system schemas, tables and schema filters mutually exclusive because `pg_dump` discards one) feed a catalog resolver that resolves the selection with `psql` before `pg_dump` runs: zero-match selections, selections over 512 relations, and any reference from an in-scope object to an out-of-scope one are refused, with the dangling kinds covering foreign-key targets, parent relations, sequence defaults, enum/domain/composite/array column types, view and materialized-view base relations, and trigger or default-expression functions. Partitioned parents expand through `pg_inherits` to exact child names, large objects are refused in every filtered profile and in whole-database profiles that omit them, and `--exclude-extension` requires a 17 or newer client. The manifest records the requested and resolved scope plus a `toc_sha256` over `pg_restore --list` output that `verify --level archive` re-checks, keeping `m1-development-plaintext` so earlier artifacts still load. `profile validate/list`, `backup create --profile|--dry-run`, and repeatable `restore plan --section` were added; section sets must start at pre-data and cannot claim the `dr` policy, a table-selected run creates the schemas its resolved relations need, and a partial run never raises the verification level. `tests/m3_docker_smoke.sh` passes on PostgreSQL 16–18, and the M1 and M2 matrices still pass unchanged. `mode = "data-only"` profiles stay accepted at validation but cannot be restored by this CLI, because every restore creates an empty target database; the guide documents that as a known limitation rather than a supported selection. See [M3 guide](docs/development/m3-profiles-selective.md).
+M0: architecture/ADRs/threat/content/privilege contracts and synthetic fixtures. M1: five initial crates, guarded local backup, bounded tools, publication and inspect/list. M2: opt-in role globals without passwords, DR/portable security policy, plan/run, checksum/archive verification. M3: profile validation, catalog-resolved exact scopes/dependency refusal, TOC digest, section-limited restore and namespace preparation. M4a: `backup-crypto`, custom hybrid recipient, age streaming, safe plaintext view ownership, key lifecycle and rotation/recovery drill. M4b: hybrid origin signature, encrypted manifest/public header, signature-first reads, DR without signing secret and frozen v1.
 
-### M4a — Hybrid encryption and key providers
+Historical matrix evidence covers PostgreSQL 16/17/18; archives are [September](archive/SESSION-LOG-2026-09.md) and [October completed M4b](archive/SESSION-LOG-2026-10.md). Active M5 increments remain in session-log.md. Do not reopen these milestones merely to rename types or broaden selection. Their guides and tests define compatibility.
 
-- **Objective/why:** protect stolen backups against a harvest-now-decrypt-later adversary, so neither the payload nor the metadata is ever plaintext in the published store. **Prerequisites:** M2; M3 profiles proceeded separately.
-- **Spike complete (2026-09-27); container decided.** age 0.12.1's native hybrid post-quantum recipient (`tagpq`, `ml-kem` + `x25519-dalek` + P-256) is **encrypt-only**: no `tagpq::Identity`, no software key generation, `Recipient` does not implement `Identity`, crate decryption of a `tagpq` file with an `x25519` identity returns `No matching keys found`, stock `rage 0.12.1` cannot decrypt a `rage`-encrypted `tagpq` file either, and its `postquantum` label forbids mixing with X25519 recipients. Evidence and the chosen container are recorded in [ADR 0001](docs/architecture/adr-0001-foundations.md). Chosen: our own `age::Recipient`/`age::Identity` implementation with stanza tag `mlkem768x25519`, combining ML-KEM-768 first then X25519 per [RFC 10024](https://www.rfc-editor.org/info/rfc10024/)'s ordering rule, carried by age's standard authenticated `age-encryption.org/v1` stream — no hand-rolled AEAD framing, no third-party PQ file-encryption crate, and X-Wing rejected as an unaudited individual draft. The artifact is therefore **not** stock-`rage`-decryptable in either direction; that divergence is a tested contract, and the spike's measured cost is ≈1.7 KB fixed plus 16 B per 64 KiB chunk with no throughput loss.
-- **Architecture/files:** `backup-crypto` crate, `RecipientProvider`/`IdentityProvider` ports, named algorithm suite, service-owned key files outside the store, key recovery docs.
-- **APIs/DB/CLI:** streaming encrypt/decrypt and identity ports; no DB migration; `key status`, `backup verify` levels. Rotation creates a new validated encrypted generation.
-- **Tests/security/docs:** hybrid recipient round trip, truncation/reorder/bit-flip/wrong-key and manifest/payload swap cases, key-loss and rotation drill, no secret leakage, and the spike's already-proven cases re-implemented in the repository: exact 1216/1120-byte key lengths with ±1-byte rejection, stanza tampering caught by the age header MAC, the stock-`rage` divergence, and refusal of a second classical-only recipient stanza. The single-recipient rule is about recipient stanzas, not total stanza count: `HeaderV1::new` appends a random `*-grease` stanza to every age header, so round trips must tolerate exactly that and refuse any other foreign tag.
-- **Acceptance/DoD:** plaintext never enters the published store; wrong key, tampering, and truncation fail before restore; the recipient suite and parameter set are recorded in the encrypted manifest; decryption key recovery tested; exactly one hybrid recipient stanza per artifact, enforced by the writer.
-- **Pitfalls:** identity loss, finishing age streams, temporary plaintext, treating an unaudited PQ implementation as settled, and quietly adding a classical-only recovery recipient that cancels the post-quantum property. **Portfolio:** applied cryptography.
+### S — Correct ownership before feature development
 
-**M4a status — closed (2026-09-28, write path, key commands, the key lifecycle drill, and the operator guide):** `pg_dump` now runs without `--file` and its standard output is piped straight into the store's payload sink, so no process ever creates a plaintext archive file; the same holds for `pg_dumpall --roles-only` globals. The sink is the store's decision: with `[encryption]` configured it is an age stream writing `payload.age`/`globals.age`, otherwise the M1 plaintext `payload.dump`/`globals.sql`, byte-identical to the layout the M1–M3 matrices assert, so encryption is opted into per store rather than forced. `backup-local` is the crypto boundary (`backup-application` holds no key material and does no crypto), a stage whose stream was never finished cannot be published, and `backupctl` refuses a key pair whose recipient is not the recipient of its identity before it touches the store. The encrypted manifest records `format = "m4a-development-age"`, `recipient_suite = "mlkem768x25519-v0"` and `payload_plaintext_bytes`; reads decrypt to a transient mode-0700 `scratch/` view that removes itself on drop and is purged at startup, bounded by the recorded plaintext size, and an artifact holding both `payload.dump` and `payload.age` is refused. `tests/m4a_docker_smoke.sh` supplies that end-to-end proof against real PostgreSQL tools on majors 16, 17 and 18. Every client tool in it is a wrapper that logs each absolute file argument it was handed together with that file's first five bytes, so the run asserts rather than assumes: no dump tool ever receives `--file`, the only archive a tool opens in an encrypted store is a PGDMP file under `scratch/` and that directory is empty again afterwards, the checksum level touches no tool at all, and DR restore replays ciphertext into a rebuilt cluster while the store keeps holding none. The secret-material check uses a role name the globals export carries verbatim plus the 64-character identity seed, and the same greps run against a keyless store in the same pass, where they do find `backupctl_fixture_alice` in `globals.sql`, which is what makes their silence in the encrypted store evidence. The refusal cases are a bit flip, which dies at the digest; a truncated payload, which dies at the stream even with a rewritten manifest; and a payload published under a different key pair, which passes the checksum level and then dies at decryption, because a matching hash proves the file was not corrupted, not that it is ours. Key management became a tested procedure rather than a note: [key lifecycle](docs/security/key-lifecycle.md) defines a **generation** as one key pair plus the configuration that names it, because generation refuses an occupied path and the store loads exactly one pair, so rotating means a new key directory and a new config file, and an older artifact stays readable only through the pair that wrote it. `tests/m4a_key_drill.sh` runs that document on majors 16, 17 and 18: the offline copy is taken before anything rotates, generation refuses to overwrite the pair it is replacing, each generation refuses the other's artifact at `--level archive` while both sit in one store, the live identity disappears and every command through its configuration is refused before it reads a byte, the recovered copy is itself refused until its mode is back to 0600, and the old artifact then restores into a fresh cluster configured only by that offline copy. Finally the offline copy goes too, and the drill reads the manifest directly to show the ciphertext still hashes to what was recorded and is simply unreadable, which is the honest shape of that loss: not corruption, inertness. Writing the run surfaced a real leak in the store: `decrypt_to_scratch` created the scratch directory and its file and only *then* built the drop guard, so a failed decryption, whether a wrong identity or a stream inflating past the recorded plaintext bound, left a half-written plaintext file inside the storage root. The view now takes ownership of the directory before a byte is decrypted and `a_refused_decryption_leaves_no_scratch_behind` pins it; the startup purge already removed such a directory after a crash, which is why no earlier test saw it. Two things are deliberately not claimed: a swap between two artifacts of the same recipient is invisible to age and belongs to M4b signing, and no real-data artifact should be published before that signature exists. `key generate`, `key publish` and `key status` act on the configured `[encryption]` paths and nothing else, so a key the store would refuse cannot be created through this CLI: generation refuses an occupied path before writing either half and creates a missing parent directory at mode 0700, status loads the pair under the store's own rules and prints only public facts — suite, paths, modes, and a fingerprint of the shared recipient, with the whole public key in `--output json` — and publish closes the loop for an identity the operator supplied: it loads that identity first, so a seed the store would refuse never gets a public half beside it, then writes only the recipient and leaves the identity byte-for-byte untouched, because rewriting a seed is the one action that makes every artifact sealed under it permanently unreadable. That is what makes the custom-secret request from the drill a supported path rather than a workaround: write the seed yourself, publish, and back up. The current encrypted proof is crate-level store tests, the composed stub-engine test, and CLI runs against generated key files; `tests/m1_docker_smoke.sh`, `tests/m2_docker_smoke.sh` and `tests/m3_docker_smoke.sh` were all re-run on PostgreSQL 16–18 after the encrypted write path landed and pass unchanged, so a keyless store still writes and restores exactly the M1–M3 layout. [M4a encryption guide](docs/development/m4a-encryption.md) states what the milestone proves and, in its limits list, what it does not: unsigned artifacts, a manifest that is still plaintext JSON beside the ciphertext, `backup create` still requiring the identity file even though writing needs only the recipient, one pair per configuration, no re-encryption, plaintext on the restoring host during a read, and the stock-`rage` divergence enforced by repository tests but not yet as a golden CLI assertion — that last item moved to M4b, where the artifact shape stops changing, and landed in `tests/m4b_docker_smoke.sh` on 2026-10-01; the unsigned shape and plaintext manifest it lists are closed by M4b, not by anything in M4a. See [artifact v1](docs/backup-format/manifest-v1.md), [the threat model](docs/security/threat-model.md), and [the M4a example config](config/m4a.example.toml).
+Prerequisites: baseline review; read storage/job implementation and ADR 0003. Owners: `backup-local`, application restore/verify resource lifetime, full-CLI integration tests. No artifact version change.
 
-### M4b — Origin signature and artifact v1 freeze
+1. **S01 — failing full-startup regression.** Add a controlled mid-dump barrier and launch a second real CLI process opening the same store. Cover duplicate backup, `backup list`, archive verify and restore scratch access. Demonstrate that the baseline loses live working paths; assert the first operation's paths and bytes survive after the fix. Synchronize with a pipe/file barrier owned by the test; avoid timing-only sleeps.
+2. **S02 — activity/maintenance ownership.** Implement §10's shared-operation/exclusive-cleanup baseline in a small local guard. Document acquire/release order, reader initialization and descriptor/resource lifetimes first. Ordinary open no longer purges directories. All stage and plaintext-view users retain ownership until their last file access/drop. Cleanup with a busy activity lock preserves every working directory and reports why it skipped/refused. Scope locks remain independent and nonblocking. Validate regular lock files, permissions and no-follow access.
+3. **S03 — safe interruption recovery.** On an explicit writable recovery path, take exclusive maintenance ownership, conditionally mark genuinely abandoned jobs interrupted, and clean/report only abandoned work. Reopening the same scope must recover its old rows before the new job makes the scope appear busy. A concurrently completed job cannot be overwritten as interrupted. Add two-process SIGKILL scenes, repeated recovery/idempotence and changed-files/symlink refusals.
 
-- **Objective/why:** let a holder of the decryption identity still detect a replaced or downgraded artifact, then freeze the published format. **Prerequisites:** M4a.
-- **Spike complete (2026-09-28); shape decided as one increment.** `ml-dsa` 0.1.1 and `ed25519-dalek` 2.2 were measured in `/tmp/m4b-hybrid-sign`: `signature.hybrid` is exactly **3373 bytes** (64 + 3309, so the crate implements final FIPS 204 rather than the round-3 3293 encoding), an ML-DSA-65 verifying key encodes to 1952 bytes, a signing key round-trips through a raw 32-byte seed so the key files look like the M4a identity file, `Signer::sign` is deterministic and needs no entropy, secret wiping requires the non-default `zeroize` feature and is therefore asserted as a compile-time bound, and mutations of the signature's first, middle and final bytes are all refused. `ed25519-dalek` stays pinned at 2.2 because 3.x would pull a second copy of `curve25519-dalek`, and `ml-dsa` must stay `>= 0.1.1` for GHSA-5x2r-hc65-25f9.
-- **Crypto half implemented (2026-09-28).** `crates/backup-crypto/src/signing.rs` provides `HybridSigner`/`HybridVerifier`/`HybridSignature` over the contract tuple, `SigningKeyFile` (`load`, `create_signing`, `write_verifying`) and the `SigningProvider`/`VerifyingProvider` ports: a signing key file is marker + 128 hex (Ed25519 seed ‖ ML-DSA-65 seed) at 0600, a verifying file marker + 3968 hex (32 + 1952 bytes) at 0644. The identity file's read/write rules were lifted into crate-internal `KeyFileRules` in `keystore.rs` so both families share one implementation with byte-identical refusal messages, which is why `tests/m4a_key_drill.sh` still passes on 16, 17 and 18. Two facts only the implementing pass surfaced: `ed25519_dalek::VerifyingKey::from_bytes` accepts a small-order key, so the weak-key refusal is explicit on load; and FIPS 204 `pkDecode` accepts every 1952-byte string, so a malformed verifying key is possible only on the classical half. `ml-dsa`'s graph is not disjoint from age's (`signature`, `sha2` and `hybrid-array` each resolve twice; `curve25519-dalek` and `zeroize` stay single), so each leg's `Signer` is called by qualified path. See [ADR 0002](docs/architecture/adr-0002-artifact-v1-and-signing.md).
-- **Application and CLI half implemented (2026-10-01).** `key generate|publish|status` act on the configured `[signing]` block beside `[encryption]`: status reports every configured key file with role, suite, mode and public fingerprint and never a secret, publish derives the verifying half from a hand-written signing seed, and a block naming no `signing_key_file` is a verify-only host that refuses to generate. `backup verify --level signature` recomputes both ciphertext digests and checks `signature.hybrid`, reporting the origin with nothing decrypted and no PostgreSQL tool invoked; checksum and archive levels on a v1 store authenticate first, and signature level on an unsigned store is a refusal rather than a silent downgrade. `restore plan` opens a v1 artifact through the signature-first reader, so a forgery is refused while the cluster still holds nothing new, and it re-binds the source: the manifest's `source_fingerprint` — 16 hex over engine, major, host, port and database — must equal what the current configuration recomputes, at plan and again at run. A profile-less v1 write records a synthetic snapshot named `whole-database`, and that name is therefore refused in configuration while staying a valid `Profile`; the check belongs in `Config::validate`, which is where `crates/backup-local/tests/signed_write_path.rs` found it — with the rule in `Profile::validate` the v1 writer refused its own manifest, because `ArtifactManifest::validate` re-validates the snapshot it signs. A signed manifest is immutable: a successful v1 restore leaves the recorded verification level untouched (`recorded_in_artifact: false`) rather than raising it, since that would need the signing key a DR host does not hold, and `backup inspect` on a signed store reads the record out of the authenticated ciphertext.
-- **Status — closed (2026-10-01): artifact v1 is frozen.** `tests/m4b_docker_smoke.sh` runs write → sign → verify at all three levels → DR restore on PostgreSQL 16, 17 and 18, and `tests/m4a_key_drill.sh` gained the signing half of the lifecycle (steps 9–11): rotation to a second signer, cross-generation refusal through the signature rather than through decryption, the vault copy of `signing.key`/`verifying.key`, a writer configuration whose secret is gone, a verify-only host that restores with no signing secret at all, and a generation whose verifying file is missing — after which `payload.age` still hashes to what `public.json` recorded and `signature.hybrid` is still 3373 bytes. The M1–M4a matrices were re-run on the same three majors with the M4a artifact paths still verifying, and `cargo test --workspace` stands at 128 passing. The stock-`rage` divergence deferred from M4a landed as a CLI assertion in the same run, together with a parsed `payload.age` header showing exactly one `mlkem768x25519` stanza plus age's own grease and nothing else. [ADR 0002](docs/architecture/adr-0002-artifact-v1-and-signing.md) is accepted and its validation items are marked run; [artifact v1](docs/backup-format/manifest-v1.md) is frozen with its field list reconciled against `ArtifactManifest`/`PublicHeader`; [key lifecycle](docs/security/key-lifecycle.md) now covers both pairs, and the operator path is [the M4b signed store guide](docs/development/m4b-signing.md), whose every command and refusal was run by hand against PostgreSQL 16 on 2026-10-01 — including the mixed signed/unsigned store read, which the guide and the threat model now describe as observed behavior rather than unproven.
-- **Two limits the freeze ships with, written as limits.** (1) The signed tuple covers `backup_id` and the two ciphertext digests only, so `public.json`'s `signature_suite`, `recipient_suite`, `signer_id` and `recipient_id` are **not** authenticated by it: a header downgraded to `ed25519` still passes `--level signature`, and the refusal arrives one step later when the authenticated manifest is compared against the header — reached by `--level checksum`, `--level archive` and `restore plan`, so no restore path acts on the header's word, but suite-level trust must not be inferred from a verified signature. Pinned as m4b case 6.11, which asserts the pass as well as the refusal. (2) A missing component is refused before any crypto work but reported as a bare I/O error rather than a contract sentence — remove `complete` and the operator sees `No such file or directory (os error 2)`; the same holds for a missing key file, which is where the `load … key file` context does name the role. Case 6.7. Not tested at all: a store holding both a v1 artifact and an unsigned M4a artifact, and replay of an older valid signed artifact (M5 inventory).
-- **Architecture/files:** `Signer`/`Verifier` ports, hybrid detached signature (Ed25519 + ML-DSA-65 per [FIPS 204](https://csrc.nist.gov/pubs/fips/204/final)), independently trusted verifying key, published artifact v1 reader/writer, `public.json`. Chosen over signing the current development shape first: [ADR 0002](docs/architecture/adr-0002-artifact-v1-and-signing.md) records the full-v1-in-one-step decision, the encrypted `manifest.age`, the derived `signer_id`/`recipient_id`, `--level signature`, and that a bad signature is now caught at plan time.
-- **APIs/DB/CLI:** signature ports and artifact v1 writer/reader; no DB migration; `key status`, `backup verify` gaining the signature level. Rotation selects a new generation; an existing artifact is never re-signed or re-encrypted in place, so keeping a generation long-term means taking a fresh backup under it.
-- **Tests/security/docs:** Ed25519 and ML-DSA signature vectors, artifact-swap and suite-downgrade rejection (a new write never selects a classical-only suite; a reader reports the recorded suite instead of guessing), truncation and reorder, no signing key material in logs, signing-key recovery drill.
-- **Acceptance/DoD:** artifact v1 frozen with its suite fields; bad signature, swap, and downgrade fail before restore; signing key recovery procedure tested; readers accept known versions and reject unknown critical fields.
-- **Pitfalls:** binding the signature to plaintext instead of ciphertext, trusting the same host for both keys, freezing a format whose suite is not recorded. **Portfolio:** applied cryptography.
+Acceptance: active backup/restore/verify survives unrelated reads and refused competing commands; different backup profiles may still run; killed operations release ownership and recover without a complete artifact; no plaintext leak, live directory deletion or silent terminal-state rewrite. Existing negative same-scope acquisition control still fails when exclusivity is removed. Run fast checks and affected M1–M4b matrices. Do not proceed to C1 until these scenes pass.
 
-### M5 — Catalog, jobs, concurrency, retention
+### C1 — Clean code and human readability
 
-- **Objective/why:** make lifecycle observable and deletion safe. **Prerequisites:** M1–M4b.
-- **Architecture/files:** SQLite catalog/migrations, job runner, reconciliation, retention policy.
-- **APIs/DB/CLI:** job/catalog/retention ports; initial tables for backups, jobs, events, audit, profiles; `job *`, `backup protect/delete/prune`.
-- **Tests/security/docs:** crash recovery, overlapping jobs, catalog rebuild, protected/only-valid backup invariant, dry-run deletion.
-- **Acceptance/DoD:** bounded workers and persisted states; no incomplete backup marked complete; retention preview matches executed deletion set.
-- **Pitfalls:** catalog/artifact split-brain and race with restore. **Portfolio:** transactional state machines, reliability.
+Purpose: make routine behavior understandable from named modules and straight-line orchestration. This is a separate phase, not permission to rewrite cryptography or change product behavior. Prerequisite: S acceptance. Preserve runtime dependencies and public contracts; the full refactor diff should explain structural moves, not new features.
 
-**M5 scoping — accepted (2026-10-01).** [ADR 0003](docs/architecture/adr-0003-backup-inventory-jobs-retention.md) is accepted on seven decisions, the first of which splits this milestone: **M5a** is the SQLite inventory, persisted job states with a single-instance lock, reconciliation and rebuild-from-`public.json` — all observable, none destructive — and **M5b** is retention, protection and the first deletion commands, reviewed against an index that already survived M5a's crash tests. The metadata database is named the **inventory** in code and prose, because "catalog" already means PostgreSQL's catalog in this repository. Its schema holds only what a keyless `public.json` already states, plus digests and lifecycle state, so a plaintext database file cannot reopen the metadata disclosure M4b closed by sealing `manifest.age`; anything descriptive still decrypts, as `backup inspect` does. Files are authoritative for what exists and the inventory for what happened to it: an artifact never adopted is reported unregistered and is never a prune candidate, and a row whose files are gone never counts as one of the remaining valid backups. Protection is an inventory column, so losing the database costs the flags — an M6 guide line, not code. `prune` and `delete` reuse the M2 plan mechanism (candidate set persisted, digest confirmed, expiry enforced) and remove the `complete` marker first, so an interrupted deletion leaves a directory the reader already refuses. Because a v1 manifest permanently records `verification_level: none` and `backup_id` is a random UUID, "which backups are valid" and "which is newest" are inventory facts that cannot be read off an artifact, and they are per-host. Rollback detection is a local high-water-mark ledger labeled as an accident alarm rather than a control; the chained, signed, off-host inventory that would actually close T03 is out of scope with its own future ADR. `job cancel` and any worker pool wait for M6/M7. The dependency questions are settled by the `/tmp/m5-catalog` spike that ran the same day: `rusqlite` 0.40.2 with `default-features = false, features = ["bundled"]` (the system-`libsqlite3` variant does not even link here, and would pin the runtime to Ubuntu's 3.46.1 against the bundled 3.53.2), the inventory in `journal_mode=DELETE` with `synchronous=FULL` because a WAL database copied without its `-wal`/`-shm` cannot be opened read-only in a read-only directory while WAL buys no measurable concurrency to a synchronous CLI, an explicit `busy_timeout` on every open (rusqlite's own default is 5000 ms), the single-instance lock as a separate `flock` file rather than a database transaction, and the inventory as a new `crates/backup-inventory` crate that cannot see key material at all.
+Current pressure points: `backup-local/src/lib.rs` has 2202 lines, application lib.rs 1158 and inventory lib.rs 1217 including tests. Counts identify inspection targets, not quality thresholds. Long tests are not a reason to fragment coherent production logic, and a smaller file is not proof of simpler code.
 
-**M5a increment 1 — landed (2026-10-03).** `crates/backup-inventory` exists: `schema.rs` carries `PRAGMA user_version` migrations with a dense, append-only step list (v1 creates `meta` plus `artifact`, and creating a file runs the same `0 -> 1` step an upgrade runs), `lib.rs` holds the two open paths — `open`, which creates and migrates, and `open_read_only`, which cannot create anything because only `SQLITE_OPEN_READ_ONLY` avoids it while `PRAGMA query_only` does not — and `job_lock.rs` is the `flock(LOCK_EX|LOCK_NB)` file, per (`source_fingerprint`, `profile_fingerprint`), refusing immediately rather than waiting (a test bounds the refusal under 500 ms; the spike measured 0 ms) and released by the kernel when the holder dies. Both pragmas are read back after being set (`journal_mode` must answer `delete`, `busy_timeout` the 2000 ms asked rather than rusqlite's 5000 ms default), an inventory bound to one estate refuses another's, and `integrity_problems` exists because a query answering is not the file being healthy. The schema stays key-free, and two revisions the code forced are written into ADR 0003 as **Implementation revision** lines: the retention scope key is a `profile_fingerprint` digest rather than a profile name (choice 2 forbids the name), and because the v1 signature covers only `backup_id` and two ciphertext digests, both that digest and `completed_at_utc` are nullable — so an inventory rebuilt without the identity key is retention-blind and M5b's prune has to refuse on such a store instead of falling back to a per-source count. Estate binding is the `source_fingerprint` and not the `[storage]` root path, so a copied root remains a copy of the index. Verified by `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo test --workspace` (153 tests pass, 0 fail, of which 24 are the new crate's). Not yet wired: nothing calls `register()` — no job table, no reconcile pass, no `backup list` reading from the index, and `INVENTORY_FILE`/`locks/` are not in `backup-local`'s layout.
+| Task | Ordered changes | Acceptance |
+|---|---|---|
+| C01 | Capture current exported APIs, CLI examples, JSON/error contracts and passing baseline. Identify repeated logic and mixed ownership with concrete call sites. | Inventory of refactor scope; no speculative abstraction list. |
+| C02 | Split local store responsibilities: opening/keys, stage/sinks, signed publication/reader, development reader/writer, scratch/activity, plans, inventory bridge. Move cohesive tests with their subject. | Crate-root reexports preserve callers; no artifact bytes, publication/read ordering, key rules or path behavior changes. |
+| C03 | Split application into ports, backup, verify, restore and shared artifact facts; split inventory connection/open/recovery from SQL operations/tests where useful. | Use cases read in operation order; SQL stays in inventory; filesystem/crypto stays in local/crypto. |
+| C04 | Simplify names, branches and comments; extract repeated semantic helpers, remove dead/stale prose, consolidate fixture helpers. Review before/after call paths and docs. | A reviewer can trace create/verify/restore/recovery without jumping through unnecessary wrappers; all contracts and regression gates pass. |
 
-### M6 — Scheduler and Debian service
+Proposed private module destinations, adjusted only when code review shows a clearer cohesion boundary:
 
-- **Objective/why:** run unattended on Debian safely. **Prerequisites:** M5.
-- **Architecture/files:** systemd units/timer, packaging scripts, deployment guide.
-- **APIs/DB/CLI:** scheduled job invocation; schedules table only if needed for listing policy; `schedule list/run`, `status`.
-- **Tests/security/docs:** package install/upgrade/remove, timer overlap/missed run, service sandbox and file permissions.
-- **Acceptance/DoD:** `.deb` installs reproducibly, scheduled backup runs as dedicated user, data/keys survive upgrade/removal.
-- **Pitfalls:** client tool version mismatch and overly strict systemd sandbox. **Portfolio:** Linux packaging/operations.
+```text
+backup-application/src/{lib,ports,backup,verify,restore,artifact_facts}.rs
+backup-local/src/{lib,layout,store,stage,signed,development,scratch,activity,plans,keys,inventory}.rs
+backup-inventory/src/{lib,connection,artifact,job,job_lock,recovery,schema}.rs
+```
 
-### M7 — API and asynchronous service
+Do not create empty modules to satisfy the diagram. Keep a small crate facade with explicit reexports; use `pub(crate)`/private helpers and narrow fields rather than exposing internals for convenience. Preserve `LocalJob`'s legitimate cross-crate adapter; do not work around Rust's orphan rule by reversing dependencies.
 
-- **Objective/why:** let other applications integrate without blocking HTTP. **Prerequisites:** M5–M6 and updated threat review.
-- **Architecture/files:** `backup-api`, OpenAPI spec, auth/audit middleware.
-- **APIs/DB/CLI:** v1 backup/restore/job/profile endpoints; token/actor and idempotency records; CLI may use core locally, with remote mode separately specified.
-- **Tests/security/docs:** authz matrix, replay/idempotency, rate limits, request size, redaction, API contract tests.
-- **Acceptance/DoD:** `202` job lifecycle, stable error contract, no unauthenticated destructive action.
-- **Pitfalls:** duplicate jobs after client retry, target authorization. **Portfolio:** backend/API security.
+Readability rules: meaningful nouns/verbs and explicit types at important boundaries; early input guards; one clear sequence for resource acquisition, work, completion and cleanup; match enums rather than magic strings where this reduces invalid states; no boolean parameter bundles with unclear call sites; comments explain invariant/reason, not narrate every statement. Share rules only when they have the same semantics. Separate development/v1 paths where forcing them together hides trust differences.
 
-### M8 — UI and operator workflow
+Keep safety-relevant RAII and error contexts. Do not replace guards with manual cleanup scattered across branches. Do not hide signature verification or destructive actions behind a generic callback pipeline. Do not add helper chains/macros just to shorten functions. Move crypto modules only if necessary for a demonstrated readability problem, preserving all transcript constants/vectors and zeroization bounds.
 
-- **Objective/why:** expose verified state and guided restores. **Prerequisites:** M7.
-- **Architecture/files:** UI app and UX docs; backend unchanged except needed read APIs.
-- **APIs/DB/CLI:** API-only client; no mandatory DB/CLI change.
-- **Tests/security/docs:** accessibility, XSS, restore confirmation and failure states, browser/API integration.
-- **Acceptance/DoD:** operator can inspect, plan, submit, and monitor using API; dangerous actions still require server-side authorization.
-- **Pitfalls:** UI implying checksum equals successful restore. **Portfolio:** product integration.
+Implementation unit: one responsibility move per reviewable change, update imports/reexports, run relevant tests, inspect the diff, then continue. A bug found during refactoring is a separately documented behavior fix with its own failing test and validation; never conceal it inside a move-only change.
 
-### M9 — Production validation and release
+Phase acceptance: all fast checks, S full-process regressions, M1–M4b matrices and key drill pass; compare CLI/JSON/plan examples and deterministic crypto vectors; dependencies/versions unchanged; no claimed readability improvement based solely on line count. Write a concise module-ownership summary and remaining complexity notes. Add no new clean-code policy dependency.
 
-- **Objective/why:** back claims with drills and measured limits. **Prerequisites:** M1–M8 for full platform release; CLI-only release may precede UI.
-- **Architecture/files:** release workflow, benchmark reports, runbooks, changelog, support matrix.
-- **APIs/DB/CLI:** freeze v1 contracts; migration tests for all metadata/artifact versions; no unplanned feature.
-- **Tests/security/docs:** full failure matrix, 100 MB/1 GB/10+ GB benchmarks, restore drills, dependency review, package upgrade tests.
-- **Acceptance/DoD:** published versioned artifacts and docs, measured restore duration and last-restorable-snapshot age, reproducible release, resolved critical security findings; no unsupported RPO/RTO or host-loss claim.
-- **Pitfalls:** equating successful checksum with recoverability. **Portfolio:** testing, CI/CD, observability, release engineering.
+### A — Finish M5a without deletion
 
-## 27. Cross-cutting acceptance criteria
+Prerequisites: S and C1. Owners: inventory persistence, application inventory/job services, local scan/read bridge, CLI/report. Preserve v1.
 
-A production release requires: one complete artifact reconstructs a representative database on a supported target; verification reports its exact level; encrypted backup is unreadable without a separately stored identity and its origin signature verifies against an independently trusted key; backup interruption cannot produce a complete record; catalog can be rebuilt from artifacts; destructive restore and prune require explicit authorized plans; service connection credentials never appear in logs or service metadata, and native artifacts that may contain database-held credentials are encrypted; package install/upgrade preserve data and keys; and a documented restore drill has been performed on every supported PostgreSQL major. A feature is done only when its docs, threat review, and failure tests match its actual behavior.
+1. **A01 — job/inventory read surface.** Add `job list`, `job inspect`, `inventory check`. Read-only open never creates/migrates/sweeps. List deterministic timestamp/ID order, report exact state/operation/known associations, distinguish absent job from damaged database, and run structural integrity checks in check. Establish JSON/error contracts before implementation.
+2. **A02 — unified discovery and reconciliation.** Scan IDs/shapes with bounded validated filenames and report registered/unregistered/missing/incomplete/conflicting entries. Discovery does not authenticate descriptive public claims. Normal reads do not auto-adopt. Writable reconcile updates observed missing/conflict state with audit while preserving protection/verification/tombstones and known private facts. Refuse malformed/symlink entries per entry with understandable diagnostics rather than letting one development shape abort every mixed-store list.
+3. **A03 — explicit adoption and keyless rebuild.** Add discovery-only construction that does not load identity/signing secrets. `inventory adopt ID` records bounded public discovery facts and estate provenance, with trust level distinct from authenticated verification. Public v1 contains no source fingerprint: bind a keyless rebuild to an explicit expected estate, mark it provisional/unconfirmed where necessary, and refuse foreign source when private authentication later supplies the actual fingerprint. Never claim signature proves estate/profile/time. Rebuild preview reports IDs/shapes/unknowns/lost facts; confirmed execution follows §16's staged replacement and exclusive maintenance rules. Preserve old inventory recoverably.
+4. **A04 — authenticated enrichment and verification events.** Record successful/failed verification with level, UTC time, artifact ID and ciphertext digests; no secret-bearing diagnostic text. Authenticated manifest enrichment supplies profile/time only after binding checks. Checksum and signature observations remain distinct from archive validation. Keyless refresh preserves known facts for unchanged bytes; changed bytes invalidate observations and produce conflict. Read-only verification reports that no event was persisted.
+5. **A05 — restore jobs and resource associations.** Add operation kind/target fingerprint/artifact-use associations through the next migration. Acquire target/use/activity locks before side effects and retain through native restore/validation. Record running/complete/failure/interrupted and safe events; partial failure leaves target for repair. Do not automatically sweep a live backup or a finished restore. Shared use of an artifact blocks future deletion. Add no worker pool/cancel command.
+6. **A06 — recovery and integrity drill.** Implement `tests/m5a_docker_smoke.sh` on PG16/17/18: kill backup/restore mid-operation, duplicate startup, unrelated read, same-scope restart, publication-before-registration failure, db loss/rebuild, wrong-estate refusal, mixed shapes, malformed headers, schema v1->v2->current and newer-schema refusal, populated-db corruption and single-file read-only copy. Tests run through actual CLI initialization.
+7. **A07 — metadata leakage and audit checks.** Grep raw SQLite files/journals and captured machine/human output for fixture database/host/profile/scope, fake credentials and generated seeds. Exercise normal writes, failed writes, enrich/rebuild and restore. Demonstrate the sentinel is detectable in a positive control. Confirm state/event transaction rollback and no event claiming work that failed before it started.
+8. **A08 — close M5a.** Operator guide with read/write/keyless/DR modes, unknown facts, adoption/rebuild/lost-history rules and interrupted-state behavior. Run all regressions and ADR 0003 M5a gates. Update phase statuses and threat review. No protect/delete/prune command before acceptance.
 
-## 28. Architectural decisions
+Migration ordering: add only A04/A05 fields when their writers land; preserve old schema steps and use a new numbered step for each durable change. Fresh/upgrade/read-only paths must be tested against real older schema files, not just a database hand-built to match the new schema.
 
-1. Modular Rust monolith with a narrow database-engine capability boundary.
-2. Native `pg_dump`/`pg_restore`; custom archive first, directory only after benchmarking.
-3. Initial source support: PostgreSQL 16–18. Require a configured source-major client binary; same-major restore only until cross-major pairs pass fixture tests. Initial packages: Debian 13 and Ubuntu 24.04 LTS on amd64. Versioned clients come from the distribution or official PostgreSQL Apt repository. [PostgreSQL version policy](https://www.postgresql.org/support/versioning/), [Debian repository](https://www.postgresql.org/download/linux/debian/), [Ubuntu repository](https://www.postgresql.org/download/linux/ubuntu/).
-4. Local filesystem and SQLite first; the catalog is rebuildable from encrypted manifests with a recovery identity.
-5. TOML profiles, JSON API and public artifact fields, encrypted private metadata.
-6. Published encryption uses a **hybrid classical + post-quantum** construction: the recipient key agreement combines X25519 with ML-KEM (FIPS 203), and the detached origin signature combines Ed25519 with ML-DSA-65 (FIPS 204). Private keys stay outside the artifact store. No custom AEAD framing; the container stays the maintained [`age` crate](https://docs.rs/age/latest/age/) stream format if its native hybrid recipient proves usable in software (see the M4a spike), otherwise a thin suite-labeled envelope around that same authenticated stream. [Age crate](https://docs.rs/age/latest/age/), [PQ/T hybrid key agreement](https://www.rfc-editor.org/info/rfc10024/), [FIPS 203](https://csrc.nist.gov/pubs/fips/203/final), [FIPS 204](https://csrc.nist.gov/pubs/fips/204/final).
-7. Fresh-target restore by default; destructive work requires a bound plan confirmation. Subscriptions are excluded and global objects are documented manual prerequisites initially.
-8. systemd timer for Debian scheduling; no internal scheduler in MVP.
-9. No physical/PITR or host-loss recovery claim from local logical backup.
-10. Published artifact v1 is frozen at M4b; M1 plaintext output is synthetic-data development output only.
+### B — M5b protection, retention and deletion
 
-## 29. Open questions and validation gates
+Prerequisite: M5a accepted. Owners: pure retention policy in domain, application planning/execution, inventory lifecycle, local marker-first deletion, CLI. This is the first irreversible feature phase; review all invariants against a real inventory before enabling execution.
 
-The original eight questions have design resolutions. The remaining checks are empirical release gates.
+1. **B01 — policy and plan contract.** Start with per-(source fingerprint, profile fingerprint) `keep_last N`, with N >= 1. Defer age limits/buckets until this passes. Known valid means current complete files, authenticated v1 bindings and a matching archive-validation or stronger validated-restore observation. This is the conservative B01 policy baseline introduced by this revision; record it with examples before enabling retention, because ADR 0003 did not freeze a minimum verification level. Unknown profile/time, missing/conflict/development/unregistered/deleted entries never count as valid or candidates. Refuse prune when the requested scope cannot be established. Define deterministic completion-time ordering and tie-break only equal times with ID; UUID alone never means newer.
+2. **B02 — protection and preservation.** Add protected flag/event via migration; protect/unprotect change only inventory. Update registration/enrichment merge logic first so refresh cannot erase protection. A rebuilt index has lost flags and must state that fact; it does not silently inherit a safe-to-delete assumption. Last valid copy, active/use-held artifacts and job dependencies are exclusions even if unprotected.
+3. **B03 — saved deletion plans.** Persist versioned immutable plans under plans/: operation, estate/scope, sorted exact ID set, ciphertext digests, relevant policy/inventory facts, created/expiry times and canonical digest. Use the existing 15-minute expiry as baseline. `delete ID` shares the same planner/executor with a singleton set. Preview only prints/saves intent, never modifies artifacts.
+4. **B04 — confirmed execution.** Load plan, require exact digest/estate/expiry, take maintenance/artifact exclusion locks in recorded order, and revalidate all candidates/retained backups. If bytes, protection, validity, active usage or policy facts changed, refuse the whole unstarted plan and require a new preview; do not recompute a broader set. Remove marker/sync before deleting contents. Persist deleting/deleted state and each completed action; errors expose exact completed and remaining IDs. Tombstones/events remain.
+5. **B05 — local rollback warning.** Maintain per-(source fingerprint, signer ID) authenticated completion high-water mark. Older restore plan/list produces a clear older-snapshot warning; explicit acknowledgement is bound into a new restore plan version without changing v1. This detects accidents when ledger survives, not an attacker who rewrites both files and inventory. Unknown authenticated time cannot advance the mark.
+6. **B06 — retention drill and close.** Add `tests/m5b_retention_drill.sh`: plan/executed IDs match, each exclusion fires, unknown/keyless rebuild refuses, refresh preserves protection, a corrupted/removed retained copy prevents unsafe execution, two deleters cannot interleave, restore/delete race is refused, interruption after marker removal is recoverable and never valid, deleted history survives. Rerun M5a/M1–M4b and publish guide/threat status.
 
-| Former question | Resolution | Gate before support claim |
-| --- | --- | --- |
-| Versions/packages | PostgreSQL 16–18, same-major restore, Debian 13 and Ubuntu 24.04 amd64, matching client | Package CI and real fixture restores for every supported combination. |
-| Encryption | Hybrid classical + post-quantum recipient (ML-KEM-768 first, then X25519, per RFC 10024 ordering; FIPS 203) as our own `mlkem768x25519` age recipient inside the maintained `age` stream format; container decided by the M4a spike, not stock-`rage`-decryptable | Tamper, truncation, swap, signature, single-hybrid-stanza enforcement, the tested `rage` divergence, and recovery-key drills, with the suite recorded in the manifest. |
-| Archive format | `-Fc` first; `-Fd` only if measured backup window requires parallelism | Benchmark 1 GB and 10+ GB datasets. |
-| Privileged objects | Preflight extensions/FDWs; exclude subscriptions by default | Non-superuser fixtures; reject unsupported plans. |
-| Globals | Delivered in M2 as opt-in `pg_dumpall --roles-only --no-role-passwords`; verifiers and database-level ACLs stay manual prerequisites | Privilege and secret-content review. |
-| RPO/RTO | No universal guarantee; example daily backup, 26-hour stale alert, weekly restore drill | Measure last-restorable-snapshot age and restore duration; require off-host copy before host-loss claim. |
-| Partitions/large objects | Selected parent includes children; filtered large objects excluded or all included explicitly | Versioned selection and restore fixtures. |
-| Artifact v1 | Opaque ID, `public.json`, `manifest.age`, `payload.age`, `signature.hybrid`, recorded suite, validated binding | Versioned reader, corruption/replay/suite-downgrade tests, remote-store review before freeze. |
+Deletion is non-atomic across several directories. Report partial execution honestly; never claim transaction rollback can resurrect removed files. Keep maintenance checks simple and testable before adding age/bucket retention or break-glass overrides.
 
-**Security correction:** PostgreSQL user mappings may contain passwords, and subscription connection strings may contain passwords. The native archive is sensitive even when the service manifest contains no secrets. Encrypt before publishing an artifact with real data; `--no-subscriptions` does not remove all possible embedded credentials. [User mappings](https://www.postgresql.org/docs/18/sql-createusermapping.html), [subscription catalog](https://www.postgresql.org/docs/18/catalog-pg-subscription.html), [`pg_dump`](https://www.postgresql.org/docs/18/app-pgdump.html).
+### H — M6 harden CLI and deploy safely
+
+Prerequisites: B acceptance. Implement in reviewable increments; do not enable production data merely because a package installs.
+
+1. **H01 — configuration/release policy.** Record versioned production configuration, allowed connection/target topologies, secure local credential modes and any remote TLS extension. Preserve old fixture configuration for tests. Record error/JSON version policy and public-only/read-only key custody. Decide full/data-only/overwrite support explicitly; excluded behavior stays refused.
+2. **H02 — process/filesystem hardening.** Implement process-group timeout/cancellation for descendants; tests include a wrapper retaining pipes after the client dies. Verify tool provenance/matching versions, permission/ownership/no-follow paths, disk/scratch bounds and stable safe errors. Resolve key-command partial writes by validation before mutation or a documented transactional creation path. Validate true read-only discovery/verification and explicitly configured private scratch where decryption needs writes.
+3. **H03 — systemd/package.** Build .deb targets/units under deploy/, install dedicated user and mode-controlled paths, wire profile invocation and chosen timer semantics, preserve data/keys on upgrade/removal. Verify process locks and SQLite migration under actual service permissions/sandbox. Test package reinstall/purge policy.
+4. **H04 — CI and operating guides.** Add pinned fast/matrix/package workflows; document installation, matching clients, credentials, key backup, inventory-copy consistency, recovery, stale alerts and isolated restore drills. A live SQLite database copy must use a consistent backup/export or quiescent maintenance ownership; DELETE journal does not make arbitrary concurrent raw copying safe.
+5. **H05 — clean-code checkpoint.** Review modules introduced by A/B/H against C1 rules, remove redundant adapters/branches and update ownership comments. Keep fixes and refactors distinguishable. Run affected regressions and package lifecycle gates; no global rewrite.
+
+Acceptance: tested Debian/Ubuntu install+upgrade+remove, dedicated-user timer creates signed backups without overlap or leaks, restore with recovery keys works, limits/errors/read-only modes match docs. Production-source enablement waits for V03.
+
+### V — CLI production validation and release
+
+Prerequisites: H plus all core acceptance gates; API/UI not required.
+
+1. **V01 — content/security/failure matrix.** Run supported majors and privilege modes, full and supported selective restores, key loss/rotation, corruption, schema upgrades, restart/write/disk failure and target conflicts. Confirm compatibility/limits with recorded environments. Review custom crypto transcript/custody assumptions and dependencies; tests are evidence of behavior, not an independent cryptographic audit.
+2. **V02 — benchmarks and real recovery rehearsal.** Execute §24 sizes and validate restored rows/schema/security/sequence state. Measure snapshot age/restore time and load. Demonstrate off-host recovery only if an independent copy workflow is actually implemented/tested; otherwise retain the limitation.
+3. **V03 — release decision.** Resolve critical findings, choose license, publish SECURITY/CHANGELOG/support matrix and reproducible checksummed release. Enable production source configuration only in a separately reviewed change after these gates. Require signed encrypted writes for real data; refuse plaintext/unsigned production publication. Do not treat `--confirm-synthetic` as a production opt-out flag.
+
+Acceptance: CLI install/run/restore/retention/recovery meets the documented local product promise, no unsupported host-loss/PITR/RPO/RTO claim, and every untested/excluded capability is visible. Mark original M9 CLI track complete independently from M7/M8.
+
+### P — M7 API and asynchronous jobs
+
+Prerequisites: hardened validated core; dependency/auth/worker decisions recorded.
+
+1. **P01 — design contract.** Select framework/runtime; define OpenAPI, actors/permissions, safe errors, idempotency, token custody, TLS/deployment and queue/cancel ownership. Bound target authorization and destructive plan tokens to actor/request/expiry.
+2. **P02 — worker adapter.** Add bounded queue/workers invoking existing core, persisted accepted/running/terminal states with real writers, restart reconciliation and cancellation by process group. Do not insert runtime dependencies into pure domain/crypto just to host HTTP.
+3. **P03 — routes and observability.** Implement 202 jobs, artifact/profile/job reads, authenticated metrics/health and operation-specific access. Reject oversized/unknown fields, arbitrary paths and duplicate/conflicting idempotency keys before execution.
+4. **P04 — verification and cleanup.** Authz/replay/rate/queue/cancel/restart/redaction tests, API-to-core equivalence and full destructive confirmation scenes. Apply C1 readability rules to new code, publish versioned API guide and threat review.
+
+Acceptance: retries do not duplicate operations, no unauthenticated destructive access, cancellation accurately reports partial restore/deletion, and API behavior is the same core policy as CLI.
+
+### U — M8 UI
+
+Prerequisites: P accepted and OpenAPI stable. U01 chooses/records framework and operator workflow; U02 implements API-only health/artifacts/jobs and restore planning/confirmation; U03 adds profile/schedule/key-status views only for delivered API features; U04 tests accessibility/XSS/failure/partial states and complete browser/API flows, then cleans up code under C1 rules.
+
+Acceptance: an operator can inspect verification, plan/confirm restore and monitor jobs without bypassing backend safeguards. No secrets in browser state/reports. No UI-created policy logic that disagrees with core.
+
+### F — Full-platform release
+
+Prerequisites: V/P/U accepted. F01 reruns end-to-end and package/migration/compatibility tests across all interfaces; F02 benchmarks actual worker concurrency and reviews API/UI security/operations; F03 performs final focused clean-code/doc review and publishes versioned platform release/support notes. Original M9 full-platform track closes here.
+
+## 27. Universal acceptance and Definition of Done
+
+A task is done only when its implementation, public examples, relevant contracts, tests and safe failure behavior agree. Required checks are executed and evidence recorded, or the task remains incomplete with the exact missing gate. No phase completion by elapsed time or test count alone.
+
+Production conditions: a signed encrypted artifact reconstructs the representative supported database; full validation is distinguished from signature/checksum/archive; lost/corrupt inventory has an honest recovery path; crash cannot invent a complete artifact; destructive actions require bound plans and retain known valid copies; secrets do not leak; keys/data survive package lifecycle; an isolated restore drill passes on every claimed major.
+
+Clean-code conditions: coherent module ownership, readable operation order, minimal justified abstractions, stable contracts, working regression tests and a reviewable diff. A refactor reducing lines while hiding ownership or trust checks fails acceptance.
+
+## 28. Decision register
+
+| Decision | Status/source | Implementer rule |
+|---|---|---|
+| Rust modular monolith/native logical tools | Accepted ADR 0001 | Preserve boundaries; no custom dump engine. |
+| Hybrid recipient in age stream, backupctl-only recovery | Accepted ADR 0001 | Preserve exact suite/transcript and custody. |
+| Signed encrypted v1 in one freeze | Accepted ADR 0002 | No in-place artifact changes or signing tuple edits. |
+| Inventory key-free, inside store, one estate | Accepted ADR 0003 | Preserve privacy/provisional keyless limits. |
+| DELETE journal/FULL/current 2000 ms timeout | Implemented M5a/spike | Assert effective values; no WAL assumption. |
+| M5a observational before M5b destructive | Accepted ADR 0003 | No deletion before recovery acceptance. |
+| Per-name-fingerprint scope, marker-first deletion, local ledger only | Accepted ADR 0003 | Preserve limits, protection/tombstones and explicit plans. |
+| Shared activity/exclusive maintenance, nonmutating ordinary read | Planned S02 baseline in this revision | Record addendum and test lifecycle before coding cleanup. |
+| Clean-code phase before new M5a features | Operator-requested in this revision | Behavior-preserving C1, no dependency/version drift. |
+| Exact new CLI/rebuild/event/policy contracts | Planned A/B baselines | Freeze examples/encodings in task docs before code. |
+| Production config, API runtime/auth, UI framework | Decision gates H01/P01/U01 | Do not choose silently during earlier tasks. |
+
+If a baseline cannot satisfy a frozen/accepted invariant, state the conflict and alternatives with pros/cons. Resolve the specific decision before dependent work; do not ask the operator to approve already-authorized routine refactoring choices.
+
+## 29. Gate checklist for the next implementing model
+
+Start at S01. Confirm the worktree still has M5a increments 1–3 and the live-cleanup behavior. Read the applicable contract/source files, define the full-CLI failing scene, record the S02 lock/ownership design in ADR 0004, fix and verify safety, then begin C01. Do not jump straight to job commands because they look small.
+
+Before M5a close: S and C1 accepted; job/read-only/keyless modes exposed; discovery differs from adoption; source provenance of keyless rows honest; observations bound to bytes; restore jobs/use locks real; rebuild flags/history losses stated; corruption/secret-content/PG16–18 crash and regression gates pass.
+
+Before M5b close: last-valid/protected/active/dependency exclusions pass; known scope/time/validity mandatory; preview digest/expiry checked; exact set revalidated; marker-first interruption/tombstone recovery demonstrated; no automatic data resurrection/adoption; local ledger explicitly not adversarial replay protection.
+
+Before release: package/service permissions and process descendants tested; config/claims match supported operations; production guard change separately reviewed; benchmark and restore evidence recorded; license/security/recovery docs complete. A future interface does not relax any core gate.
 
 ## 30. Risks and reductions
 
-| Risk | Reduction |
-| --- | --- |
-| Partial dumps/restores look successful | State machine, staged commit, native tool exit/error checks, archive parse, real restore tests. |
-| Selective archive lacks dependencies | Resolve scope, show warnings, fixtures, disallow unsupported combinations. |
-| Key loss or compromise | Recovery runbook, separate key backup, rotation drills, least-privilege host. |
-| Local disk and host are same failure domain | State limitation prominently; add off-host store before strong DR promise. |
-| PostgreSQL version/extension drift | Version matrix, pinned client compatibility checks, multi-version CI. |
-| Post-quantum primitive or implementation immaturity | Hybrid rather than post-quantum alone, so a classical break and a lattice break must both land; upstream maintained implementations only; suite and parameter set recorded in every manifest so a generation can be re-encrypted to a better one; no unaudited third-party PQ container format. |
-| Backup load harms production | Bounded concurrency, timeouts, benchmarked defaults, observability. |
-| Restore harms production or executes untrusted SQL | New-target default, plan digest, authz, trust warning, isolated restore drill. |
-| Metadata database lost/corrupt | Rebuild from manifests, transactional migrations, catalog backup. |
-| Too many abstractions before evidence | One PostgreSQL adapter and one local store first; add ports only at tested seams. |
+| Risk | Reduction and residual |
+|---|---|
+| Another model implements historical proposals as current truth | Status labels, stable task IDs, current-code references and frozen contracts. |
+| Cleanup deletes live work | S ownership model plus real competing CLI/process tests. |
+| Refactor disguises behavior/security change | Small responsibility moves, preserved vectors/contracts, separate bug-fix records. |
+| Refresh/rebuild erases lifecycle protection | Merge rules, explicit lost-history confirmation, no deletion while unknown. |
+| Retention uses stale/unknown verification | Observation-to-digest binding and execution-time retained-copy checks. |
+| Restore runs harmful SQL or leaves partial target | Trusted-origin boundary, fresh target/plan, no silent retry/drop, isolated drills. |
+| Key loss/compromise or custom crypto assumption fails | Separate recovery custody, hybrid construction, versioned suite/independent review; no audit claim from passing tests. |
+| SQLite copy is inconsistent or silently corrupt | Consistent backup/quiescent copy, integrity check, staged rebuild; local index is not a witness. |
+| Host loss deletes all local copies | Explicit limitation; independent-copy subsystem before strong recovery claim. |
+| Roadmap overbuilds API/UI before usable CLI | V release before P/U; small concrete ports and no speculative worker framework. |
 
 ## 31. Future extensions
 
-Future engine adapters: MySQL/MariaDB, MongoDB, Redis. Future stores: S3, MinIO, SFTP, with resumable transfer and remote consistency tests. Future key providers: OS keyring, Vault, AWS KMS, Azure Key Vault, Google Cloud KMS. A separate physical PostgreSQL subsystem may support `pg_basebackup`, WAL archiving, PITR, incremental chains, cross-region replication, and a backup verification server; it needs its own retention and recovery semantics. Multi-tenant mode requires tenant isolation, quotas, key separation, and authorization redesign. None of these are implied by the MVP logical backup contract.
+Separate designs are required for MySQL/MariaDB/MongoDB/Redis engines; S3/MinIO/SFTP consistency and transport; recipient-only writers/multiple generations/keyring/Vault/KMS; cross-major or cross-server restore; exact TOC/data-only/overwrite modes; age/bucket retention; multi-source/multi-host/tenant support; physical PostgreSQL/WAL/PITR; signed off-host inventory/immutability. None is implied by this CLI roadmap.
 
-**Crypto agility:** because the algorithm suite is recorded in every encrypted manifest and `public.json`, a future suite change is a migration path rather than a format break. Retire a suite by rotating: decrypt with the old identity, re-encrypt and re-sign under the newly approved suite as a new validated artifact generation, verify the result, then let the old generation age out under normal retention. Existing artifacts are never rewritten in place and readers never guess a suite. This is the intended answer to a post-quantum primitive being weakened later, and it assumes the decryption identity for the old generation is still available; an algorithm break that exposes an old identity is a key-compromise event, not a rotation.
+Crypto agility means decrypting with a preserved old identity, re-encrypting/re-signing into a new immutable generation under a reviewed suite, validating it, then allowing old generations to age out under safe policy. It is not an in-place rewrap guarantee, and it cannot undo already disclosed data.
+
+## 32. Design and roadmap review — 2026-10-03
+
+Assessment retained from the preceding review: product/architecture direction is sound, current M5a is incomplete, and cleanup safety is the immediate blocker. Reproduction used disposable synthetic staging/scratch directories with a held exclusive scope flock: `backup list` exited successfully, removed both directories, and left the flock held. The existing overlap test calls JobGuard directly and misses LocalStore startup.
+
+This rewrite puts S before C1 before remaining M5a/M5b, makes the clean-code work explicit, reconciles delivered gzip/custom/synthetic/job/SQLite behavior, retains accepted contracts and places unresolved future choices at named gates. It specifies testable behavior rather than promising identical source from every model. Documentation revision alone does not fix the blocker or complete any implementation task.

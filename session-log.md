@@ -1,430 +1,6 @@
 # Session log
 
-## 2026-09-26 — M0 research contracts and fixtures
-
-**Request:** Begin milestone M0 from `project.md` and maintain this log.
-
-**Completed:** Created the architecture contract, ADR 0001, PostgreSQL content/privilege matrices, fixture plan, threat model, artifact v1 specification, and synthetic SQL fixtures. Updated `project.md` minimally to link M0 deliverables and make the origin-signature requirement explicit. No Rust application code or production database configuration was added.
-
-**Research and decisions:** Checked official PostgreSQL documentation for versions 16–18, native dump/restore selection, globals, RLS, large objects, partitions, and subscription behavior. Confirmed native archives may contain database-held credentials. Confirmed `age` encryption alone does not establish sender origin: artifact v1 now requires a detached Ed25519 signature verified against an independently trusted key. Documented the residual rollback/deletion risk. Existing backup products informed retention expectations but did not determine logical archive behavior.
-
-**Verification performed:**
-
-- Checked the new documents and fixture files exist and contain no credential values.
-- Ran `core.sql` and `assertions.sql` in an isolated, network-disabled PostgreSQL 15 container available locally. Optional extension, publication, and FDW SQL parsed; publication warned that the test server's `wal_level` does not enable logical publishing.
-- Found and fixed an assertion that changed baseline source rows. Re-ran a fresh source -> `pg_dump -Fc --no-subscriptions` -> `pg_restore --exit-on-error` -> `assertions.sql` round trip; all steps passed.
-- PostgreSQL 15 was a syntax/round-trip smoke test only. The selected PostgreSQL 16–18 support matrix remains an executable M1/M2 gate, not a claim validated by this session.
-- Stopped and removed the temporary container. Checked 15 project/M0 files for broken local Markdown links and trailing whitespace; `git diff --check` passed.
-
-**Next implementation gate:** M1 creates the Rust workspace and local synthetic-data backup path. The first real-data artifact cannot be published until M4 implements encrypted and signed artifact v1. M1/M2 must run the fixture/privilege matrix on PostgreSQL 16, 17, and 18 with matching client binaries.
-
-## 2026-09-26 — M1 synthetic local backup
-
-**Request:** Begin M1 Rust workspace and synthetic-data local backup.
-
-**Implemented:** Added a five-crate Rust workspace (`backup-domain`, `backup-application`, `backup-postgres`, `backup-local`, `backupctl`), an explicit synthetic-use configuration guard, version-matched native `pg_dump -Fc --no-subscriptions`, bounded subprocess output and timeout, local staged publication with fsync/checksum/completion marker, and CLI `config check`, `backup create`, `backup list`, and `backup inspect`. Added a reproducible Docker smoke script, example TOML, README, and M1 operator guide. The artifact format is explicitly `m1-development-plaintext`, separate from future encrypted/signed v1.
-
-**Verification:** `cargo fmt --all`, `cargo test --workspace`, and `cargo clippy --workspace --all-targets -- -D warnings` passed. The Docker script passed on PostgreSQL 16, 17, and 18 with matching native clients: create/list/inspect followed by an independent `pg_restore --exit-on-error` into a fresh database and fixture assertions. On PostgreSQL 16 it also verified rejection of missing synthetic confirmation, simulated write error, empty output, timeout, mismatched client major, and a malformed config containing a runtime-generated sentinel without echoing that value. Failed backup attempts did not publish another artifact or leave an ordinary staged directory.
-
-**Final QA:** Re-ran the PostgreSQL 16–18 Docker matrix after disabling implicit default `.pgpass` use. Checked 18 source/document files for broken local links and trailing whitespace, confirmed `git diff --check`, and confirmed temporary M1 containers were removed.
-
-**Scope remaining:** M1 has no restore command, encryption, signing, SQLite catalog, scheduler, remote storage, or production-data support. An actual full-filesystem disk-exhaustion event was not induced; the write-failure path was simulated. The public repository license is not yet selected, so Cargo does not declare one.
-
-## 2026-09-27 — M2 safe restore, security metadata, and verification
-
-**Request:** Implement M2 so a backup can reconstruct the database security environment (roles, attributes, memberships, ownership, privileges) and not only tables and data, with an explicit restore security policy, safe plan/run separation, and verification levels. Keep exit codes at 0/1, add no SQLite catalog, and document rather than work around any authentication limitation.
-
-**Implemented:** Added `RestoreSecurityPolicy` (`dr` = roles + ownership + privileges, `portable` = contents only) and a `RestorePlan` record whose SHA-256 digest binds the policy, target, and artifact; plans are mode 0600 JSON under `<storage-root>/plans/` with a 15-minute expiry. The domain manifest now records `security_globals`, the globals digest/size, and the verification level, with shape validation that keeps those fields consistent. `backup create` optionally exports globals, `backup verify --level checksum|archive` was added, and `restore plan`/`restore run` execute the DR order: validate plan and digests, apply roles and memberships, re-check the target is absent, `createdb --template=template0`, then `pg_restore` with policy-derived flags. `--no-owner`/`--no-privileges` are never globally forced. A successful DR restore raises the artifact to `restore-tested`.
-
-**Security decisions:** Globals export uses `pg_dumpall --roles-only --no-role-passwords`, so no SCRAM or MD5 verifier can enter an artifact; the adapter independently refuses to apply a file containing a `PASSWORD` clause, and `list`/`inspect`/`verify` re-hash `globals.sql` and reject an undeclared globals file. Restored roles therefore need an operator-assigned password, and database-level `GRANT ... ON DATABASE`, tablespaces, and other cluster globals stay documented prerequisites. Native tool output stays withheld from errors so data cannot leak through the CLI. Tests use only fake, in-container credentials.
-
-**Verification performed:** `cargo fmt --all`, `cargo test --workspace` (23 tests), and `cargo clippy --workspace --all-targets -- -D warnings` pass. `tests/m2_docker_smoke.sh` passes on PostgreSQL 16, 17, and 18 with version-matched clients: sentinel/`PASSWORD`/`SCRAM-SHA-256` leakage checks, both verification levels, the M1 native restore compatibility path, DR refusal while the exported roles exist, clean-cluster DR restore with `assertions.sql` and `security-assertions.sql`, second-DR refusal, portable restore onto a role-less cluster proving ownership and roles are untouched, plan policy binding, expired-plan refusal, mismatched `--confirm-target`, the `export_globals = false` gate, and globals/payload tamper detection. `tests/m1_docker_smoke.sh` also passes again after its wrappers gained `pg_dumpall` and `createdb`, which the widened preflight now requires.
-
-**Defects found and fixed during integration:** the Docker client wrappers omitted `docker exec -i`, so the role script written to psql stdin never reached the container and the DR restore silently applied nothing; the filter also dropped memberships for roles that already existed, and an empty script returned success. The apply step now replays memberships unconditionally, always re-reads `pg_roles` afterwards, and fails if any exported role is still absent. `security-assertions.sql` referenced a nonexistent `rolattr` column and asserted table ownership the fixture never set, so the fixture now owns `app.audit_events` and the attribute check uses real `pg_roles` columns.
-
-**Scope remaining:** no encryption or signing (M4), no retention/deletion, no scheduler or daemon, no SQLite catalog, no profiles or selective restore (M3), no off-host storage, no multi-database or cluster-wide restore, and no automatic cleanup of a partially restored target.
-
-## 2026-09-27 — M3 profiles, resolved scope, and section-limited restores
-
-**Request:** Implement M3 so a backup can cover an explicit scope without promising dependencies it did not archive. The operator approved five decisions up front: profiles as `[[profile]]` blocks inside the existing service TOML; out-of-scope dependencies refused with no override flag; selective restore limited to `pg_restore` sections rather than table-of-contents editing; an optional manifest `scope` block that keeps `m1-development-plaintext` so M1/M2 artifacts still load; partial section sets must start at `pre-data` because every restore creates its own target database; and `backup create --dry-run` reporting scope without writing.
-
-**Implemented:** `Profile` and `SelectionMode` in the domain, validated before any connection (exact lower-case identifiers, no wildcards, no system schemas, tables and schema filters mutually exclusive since `pg_dump` discards one, no `schema-only` with `large_objects`, no duplicates). `PostgresEngine::resolve_selection` resolves the profile against the live catalog with `psql --tuples-only --no-align`, expanding partition families through `pg_inherits`, recording extension membership, refusing zero matches, and refusing both large-object shapes that would misrepresent the database: a filtered profile while any large object exists, and a whole-database profile that omits them. `find_dangling` reports references from in-scope objects to out-of-scope ones across six kinds (foreign-key target, parent relation, sequence default, enum/domain/composite/array column type, view and materialized-view base relation, trigger and default-expression function), with `pg_catalog` and `information_schema` exempt; `BackupService::resolve` turns any of them into a refusal naming each pair, shared by `--dry-run` and `create`. `dump_arguments` builds the argv, gating `--exclude-extension` to major 17+. The manifest gained `scope` and `toc_sha256`, the latter a digest of `pg_restore --list` output re-checked by `backup verify --level archive`. `RestoreSections` is bound into the plan digest; a section-limited set cannot claim the `dr` policy, `restore run` creates the schemas a `--table` archive never contains, and a partial run leaves the artifact's verification level untouched and warns. CLI: `profile validate`, `profile list`, `backup create --profile|--dry-run`, `restore plan --section` (repeatable), and scope/TOC/verification reporting.
-
-**Verification performed:** `cargo fmt --all`, `cargo test --workspace` (25 tests: 9 domain, 11 PostgreSQL adapter, 5 local store), `cargo clippy --workspace --all-targets -- -D warnings`, and `git diff --check` pass. `tests/m3_docker_smoke.sh` passes on PostgreSQL 16, 17, and 18 with version-matched clients in network-disabled containers, re-run independently to confirm: profile listing and validation, the three large-object refusals, the zero-match refusal, the five reachable dangling kinds, family expansion to exact names, `--dry-run` publishing nothing, `--exclude-extension` refused on 16 and accepted on 17/18, recorded `scope` plus `toc_sha256`, archive verification failing against a rewritten TOC digest and passing once corrected, `--section data` refused, `dr` with partial sections refused, a pre-data-only restore leaving zero rows and reporting `verification level: none` with the warning, a full selective restore passing `tests/fixtures/postgres/selective-assertions.sql` and marking the artifact `restore-tested`, a schema-only restore holding the cross-schema foreign key but no rows, and a table-selected events restore carrying both partition rows plus the 2026 child. `--strict-names` was confirmed accepted alongside `--schema`/`--table` on all three majors. `tests/m1_docker_smoke.sh` and `tests/m2_docker_smoke.sh` still pass unchanged, which is the no-regression evidence for the optional manifest fields and the new `restore_to_database` signature.
-
-**Defects found and fixed during integration:** the view branch of `find_dangling` looked for a `pg_class` to `pg_class` dependency that does not exist, so views resolved as self-contained until it was rewritten through `pg_rewrite` with `deptype = 'n'` and `SELECT DISTINCT` for the duplicated rows; triggers are found through `pg_trigger.tgrelid`, not a nonexistent `tgreloid`. The namespace predicate was first derived from the namespaces of the included relations, which would have let a `--table` profile pass on its same-schema enum and trigger-function dependencies; table selections now cover no namespace, written as `WHERE false` because `x NOT IN (SELECT NULL)` silently drops every row. `pg_dump --table` archives carry no `CREATE SCHEMA`, so a table-selected restore failed on every major with `schema "app" does not exist` until `create_schemas` was added, accepting only manifest-validated exact non-system schema names into a `backupctl_fixture_*` database. A `--security dr --section pre-data` plan died on the missing-globals check instead of naming the real contradiction, so the sections-versus-security check now runs before any environment probe. Finally, surfacing the TOML parse error detail was reverted: the error's source snippet repeats configuration values, which broke the M1 credential-redaction check, so the CLI again reports a static message.
-
-**Scope remaining:** no encryption, signing, or key management (M4), no catalog, jobs, retention, or deletion (M5), no scheduler or daemon, no off-host or remote storage, and no production-database support. Object-level selection (`pg_restore --use-list`) is not implemented; selection stops at schemas, tables, sections, and extensions. `mode = "data-only"` profiles validate but cannot be restored by this CLI, since every restore creates an empty target. A trigger function that writes to a table by name creates no catalog dependency, so excluding that table from an otherwise-valid selection is still undetectable.
-
-## 2026-09-27 — constant extraction, module splits, and the M4 hybrid post-quantum decision
-
-**Request:** Before starting M4, remove scattered literals and interpolated strings (for example the major-version message built from `info.source_major`) by giving defined values their own home and making the module structure more readable, then re-test functionality. Separately, M4 must not ship classical elliptic-curve encryption alone: record a **hybrid X25519 + ML-KEM** requirement, i.e. classical plus post-quantum together, into the roadmap steps of `project.md`.
-
-**Decisions taken with the user:** signing becomes hybrid **Ed25519 + ML-DSA-65** rather than staying classical; interop posture is "age native PQ if it works, else document it"; and M4 is split into **M4a** (hybrid encryption and key providers) and **M4b** (origin signature and artifact v1 freeze) so the container question is answered before the format is frozen.
-
-**Implemented (structure):** `backup-domain/src/protocol.rs` now owns the defined values (`DEV_FORMAT`, `FIXTURE_PREFIX`, `PLAN_FORMAT`, verification-level and section names, `SUPPORTED_MAJORS`/`SUPPORTED_MAJOR_RANGE`, `MIN_MAJOR_EXCLUDE_EXTENSION`, `ARCHIVE_FORMAT`/`ARCHIVE_COMPRESSION`, `BACKUP_STATUS`, `DIGEST_HEX_LEN`, `DEFAULT_TIMEOUT_SECONDS`, `PLAN_TTL_SECONDS`, `MAX_RESOLVED_TABLES`), and the crate was split into `config.rs`, `profile.rs`, `selection.rs`, `artifact.rs`, `restore.rs`, and a test-only `fixture.rs`. `backup-postgres` split into `tools.rs` (binary names, dump flags, psql query args, connection argv flags), `dump.rs`, `catalog.rs`, and `globals.rs`; `backupctl` into `cli.rs` and `report.rs`; `backup-local/layout.rs` gained the directory, filename, marker, and size-limit constants. Every crate root re-exports the moved items, so no consumer import path changed. Messages interpolate the constants instead of repeating them (`"…server majors {SUPPORTED_MAJOR_RANGE}"`, the 17 gate, and the plan TTL in minutes).
-
-**Implemented (roadmap and contracts):** `project.md` gained `### M4a` with a mandatory **spike first** bullet — prove whether the upstream `age` crate's native hybrid post-quantum recipient (`tagpq`, built on `ml-kem` plus `x25519-dalek`) works with a **software file identity**, including decryption by the stock `rage`/`age` CLI, with the result written into ADR 0001 — and `### M4b` for the hybrid detached signature and the v1 freeze. §7 replaced `signature.ed25519` with `signature.hybrid` plus a recorded algorithm suite, §8 cites FIPS 203/204 and RFC 10024, §28 decision 6 was rewritten and decision 10 now freezes at M4b, §9 reframed the thief threat as harvest-now-decrypt-later, §30 added the primitive-immaturity risk row, §31 added crypto agility (suite migration is rotation into a new generation, never an in-place rewrite), and M5 prerequisites became M1–M4b.
-
-**Implemented (docs):** [ADR 0001](docs/architecture/adr-0001-foundations.md) records the hybrid encryption and origin options plus a new **"Open: the age hybrid container"** section with both spike outcomes (that section was replaced by the decided outcome later the same day — see the next entry); [artifact v1](docs/backup-format/manifest-v1.md) defines `recipient_suite`/`signature_suite`, the 64 + 3309-byte `signature.hybrid` layout, suite checks in the reader order, and suite-downgrade tests; the [threat model](docs/security/threat-model.md) updated assets, T01/T02/T10, invariants, and review triggers; [ARCHITECTURE.md](ARCHITECTURE.md) updated the crypto adapter, artifact contents, product boundary, and artifact gate row; and the new [post-quantum hybrid rationale](docs/security/post-quantum-hybrid.md) explains why hybrid rather than either primitive alone.
-
-**Verification performed:** after the refactor, `cargo build -p backupctl`, `cargo test --workspace` (25 tests: 9 domain, 11 PostgreSQL adapter, 5 local store), `cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --all --check`, and `git diff --check` all pass, and `tests/m1_docker_smoke.sh`, `tests/m2_docker_smoke.sh`, and `tests/m3_docker_smoke.sh` each pass again on PostgreSQL 16, 17, and 18 with no leftover containers or store directories — those scripts assert exact CLI output, argv, plan expiry, and store layout, so they are the behavior-preservation evidence for a move-only refactor. The diff itself was reviewed line by line: the only added literals are constant references, and no message text, argv element, JSON field, or validation rule changed.
-
-**Corrections made during writing:** the initial draft of the hybrid rationale attributed the compress-before-encryption decision to M2 and claimed `pg_dump`'s archive was recompressed; both were wrong, and the text now states that compression happens inside `pg_dump`. An early asset sentence in the threat model was also garbled about which key halves matter and was rewritten.
-
-**Scope remaining:** nothing is implemented yet for M4a or M4b — the spike, `backup-crypto`, key providers, and the artifact v1 reader/writer are all still future work. No encryption or signing exists, so artifacts remain plaintext `m1-development-plaintext` and synthetic-only. The hybrid container choice is deliberately unresolved until the spike runs.
-
-## 2026-09-27 — M4a spike: age native PQ is encrypt-only, so the hybrid recipient is ours
-
-**Request:** run the M4a spike as a throwaway binary — age's `tagpq` hybrid post-quantum recipient with a software file identity, encrypted and decrypted with the crate, then decrypted with stock `rage`/`age` — and write the result into ADR 0001.
-
-**Stage 1 (`/tmp/m4a-spike`, `/tmp/m4a-probe`, `age` 0.12.1, `rage` 0.12.1):** `tagpq` cannot be used with a software identity. It exposes no `Identity` type (`cannot find type Identity in module tagpq`), no key generation (`no associated function or constant named generate found for struct age::tagpq::Recipient`), and `Recipient` does not satisfy `age::Identity`; the crate's own decrypt of a `tagpq` file returns `No matching keys found`, and stock `rage` — which had just encrypted that file happily — returns the same and exits 1. Its `postquantum` label also blocks mixing with an X25519 recipient. The honesty control: a normal X25519 age file from the same harness decrypted by `rage -d` to the expected SHA-256, so the failures are the recipient type, not the test. Roadmap option "age native PQ if it works" is closed.
-
-**Direction changes during the spike:** the operator asked for a standard encryption library and accepted P-256 once it was explained, then chose an own hybrid KEM carried by age's stream with **X25519** as the classical half, then chose **X-Wing** via the RustCrypto `x-wing` crate. That last choice was reversed after verification: `draft-connolly-cfrg-xwing-kem-11` is an individual submission with no WG adoption, revised four days earlier, and `x-wing` 0.1.0 is unaudited ("USE AT YOUR OWN RISK"). Final decision: our own recipient combining **ML-KEM-768 first, then X25519**, per RFC 10024's ordering rule. No registered HPKE KEM id exists for that pairing, which is what makes a custom combiner unavoidable once X25519 is chosen.
-
-**Stage 2 (`/tmp/m4a-hybrid`, delegated then reviewed line by line):** FEASIBLE. Stanza tag `mlkem768x25519`, one base64 arg carrying the 1120-byte encapsulated key, HPKE-wrapped 16-byte age file key, everything else age's own stream. 8 MiB → 8,392,405 bytes (overhead 3,797 B ≈ 1.7 KB fixed + 16 B per 64 KiB chunk) at ~585 MiB/s both directions, byte-exact. Fail-closed verified: stanza-body flip → `Header MAC is invalid`, payload flip and truncation → `decryption error`, wrong identity → `Header MAC is invalid`; three unit tests cover seed determinism, exact 1216/1120 lengths with ±1-byte rejection, and HPKE open under a foreign key. Stock `rage` rejects our key files in both directions, so v1 artifacts are `backupctl`-only.
-
-**The finding that became a rule:** the recipient claims no age label, so age accepts a mixed `[x25519, mlkem768x25519]` header and **either identity decrypts alone** — a classical-only recovery recipient is one config flag away and would cancel the harvest-now-decrypt-later protection. Writer and reader must allow exactly one hybrid stanza. Recorded as a threat-model invariant, an artifact-contract rule, and an ADR consequence.
-
-**Review corrections (spike code is throwaway; these are M4a requirements):** the combiner follows RFC 10024's *ordering* but is not RFC 9180's bare `Extract(salt = 0, ss1‖ss2)` — it binds both X25519 public keys with a versioned salt, which the docs now state as an explicit deviation; `0x00FF` is not a "private-use" KEM id (RFC 9180 defines no such range) and is only a local domain separator; age 0.12.1 performs no small-order X25519 check, contrary to a comment in the spike; the identity seed is not zeroized on drop and base-mode-only is an `assert!` rather than a typed property.
-
-**Files changed:** [ADR 0001](docs/architecture/adr-0001-foundations.md) — the open-container section replaced with the spike decision, evidence and review findings, plus new decision rows and consequences; [artifact v1](docs/backup-format/manifest-v1.md) — stanza wire format, combiner definition, hex keys and `rage` divergence, one-stanza enforcement in writer/reader order, `recipient_suite` value `mlkem768x25519-v0`, extended test list; [hybrid rationale](docs/security/post-quantum-hybrid.md) — container closed, two consequences of the choice, measured cost, unaudited-combiner limit; [threat model](docs/security/threat-model.md) — T01 names the suite, new single-stanza invariant; `project.md` — M4a spike bullet marked complete with results, tests/acceptance/pitfalls updated, suite naming in §7 and §28; `ARCHITECTURE.md` — crypto adapter names the recipient type and its non-`rage` interoperability. No Rust code was added or changed; the repository tree outside documentation is untouched.
-
-## 2026-09-28 — M4a: the `backup-crypto` crate
-
-**Request:** start M4a with the reviewed design — the `backup-crypto` crate, the spike's tests re-implemented inside the repository, plus the two review corrections that were load-bearing (zeroize the identity seed, make HPKE base-mode-only a typed property rather than an `assert!`).
-
-**Implemented:** `crates/backup-crypto` with four modules. `protocol.rs` holds the wire vocabulary that is observable outside the process (stanza tag, suite names, HPKE `info`, combiner salt, key and stanza sizes, key-file marker, permission mask, plaintext cap) with a test that pins the documented sizes. `kem.rs` implements `MlKem768X25519` as an `hpke::Kem`: 32-byte seed expanded through `SHAKE256` labeled derivations, ML-KEM-768 first then X25519 per RFC 10024's ordering, combiner `HKDF-SHA256-Extract(salt, ss_pq ‖ ss_x ‖ ct_x ‖ pk_x)`, exact 1216/1120-byte (de)serialization, and `encap`/`decap` that take no sender-key argument at all — authenticated mode is absent by construction, not by assertion. The seed lives in a `Zeroizing` wrapper, `PrivateKey` has no derived `Debug` or `PartialEq` that could print it, and `HpkeError` (which is not a `std::error::Error`) is converted at every boundary. `recipient.rs` provides `HybridRecipient`/`HybridIdentity` for the age extension joint, emitting one `-> mlkem768x25519 <base64>` stanza with an empty label set and failing closed on every malformed input. `keystore.rs` adds the `IdentityProvider`/`RecipientProvider` ports and a `KeyFile` provider that loads service-owned key files from outside the artifact store: regular non-symlink, size-capped, suite-marker-first, exactly one key line of the exact hex length for the requested role, identity files refused unless mode permits only the owner, creation that never overwrites, and a `status` that reports only public facts. `stream.rs` streams plaintext in and ciphertext out with no whole-archive buffering, enforces the plaintext cap while writing rather than after, and returns the byte count plus the suite a manifest records.
-
-**The finding that changed the design:** five stream tests failed with `Header is invalid` on artifacts this crate had itself written. `age`'s `HeaderV1::new` appends a random `*-grease` stanza to every header it writes unless the header holds an scrypt recipient, which ours never does. The documented invariant had been written as "exactly one stanza per artifact", a rule that rejects every real age file. The enforcement is now **exactly one recipient stanza**: the `mlkem768x25519` one, plus at most the grease stanza, recognised by its `-grease` tag suffix and by every tag and argument passing `age_core::format::is_arbitrary_string`; any other tag is refused. A test draws 64 real grease stanzas to confirm the tolerance, and separately proves the tolerance cannot be abused by a disguised tag: `x25519::Identity` returns `None` for a stanza tagged `X25519-grease`, so accepting that shape hands no key to the classical recipient. The wording in the artifact contract, threat-model invariant, ADR consequences and roadmap DoD is corrected to match.
-
-**Verification performed:** `cargo fmt -p backup-crypto`, `cargo clippy -p backup-crypto --all-targets` clean, and `cargo test --workspace` at 53 passing tests — 28 in `backup-crypto`, covering deterministic seed expansion, ±1-byte rejection on both key types, combiner dependence on every component including ordering, base-mode refusal as an error rather than a panic, every stanza-shape refusal, key-file permission and format rejections, create-never-overwrites, `status` leaking nothing secret, byte-exact round trips across age chunk boundaries (0, 1, 64 KiB ± 1, 200000), the ciphertext overhead staying in the measured band, tampering and truncation failing before anything writable appears, the plaintext cap bounding the actual write, the mixed `[x25519, mlkem768x25519]` header being readable by the classical identity alone and refused by ours, and an unfinished stream not being a backup. The M1–M3 Docker matrices were not re-run because no code path they exercise changed: nothing outside the new crate imports it yet.
-
-**Scope remaining for M4a:** encryption is not yet wired into `backup-application`/`backup-local`, so artifacts are still plaintext and `m1-development-plaintext` remains the recorded suite; `recipient_suite` is not yet written into a manifest; there is no `key status` CLI command or key generation command; the stock-`rage` divergence is documented and tested at the crate level but not yet a golden CLI assertion; and the key-loss and rotation drill is still a procedure to write and run.
-
-## 2026-09-28 — M4a: the encrypt/decrypt stream wired into the write path
-
-**Request:** wire the `backup-crypto` stream into the backup write path — `pg_dump` straight into age, plaintext never in the store, `recipient_suite` recorded in the manifest — without forcing encryption on deployments that do not want it yet.
-
-**Decisions taken with the user:** `dump_stream` was added to the `DatabaseAdapter` port rather than giving the adapter a file path, because the dumper's standard output is the only place the archive exists before the store decides its format; and encryption is **opt-in per store** — no `[encryption]` block keeps writing the `m1-development-plaintext` layout the M1–M3 matrices assert, so there is no flag an operator can forget on a single run, and a store that opts in cannot silently emit plaintext.
-
-**Implemented:** the sink ports (`payload_sink`/`globals_sink` returning `Box<dyn PayloadSink + 'a>` bound to the stage's lifetime, since finishing a sink seals the stage it borrowed), `dump_stream`/`dump_globals_stream` replacing the file-writing `dump_to`/`dump_globals`, and `run_streaming` in the PostgreSQL adapter: the child is spawned with a pipe, a watchdog thread polls `try_wait` and enforces the deadline, dropping the read end makes a still-writing tool die on `EPIPE`, and the consumer's own error is reported before the tool's exit status so a refused sink is never blamed on `pg_dump`. `backup-local` became the crypto boundary: `LocalStore::with_keys` loads both key files before it touches the root and refuses a mismatched pair, `begin` no longer pre-creates payload files, stage sinks open `create_new` 0600 and write either plain or age, `publish` refuses a stage whose stream was never finished, and reads go through a `PlaintextView` that decrypts into a transient mode-0700 `scratch/` directory — removed on drop, purged at startup, bounded by the manifest's `payload_plaintext_bytes`. Which view an artifact gets is driven by `manifest.format`, not by the current configuration, so a keyless store can still read its own plaintext artifacts and an encrypted store never exposes `payload.dump`. The manifest records `m4a-development-age`, `recipient_suite = mlkem768x25519-v0` and the plaintext byte count; `backupctl` gained `open_store`, and the globals warning is gated on plaintext mode because a sealed `globals.age` needs no warning.
-
-**Verification performed:** `cargo fmt --all`, `cargo clippy --workspace --all-targets -- -D warnings` clean, `cargo test --workspace` at 67 passing tests — 9 in `backup-local` (unfinished stream, encrypted stage publishes ciphertext only, stray plaintext sibling refused, keyless store cannot decrypt, mismatched pair refused before creation), 4 new streaming tests in `backup-postgres` (a stream larger than the capture bound, a refusing consumer as the reported failure, a stalled producer killed at the deadline, stderr refusing the whole stream), and `crates/backup-local/tests/write_path.rs`, which composes the real service against a stub engine to assert that an encrypted backup leaves no plaintext anywhere under the storage root and that every tool-boundary read is a scratch file, while the same call without key files writes the M1 layout and opens no `scratch/`. The M1, M2 and M3 Docker matrices all still pass on PostgreSQL 16, 17 and 18, which exercises the new streaming write path and the new plaintext views against real `pg_dump`, `pg_restore` and `psql`.
-
-**Scope remaining for M4a:** the encrypted path has no end-to-end proof against real PostgreSQL tools yet, because there is still no `key generate` CLI to put key files in a container; `key status`, the key-loss recovery and rotation drill, and the stock-`rage` divergence as a golden CLI assertion are open; and the artifact is still unsigned, so M4b must land before any real-data artifact is published.
-
-## 2026-09-28 — M4a: `key generate` and `key status`
-
-**Request:** add the two key commands M4a's API surface still lacked, so an operator can create and confirm the hybrid key pair this CLI needs.
-
-**Decisions taken with the user:** the commands take **no path arguments** — they act on the `[encryption]` block of the configuration and nothing else. The chosen tradeoff: an operator cannot generate a key the configured store would refuse, and `Config::validate`'s rules (absolute paths, outside the artifact store) apply to the write path for free; the cost is that bootstrapping means writing the TOML first, and a rotation to a new generation means editing the configuration before generating into it.
-
-**Implemented:** `backup_local::{generate_key_pair, key_status}` next to the store that owns key files, so `backupctl` still imports no crypto crate and the store remains the crypto boundary; `backup-crypto`'s `KeyStatus` is re-exported from `backup-local`. `with_keys` and `key_status` now share one `load_pair` helper, so a mismatched pair is refused with identical words whether it is opened by a backup or inspected by an operator. Generation checks both paths with `symlink_metadata` before writing either: a dangling symlink counts as occupied, and an identity whose recipient was never published would be a key nobody can encrypt to. `key status` prints suite, both paths with their permission bits, and a 32-character fingerprint of the recipient the pair shares; `--output json` carries the full public key.
-
-**Verification performed:** `cargo fmt --all`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace` at 69 passing tests, including two new store tests (a generated pair reports the public recipient at 0600/0644 and opens `with_keys`; an occupied path — either half — is refused before the other half is written). Manually, against generated key files: `key generate` wrote the pair with the expected modes, a second run refused with `refusing to overwrite the existing key file`, `key status` on a config with no `[encryption]` block named that as the reason, a pair mixing two identities failed with `recipient key file … is not the recipient of identity key file …`, a key path inside the storage root was refused before anything was written, and the identity seed extracted from the key file appeared in none of those outputs in either format.
-
-**Scope remaining for M4a:** an end-to-end encrypted smoke run against real PostgreSQL tools is now unblocked (key files can be created in the container), and the key-loss recovery and rotation drill is still a procedure to write and run; the artifact remains unsigned until M4b.
-
-## 2026-09-28 — M4a: `key generate` creates its parent, and the encrypted matrix runs end to end
-
-**Request:** the encrypted Docker smoke — `key generate` → backup → assert no plaintext in the store → verify → DR restore → decrypt only in scratch.
-
-**Implemented:** `tests/m4a_docker_smoke.sh`, and one CLI change it forced. The first draft configured keys under a directory that did not exist yet, which is the normal first run on a new host, and `key generate` answered a bare `No such file or directory`; `generate_key_pair` now builds missing parent directories at mode 0700 with `DirBuilder::recursive`, on the reasoning that the directory holding an identity is private in its own right, with `generation_creates_a_private_parent` covering it.
-
-**How the proof works:** each PostgreSQL client in `client_bin_dir` is a `/bin/sh` wrapper that appends its argv and, for every absolute file argument, that file's first five bytes in hex, before exec'ing the real tool inside the container. `assert_reads` then requires that every such read is a `5047444d50` PGDMP archive and that its path is under the allowed prefix — for the encrypted store `data/scratch/` and nothing else, for the keyless control the store tree, where staging is legitimately inspected before publication. That turns "the tool boundary only ever sees plaintext" from a claim into a checked fact, and the absence of a read is a failure rather than a pass.
-
-**What the run asserts:** status before generation names the missing identity file; a key path inside the storage root is refused with nothing written; the pair generates into a private new parent, a second run refuses, and JSON status reports the suite, 0600/0644, a 2432-character recipient and both files agreeing; a stranger's recipient paired with our identity is refused; a backup writes exactly `payload.age`, `globals.age`, `manifest.json` and `complete`, the payload starts with `age-e`, `size_bytes` exceeds `payload_plaintext_bytes` because age does not compress, and no dump tool is ever handed `--file`; `backupctl_fixture_alice`, `fake-verifier-for-tests-only`, `SCRAM-SHA-256` and the extracted 64-character seed appear in no stored byte and no CLI output in either format, with `staging/` and `scratch/` empty after each run; checksum verification invokes no tool at all; DR restore replays into a rebuilt cluster and the artifact reaches `restore-tested` while its payload is still an age stream; a bit flip dies at `payload checksum or size mismatch`; a truncation dies at the stream; and the same store without `[encryption]` writes the M1 layout, where the same grep does find `backupctl_fixture_alice` in `globals.sql`.
-
-**The finding that changed a test:** the draft swapped the payloads of two artifacts encrypted under the *same* recipient and expected age to refuse them. It does not: both streams are authentic under that recipient, so with the manifest digests rewritten to match the bytes the swap verifies cleanly. age authenticates a stream, not which of this deployment's backups it came from, and `project.md` already assigns artifact-swap rejection to M4b signing. The step now uses ciphertext from a second key pair, which the identity genuinely cannot open, and the same-recipient case is documented as not claimed rather than asserted in either direction.
-
-**Verification performed:** the matrix passes on PostgreSQL 16, 17 and 18 (three containers per major, source on an isolated network, target on a fresh port with the test root bind-mounted at the same absolute path). `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings` and `cargo test --workspace` (70 tests, the new one being `generation_creates_a_private_parent`) were clean before the run, and only the shell script and documentation changed after them. The M2 and M3 matrices were not re-run in this increment.
-
-**Scope remaining for M4a:** the key-loss recovery and rotation drill, and the stock-`rage` divergence as a golden CLI assertion. M4b signing must land before any real-data artifact is published.
-
-## 2026-09-28 — M4a: the key lifecycle procedure, and the drill that found a leak
-
-**Request:** write the key-loss recovery and rotation procedure, then run it — the last item on the M4a list.
-
-**Design decision:** a **generation** is one key pair plus the configuration that names it, so rotation means a new key directory and a new config file rather than a rewritten key. This fell out of what was already built instead of adding to it: `key generate` refuses an occupied path, and `LocalStore` loads exactly one pair, so nothing in the codebase can present two generations at once. The alternative considered was an identity *list* in `[encryption]`, which would let one config read a whole store's history; it was declined because it is ergonomics the M5 catalog is meant to own, and it changes a config shape every example file and test asserts. The user asked that keeping one's own secret stay optional; that is what the generation model gives — the pair is a file you point at, not a value the tool holds.
-
-**Implemented:** `docs/security/key-lifecycle.md` (generation model, where the files live, the per-generation ledger, the offline copy, rotation, restoring an older generation, one copy lost versus every copy lost, and what M4a does not provide) and `tests/m4a_key_drill.sh`, which executes that document against real `pg_dump`, `pg_restore` and `psql` on PostgreSQL 16, 17 and 18.
-
-**The leak the drill found:** the run asserts that a refused read leaves `staging/` and `scratch/` empty, and it failed on a *successful* earlier step. `decrypt_to_scratch` created the scratch directory and its `payload.dump`, ran the decryption, and only then constructed the `LocalPlaintext` whose `Drop` removes the directory — so any decryption that failed (wrong identity, or a stream inflating past the recorded plaintext bound) returned its error with a half-written plaintext file still sitting in the storage root. The view now takes ownership of the directory before a single byte is decrypted, and `a_refused_decryption_leaves_no_scratch_behind` publishes an artifact under one pair and reads it with an unrelated pair, asserting the scratch directory is empty afterwards. The startup purge already swept such a directory after a crash, which is why six earlier encrypted tests never saw it: every test they wrote covered the success path.
-
-**What the drill proves, in order:** the offline copy is taken with modes preserved before anything rotates; `key generate` refuses to overwrite the pair it is replacing, so rotation cannot be destructive; generation 2 reports a different recipient than generation 1; both artifacts sit in one store and each configuration refuses the other's artifact at `--level archive`, so the separation is the header, not the directory; deleting the live identity makes *every* command through that configuration fail before it reads the store, including `backup inspect`, because the pair is loaded first; a recovered copy left world-readable is refused until `chmod 600`, which is why the copy step uses `-p`; the generation 1 artifact then restores into a fresh cluster configured only by the offline copy, with the tool reading nothing but `scratch/`; and when the offline copy is deleted too, the manifest is read directly to show the ciphertext still hashes to the recorded digest and is unreadable — the honest shape of total key loss is inert bytes, not corruption, and the current generation is untouched by it.
-
-**A limitation the drill surfaced:** an operator-supplied identity file is loaded happily — writing a seed by hand and running `key status` parses it and derives its recipient — but `key generate` is the only command that publishes a recipient file and it refuses an occupied identity path, so there is no CLI route to "keep this identity, tell me its recipient". Documented as a gap rather than worked around, because publishing a recipient from a hand-written identity is a small new command and inventing a file-editing procedure in the meantime would be the unsafe advice. That gap is closed by `key publish`, below.
-
-**Verification performed:** `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace` at 71 passing tests (13 in `backup-local` including the new one), `tests/m4a_docker_smoke.sh` re-run green on 16, 17 and 18 after the store change, and `tests/m4a_key_drill.sh` green on all three majors. The M2 and M3 matrices have still not been re-run since the encrypted write path landed.
-
-**Scope remaining for M4a:** the stock-`rage` divergence as a golden CLI assertion, and a decision on whether a command that publishes a recipient from an existing identity belongs in M4a or M5. M4b signing must land before any real-data artifact is published.
-
-## 2026-09-28 — M4a: `key publish`, so a secret can stay the operator's own
-
-**Request:** close the custom-secret gap the drill surfaced — derive and write the recipient half from an existing identity file.
-
-**Why in M4a:** the generation model already treats the pair as "a file you point at", and the user asked twice that keeping one's own secret stay optional. Without a publish command that option was only true for a key `backupctl` generated, because the writing side needs the recipient half and only `key generate` could produce one.
-
-**Implemented:** `backup_local::publish_recipient(identity_file, recipient_file)` beside the store that owns key files, so `backupctl` still imports no crypto crate. It checks the recipient path is free, then **loads the identity with `KeyFile::load`, the store's own loader**, and only then writes the public half. The order is the whole design: a seed that is world-readable, symlinked, or missing the suite marker is refused before anything is written, so the CLI never publishes a recipient for a key it would later refuse to restore with. The identity is opened read-only and never rewritten — editing a seed is the one action that makes every artifact sealed under it permanently unreadable. `refuse_occupied` and `ensure_private_parent` were extracted out of `generate_key_pair` so both commands share one definition of "free path" and "private directory". `KeyCommand::Publish` and the `main.rs` arm are the only CLI surface.
-
-**Tests:** three store tests — `publishing_writes_the_recipient_of_a_hand_written_identity` (fixed seed, asserts the identity bytes are unchanged afterwards, modes 0600/0644, a 2432-character recipient, and that `LocalStore::with_keys` then opens the pair), `publishing_refuses_an_occupied_recipient`, `publishing_refuses_an_identity_the_store_would_not_open` (a 0644 identity leaves no recipient file behind). `backup-local` now has 16 library tests and the workspace 74.
-
-**End-to-end proof:** step 8 added to `tests/m4a_key_drill.sh`: it writes an identity by hand from a fixed seed, shows `key status` refusing the pair while the recipient half is missing, publishes, `sha256sum`s the identity to show publishing read it without touching it, checks the recipient arrived at 0644, confirms a republish is refused, and then takes a backup, verifies it at `--level archive`, and portably restores it into a new cluster — all under a key pair the CLI did not generate. It also asserts the derived recipient is not generation 2's, so the public half came from this seed and not from the store's last pair. The seed is added to the drill's secret greps, which cover the store tree, every JSON and every captured stderr, so the run shows it reaching no stored byte and no command output. Green on PostgreSQL 16, 17 and 18.
-
-**Verification performed:** `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace` at 74 passing tests, `tests/m4a_docker_smoke.sh` re-run green on all three majors (required, since `backup-local` changed), and the drill green on all three. Docs updated: the "identity you did not generate" section of `docs/security/key-lifecycle.md` is now a supported procedure instead of a documented gap, and its limits list lost that bullet; `README.md` and `config/m4a.example.toml` name `key publish`.
-
-**Scope remaining for M4a:** the stock-`rage` divergence as a golden CLI assertion. M4b signing must land before any real-data artifact is published.
-
-## 2026-09-28 — M4a closed: the operator guide, and the limits it forced into words
-
-**Request:** close M4a — a commit-ready summary of its limits — then move to M4b signing design.
-
-**Why a guide rather than a status line:** M1, M2 and M3 each end with an operator-facing document in `docs/development/`, and M4a was described only across `ARCHITECTURE.md`, the key lifecycle procedure and the roadmap status. A summary written to be *read before trusting the tool* has to say what is not proven as loudly as what is, so it got its own file: `docs/development/m4a-encryption.md` (requirements, commands, a before/after table for what configuring `[encryption]` changes, a claims-to-evidence table, limitations, validation).
-
-**Re-running what the close depends on:** `tests/m2_docker_smoke.sh` and `tests/m3_docker_smoke.sh` were both re-run against PostgreSQL 16, 17 and 18 and pass unchanged — the last standing caveat from the encrypted write path. A keyless store still writes and restores exactly the M1–M3 layout, which is the regression these two runs exist to catch.
-
-**Two limits the writing exposed, both true of the code and neither previously stated:**
-1. A host that may only *write* backups still needs the identity file present. The key docs and the example config both said the two halves were configured separately so a backup host could hold only the recipient, but `LocalStore::with_keys` loads the pair before it touches the storage root, and the drill already proves what that means when the identity is missing: every command through the configuration is refused. Rather than let the sentence describe a topology nobody can deploy, both `docs/security/key-lifecycle.md` and the guide now state the limit and name the port split as the way it eventually gets fixed.
-2. `manifest.json` is plaintext JSON sitting beside the ciphertext, so the database name, resolved scope, timings, client versions and digests are not confidential in an M4a artifact. This is what [artifact v1](docs/backup-format/manifest-v1.md) already prescribes for the frozen format (`manifest.age` plus a bounded `public.json`), so it is an M4b/M1-shape consequence rather than a defect — but it is the limit an operator most needs before putting anything real in the store, and it was documented nowhere.
-
-**M4a close decisions:** the acceptance criteria are met in full — plaintext never enters the published store, wrong key/tampering/truncation fail before restore, the recipient suite and parameter set are recorded, decryption key recovery is drilled, and exactly one hybrid recipient stanza is enforced by the writer. The one item still open is the *test surface*, not the behavior: the stock-`rage` divergence is enforced by repository-level recipient tests but not yet as a golden CLI assertion. It moves to M4b with the rest of the interoperability fixture, because a golden CLI assertion belongs to a format that stops changing at M4b, and writing it now would freeze the M1 directory shape one milestone early.
-
-**Verification performed:** `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace` at 74 passing tests, M1/M2/M3/M4a-smoke/M4a-drill runs green on 16, 17 and 18. `project.md` marks M4a closed and links the guide; `README.md` links it and states the two new limits in its own summary line.
-
-## 2026-09-28 — M4b: the signing spike, and the decision to freeze v1 in one step
-
-**Request:** after closing M4a, design M4b. The operator accepted a spike first, then chose **full v1 in one step** over signing the current development shape.
-
-**Why the spike was not optional:** four things could not be read off the documentation — whether the hybrid signature is really the 3373 bytes the contract fixes, whether a signing key can be a raw seed like the age identity, whether secret wiping happens without asking for it, and whether the crate implements final FIPS 204 or the older round-3 encoding. The last one was the dangerous case: ML-DSA-65 was 3293 bytes before finalization, and the reader is designed to *derive* the expected signature length from the recorded suite.
-
-**Measured in `/tmp/m4b-hybrid-sign`:** `signature.hybrid` = 64 + **3309** = **3373**, so the contract's number stands. An ML-DSA-65 verifying key encodes to **1952** bytes and `SigningKey::from_seed`/`to_seed` round-trips a **32-byte** seed. `Signer::sign` is deterministic on both crates, so no entropy is needed to sign and a golden vector is possible. Secret wiping is **feature-gated**: `ml-dsa` does not implement `ZeroizeOnDrop` unless the `zeroize` feature is on, so the spike asserts the trait bound at compile time — a future feature removal breaks the build instead of silently dropping a security guarantee the operator named as mandatory. Mutating the signature at its first, middle, last and last-minus-eighth byte, signing a truncated tuple, and flipping an Ed25519 byte were all refused.
-
-**Dependency facts:** `ed25519-dalek` must be pinned at **2.2**, because 3.0 resolves `curve25519-dalek` 5.0 while `age`/`x25519-dalek` already lock 4.1.3 — pinning 2.2 keeps one copy of the curve in the binary. `ml-dsa` must stay `>= 0.1.1` for GHSA-5x2r-hc65-25f9 (hint-region malleability, fixed in `0.1.0-rc.4`).
-
-**Decision recorded:** [ADR 0002](docs/architecture/adr-0002-artifact-v1-and-signing.md). The reason option C was rejected is worth its own sentence: the signed tuple hashes `manifest.age`, so signing the plaintext `manifest.json` first would mean the freeze changes the signature input, and the contract treats a signature-input change as a new format version. The ADR also names the one place where authentication is indirect: `globals.age` is not in the tuple, and is bound through `globals_sha256` inside the signed manifest, which the store already checks.
-
-**Also from this discussion:** the operator set three conventions — deterministic signing, signing keys as raw-seed files like the M4a identity, and zeroization treated as mandatory rather than best effort. Three design choices remain open in the ADR (`[signing]` custody layout, derived versus configured key ids, whether unsigned M4a artifacts stay readable) and are listed with proposed defaults rather than decided silently.
-
-## 2026-09-28 — M4b task 1: the hybrid signer, and the key-file rules it inherited
-
-**Request:** accept the four remaining ADR defaults and start task #27 — the hybrid
-Ed25519 + ML-DSA-65 signer and verifier in `backup-crypto`.
-
-**What landed:** `crates/backup-crypto/src/signing.rs`. `HybridSigner` / `HybridVerifier` /
-`HybridSignature` over the contract tuple, `SigningKeyFile` with `load`, `create_signing`
-and `write_verifying`, and `SigningProvider` / `VerifyingProvider` ports mirroring the
-encryption side. The signing key file is marker + **128 hex** (Ed25519 seed ‖ ML-DSA-65
-seed, two independent 32-byte values); the verifying file is marker + **3968 hex**
-(32-byte Ed25519 key ‖ 1952-byte ML-DSA-65 key), so both families stay two-line files whose
-role is decided by length and marker, never by shape guessing.
-
-**The refactor the milestone forced:** a signing seed needs every protection an identity
-seed has — mode 0600, regular non-symlink, size cap, marker, exactly one line of exactly
-the right length — and a second copy of that sequence is how one family gets a weaker check
-than the other. So `keystore.rs` now exposes crate-internal `KeyFileRules` (label, marker,
-hex length, secret, size-message noun, suite) and `read_key_line` / `write_key_file` take
-rules instead of a `KeyRole`. `KeyRole` and `SigningRole` each map to two rule constants.
-Every existing error string is byte-for-byte what it was, which is what let the M4a drill
-pass untouched; `an_identity_file_is_not_a_signing_file` pins the cross-family refusals in
-both directions.
-
-**Three things only the implementing pass found:**
-1. `ed25519_dalek::VerifyingKey::from_bytes` does **not** reject a small-order key — it only
-   requires the bytes to decompress to a point, and the all-zero encoding does. The weak-key
-   rejection lives in `verify_strict`, i.e. at verify time. `HybridVerifier::from_bytes`
-   therefore calls `is_weak()` explicitly, so a hand-written verifying key file that could
-   verify nearly any message is refused when it is installed.
-2. The other half cannot be validated that way at all: FIPS 204 `pkDecode` accepts every
-   1952-byte string. So within this suite the only malformed verifying key a file can carry
-   is a classical one — which is worth knowing before anyone writes a "reject invalid PQ
-   keys" test that has no such input to feed it.
-3. The spike's claim that `ml-dsa`'s graph is disjoint from age's was wrong. The workspace
-   lock now resolves `signature` 3.0 beside age's 2.2, `sha2` 0.11 beside 0.10.9 and
-   `hybrid-array` 0.4 beside 0.2. `curve25519-dalek` (4.1.3) and `zeroize` (1.9.0) stayed
-   single, which is what the pin existed to protect. The trait-version split has a code
-   consequence: the two `Signer` traits are different types, so each leg is called by
-   qualified path rather than imported. ADR 0002's dependency row now says all of this.
-
-**Determinism, made a test:** `golden_signature_vector_is_stable` fixes a key
-(`0x11` seeds), the tuple, and the resulting signature's first 16 bytes plus the SHA-256 of
-all 3373 bytes. It passes twice in a run and across runs because neither scheme consults an
-RNG at sign time; the values are only ever to be re-derived by publishing a new suite name.
-
-**Verification performed:** `cargo fmt --all --check`, `cargo clippy --workspace
---all-targets -- -D warnings` clean, `cargo test --workspace` at **87 passing tests** (up
-from 74; 14 of them in `signing`, covering exact length, one-half-only refusal, mutated
-signature at six offsets, wrong signer, wrong tuple, mode/symlink/marker/length refusals,
-no seed in `Debug` or errors, and the compile-time `ZeroizeOnDrop` bounds).
-`tests/m4a_key_drill.sh` re-run on PostgreSQL 16, 17 and 18 and green, which is the evidence
-that the shared key-file refactor changed no behavior the operator-facing procedure depends
-on. No artifact format changed yet: the v1 writer is task #30.
-
-## 2026-10-01 — M4b: artifact v1 is written, signed, and refused before anything is restored
-
-**What landed.** `backup-domain` gained the v1 record types (`ArtifactManifest`,
-`PublicHeader`, `RequestedSelection`), `source_fingerprint`, UTC formatting for the two
-timestamps, the `whole-database` and fingerprint domain constants, and the optional
-`[signing]` block. `backup-local` became the v1 writer and the signature-first reader:
-`payload.age`, optional `globals.age`, `manifest.age`, a 3373-byte `signature.hybrid`,
-a bounded `public.json`, then `complete`, with discovery, verification and listing all
-possible from `public.json` alone. `backup-application` and `backupctl` put that shape in
-front of an operator: `key generate|publish|status` now act on `[signing]` as well as
-`[encryption]`, `backup verify` takes `--level signature`, `backup inspect` reads a v1
-record out of the authenticated ciphertext, and `restore plan` authenticates before it
-binds a source.
-
-**Three things only writing the code forced into the open.**
-1. `archive_toc_sha256` is recorded when the artifact is written, not when it is verified.
-   `docs/artifact-contract.md` §3.2 says a manifest at `verification_level: none` carries no
-   table of contents, but a signed manifest cannot gain a fact later without changing what
-   its signature covers, so archive level compares against the write-time digest and refuses
-   an artifact that recorded none. §3.2 gets the reconciliation when #33 freezes the format.
-2. A v1 dump that names no profile still records a scope, under a reserved synthetic name.
-   The manifest is the only record of what was selected, and a missing one is
-   indistinguishable from a filtered dump that claimed otherwise.
-3. `restore run` on a signed artifact reports `recorded_in_artifact: false`. Replaying the
-   archive is exactly what `restore-tested` means, but writing it into the artifact needs
-   the signing key a DR host does not hold — and re-signing an artifact this host produced
-   nothing about would attribute it to a host that did.
-
-**A rule enforced in the wrong type, found by the test that first wrote a v1 artifact.**
-`whole-database` was refused by `Profile::validate`, and `ArtifactManifest::validate`
-re-validates the snapshot it signs, so `BackupService::create` on a signed store refused its
-own manifest: `profile name whole-database is reserved for a dump that names no profile`.
-The rule is about *configuration*, so it now sits in `Config::validate`'s profile loop and a
-snapshot the writer builds stays a valid `Profile`. `crates/backup-local/tests/signed_write_path.rs`
-is what caught it; the four tests it added are the composed v1 path — the six files and the
-signed facts a reader cannot forge, all three verification levels passing with signature
-level touching no tool and decrypting nothing into `scratch`, one bit flipped in the
-ed25519 half refusing every level *and* the plan while `CREATE DATABASE` stays un-called,
-and an artifact whose recorded source fingerprint no longer matches the configuration
-refused at planning. The control run is in the same test on purpose: the empty list is only
-evidence after the same stub demonstrably created a database for an intact artifact.
-
-**Shared fixtures.** `write_path.rs`'s stub adapter, capture and key/config helpers moved to
-`tests/common/mod.rs`, which the two composed-path tests share; the capture now also records
-every `CREATE DATABASE` it is asked for, and `signed_store.rs` uses the same `Keys`,
-`artifact_dir` and `failure` helpers rather than a third copy.
-
-**Verification performed:** `cargo fmt --all --check` clean, `cargo clippy --workspace
---all-targets -- -D warnings` clean, `cargo test --workspace` at **128 passing tests** (up
-from the 87 logged at the signing-crypto increment; 24 of them in `backup-local`'s two
-signed integration files). No Docker matrix was run for this increment, so nothing here
-claims M4b acceptance: the PG 16/17/18 sign/verify/DR runs, the signing half of the key
-drill and the stock-`rage` golden CLI assertion are task #32, and artifact v1 is not frozen
-until they are green.
-
-## 2026-10-01 — M4b: matrices run, artifact v1 frozen
-
-**What landed.** `tests/m4b_docker_smoke.sh` (new) writes and signs a v1 artifact on
-PostgreSQL 16, 17 and 18, verifies it at `signature`/`checksum`/`archive`, DR-restores it into
-a cluster whose store is configured with a verifying key and **no** signing key, and then
-feeds that store twelve tampered variants. `tests/m4a_key_drill.sh` gained steps 9–11 for the
-signing pair. The documentation freeze followed the run: ADR 0002 is **accepted** with its
-validation items marked as executed, `docs/backup-format/manifest-v1.md` is **frozen** with
-its field list reconciled against `ArtifactManifest`/`PublicHeader`, `docs/security/key-lifecycle.md`
-covers both pairs and the writer/reader custody split, and the threat model, ARCHITECTURE,
-README, `project.md` and the M4a guide stopped claiming the M4a state.
-
-**Four bugs the run found in the tests, not in the code.**
-1. `grep -q "a [signing] block requires an [encryption] block"` is a **BRE bracket class**, so
-   the character set matched single characters and the assertion passed vacuously; now
-   `grep -qF`.
-2. Three assertions grepped a refusal sentence the CLI does not print ("not written by the
-   holder of the configured signing key"). The real context string is
-   `origin signature of artifact {id} does not verify`, which is what they now match.
-3. The `payload.age` stanza parser kept a trailing newline in each stanza token, so
-   `endswith(b"-grease")` missed the randomly named grease stanza and a *fresh, valid*
-   artifact failed the single-recipient assertion. The parser now reads only the header block
-   up to the `\n\n` terminator and splits on whitespace.
-4. In the drill, `cat <<SIGNING` without `>> "$out"` wrote a configuration fragment to
-   standard output, and a bare `echo` leaked a blank line into the store's plaintext sweep
-   target; both now append to the config file.
-
-**Two limits the freeze records instead of smoothing over.** A `public.json` downgraded to
-`signature_suite: "ed25519"` still **passes** `--level signature`, because the signed tuple
-covers the backup id and the two ciphertext digests and nothing else; the lie is caught one
-step later against the authenticated manifest, which `--level checksum`, `--level archive` and
-`restore plan` all reach. Case 6.11 asserts the pass as well as the refusal so neither half
-can be quietly reinterpreted. And a missing `complete` marker is refused before any crypto
-work but reports the bare `No such file or directory (os error 2)` from the stat rather than a
-contract sentence naming the marker — case 6.7 pins the position of the refusal, and the doc
-now says an absent component speaks in errno.
-
-**What the run also corrected in the written contract.** `signature.hybrid` is not "sized from
-the recorded suite": `HybridSignature` is a fixed 3373-byte array, so a foreign suite claim
-cannot make the reader accept a shorter signature — stricter than the ADR said, and now
-written as implemented. `archive_toc_sha256` is recorded at write time from the staged archive
-(the field's doc comment claimed otherwise), which is what lets archive level compare against
-something the signer saw while `verification_level` stays pinned to `none`. The M4a plan to
-check a golden v1 fixture into the repository was **not** executed and the reason is recorded
-in the contract: every v1 byte in existence came from this tree, so the freeze is pinned by
-deterministic crypto vectors, `backup-local`'s signed integration tests, and the matrix's
-stanza/`rage` assertions, and a fixture should arrive with the first cross-host artifact.
-Untested and stated as such: a store holding both a v1 and an unsigned M4a artifact, and
-replay of an older valid signed artifact.
-
-**Verification performed:** `cargo fmt --all --check` clean, `cargo clippy --workspace
---all-targets -- -D warnings` clean, `cargo test --workspace` **128 passed, 0 failed**.
-`tests/m4b_docker_smoke.sh` and `tests/m4a_key_drill.sh` green on PostgreSQL 16, 17 and 18;
-`tests/m1_docker_smoke.sh`, `m2_`, `m3_` and `m4a_` re-run green on all three with the M4a
-paths still verifying. The documented `key status` secret check was re-run against a freshly
-generated four-file set (`grep -f` on both seeds over the JSON: no match).
-
-## 2026-10-01 — M4b operator guide, written against a live store rather than against the code
-
-`docs/development/m4b-signing.md` is the operator path for a signed store: which configuration
-writes which shape, the four-file `key generate`, the six files of one artifact with their real
-sizes and modes, what each verification level is permitted to touch, the DR host's two refusals
-and its restore, and the refusal text every tampering variant produces. Rather than transcribing
-the matrix's assertions, the guide was written from a **run**: a PostgreSQL 16 container, a writer
-configuration, a verify-only configuration, and one artifact at a time.
-
-**What the run showed that reading the code had not settled.**
-
-- **A mixed signed/unsigned store is now observed, not assumed.** The earlier entry's
-  "untested and stated as such" is closed for the read path. Through a signed configuration an
-  unsigned M4a artifact is listed honestly (`unsigned development artifact; no record without
-  keys`) and then refuses *every* read — `backup verify`, `backup inspect` — with the bare
-  `No such file or directory (os error 2)`, because the signed reader looks for the `public.json`
-  that shape never wrote. Through an `[encryption]`-only configuration the same store refuses at
-  discovery, with a sentence naming the mismatch (`is a signed v1 artifact; the signed reader
-  does, not the manifest.json reader`), and that refusal also stops `backup list`. The asymmetry
-  is documented as a limit with both messages quoted; it is still outside the matrix.
-- **A verify-only host does not need its recipient file.** Moving it away left
-  `backup verify --level signature` and the restore path working, while the identity and the
-  verifying key are both loaded before the store is touched and their absence is a refusal.
-  `key status` is the one command that reads the recipient, so the guide says which file is
-  needed by which command instead of repeating "both age files always".
-- **`key generate` on a verify-only host is a half-write.** The refusal that correctly stops a
-  signing secret from appearing on a DR box happens *after* the age pair has been created, so the
-  directory is left holding an identity and a recipient. Documented as such, because an operator
-  who assumed a clean failure would be reasoning about the wrong directory.
-- **The `--confirm-synthetic` guard, the DR-role refusal against a cluster that already has those
-  roles, and `export_globals = false` producing a five-file artifact** were each reproduced, and
-  the guide quotes the real output rather than a paraphrase.
-- **The two shipped limits reproduce live**, which is the strongest form either one can take in a
-  guide: editing `signature_suite` to `ed25519` in `public.json` prints
-  `origin: ed25519 signature by signer …` at signature level with exit 0 and is refused one step
-  later at checksum level, and deleting `complete` reports an errno and nothing about the marker.
-
-**Files:** new guide; README, [M4a guide](docs/development/m4a-encryption.md),
-[artifact v1](docs/backup-format/manifest-v1.md),
-[key lifecycle](docs/security/key-lifecycle.md) and [threat model](docs/security/threat-model.md)
-link to it, and the threat model's mixed-store paragraph became the observed behavior above.
-`project.md` records the guide in the M4b status bullet.
-
-**Verification performed:** every command block in the guide came from a real run on 2026-10-01
-against PostgreSQL 16 (`pg_dump`/`pg_dumpall`/`pg_restore`/`psql` in a container behind wrappers):
-four-file `key generate`, `key status` on writer and DR shapes, three writes (signed, signed
-without globals, unsigned into the same store), all three levels, `backup list` and `inspect` in
-both directions of the mixed store, a portable plan and run from the verify-only host, a
-wrong-database plan refused on `source_fingerprint` before its target existed, and ten tamper
-variants restored to pristine between cases. Both seeds were grepped out of every captured output
-(`grep -f` over `key status --output json`: no match), no `PGDMP` magic and no fixture role name
-reached the store, and `staging/` and `scratch/` were empty after every refusal. No Rust source
-changed, so `cargo fmt`/`clippy`/`test` results from the freeze stand.
+Completed-history archives: [September](archive/SESSION-LOG-2026-09.md), [October through M4b](archive/SESSION-LOG-2026-10.md). Archived entries preserve their original bytes and repository-root link context.
 
 ## 2026-10-01 — M5 scoped as ADR 0003, written against the code rather than against the roadmap
 
@@ -664,3 +240,144 @@ asserts, with 0 ms attributed to the spike's separate run. The only slow test in
 timeout it exists to prove; the read-only-copy and mid-dump `SIGKILL` scenes from gates 7 and 9 are
 still Docker-script work and are not claimed by any unit test. Repo-relative Markdown links: 0
 broken. `git diff --check` clean. Nothing was committed or pushed.
+
+## 2026-10-03 — M5a increment 2: a real backup now writes an inventory row
+
+**Request:** Do the smallest wiring increment — the two layout names in `backup-local`, `register()`
+on the publish path, and the test that a real `backup create` lands a `v1-signed` row. Job rows,
+reconcile and `backup list` reading from the index stay out.
+
+**Implemented:** `backup-local` depends on `backup-inventory` (and not the other way round, which is
+what keeps the key-free rule a crate boundary rather than a convention). `layout.rs` gains
+`INVENTORY_FILE` and `LOCKS_DIR`, each defined as the other crate's constant instead of restating the
+string — the store records where an operator finds these, the inventory owns what they are called —
+and `locks/` is created beside `staging/`, `artifacts/` and `plans/` on store open.
+`LocalStore::record_published` runs at the end of `publish_signed`: it derives the `Estate` from the
+manifest's `source_fingerprint`, opens the index, and writes one `v1-signed` / `registered` row whose
+eight discovery fields are copied from the `PublicHeader` that was sealed three statements earlier.
+Only `profile_fingerprint` and `completed_at_utc` are read from the manifest itself, which is the
+precise case the two nullable columns were added for: this host holds the key that just decrypted it,
+and the next host to rebuild this index will not.
+
+**The decision worth writing down.** Registration happens *after* `complete`, not before. Either
+order leaves a state ADR 0003 already names — files with no row is `unregistered`, a row with no
+files is `missing` — but they are not symmetric: the first is reported and can never be a prune
+candidate, while the second is a claim about a backup that is not there. Putting the index write
+after the marker means the one step that can fail on a healthy filesystem (a locked or corrupt
+`inventory.db`) cannot un-publish a dump, and the error says so in the same sentence that names the
+fix. Three consequences follow from that and are true of the binary now: `backup create` can exit
+non-zero on a backup that succeeded; pointing a second source at one storage root fails at this step,
+because the estate binding refuses to merge two indexes rather than making both sources' `keep_last`
+answers wrong; and the unsigned `publish` path writes no row at all, so a plaintext development
+store holds nothing but unregistered artifacts until reconcile exists. The third is a limit, not an
+oversight — a `plaintext-dev` row would have to state a source fingerprint its manifest does not
+carry.
+
+**Files changed:** `crates/backup-local/Cargo.toml` (dependency), `crates/backup-local/src/layout.rs`
+(two names), `crates/backup-local/src/lib.rs` (`LOCKS_DIR` in the created directories,
+`record_published`, its call site), `crates/backup-local/tests/signed_write_path.rs` (one test),
+`project.md` (increment 1's stale "not yet wired" sentence corrected, increment 2 paragraph added),
+`session-log.md` (this entry).
+
+**Verification performed:** `cargo fmt --all --check` exits 0; `cargo clippy --workspace --all-targets
+-- -D warnings` is clean; `cargo test --workspace` reports **154 passed, 0 failed** (5 in
+`signed_write_path`, up from 4). The new test is checked against being vacuous by the only method that
+proves it: commenting out `self.record_published(…)` makes it fail with "publishing left no inventory
+at …/inventory.db", and it passes again when the call is restored. It asserts the row against
+`public.json`'s ten fields, the two manifest-only columns, an `open_read_only` of the file the write
+path created (so the row must survive the open a DR host can perform), `integrity_problems` empty,
+and — the reason the index is its own file with its own threat model — that the bytes of
+`inventory.db` contain neither the fixture database's name nor the configured host nor the
+`backupctl_fixture` prefix either one appears under.
+
+## 2026-10-03 — M5a increment 3: the job state machine, and the two states nobody writes
+
+**Request:** Job state machine next: schema v2 with `job` + `audit_event`, `backup create`
+opening/transitioning a row, `JobLock` acquired on the real path, mid-dump overlap refused
+(ADR 0003 gates 1 and 9).
+
+**Implemented:** `SCHEMA_VERSION` is 2 and the dense `MIGRATIONS` list gains a `1 -> 2` step adding
+`job` (`job_id` primary key, nullable `backup_id`, two fingerprints, `state`, two timestamps, and a
+`(source_fingerprint, profile_fingerprint, started_at_utc)` index) and `audit_event` (`event_id` as
+a rowid, `at_utc`, `action`, and the two ids it names). The rowid is the sequence — `backup_id` and
+`job_id` are random UUIDv4s that order nothing, so the trail's only honest ordering is insertion.
+`job.rs` is the whole state machine: `JobState` with five states and `is_terminal`, `JobRow`,
+`AuditAction`, `JobScope`, and `JobGuard`, whose `begin` takes the `flock` **before** it touches any
+SQL and whose `move_to` refuses an illegal transition before it writes rather than after. Every
+state write and its event go through one `in_transaction` helper shaped like `migrate` — `BEGIN
+IMMEDIATE`, the closure, rollback if anything failed including the commit — so a row and its trail
+cannot disagree, and `register()`'s artifact row and its `ArtifactRegistered` event now land in one
+transaction too. `Inventory::open` runs `sweep_interrupted` after the estate check: for each
+non-terminal row it probes that row's own lock and marks `interrupted` only where the lock is free,
+which is what the new `JobLock::is_free` exists for (`ENOENT` is free; `EWOULDBLOCK` is not;
+nothing is created by asking). `backup-application` gains the `JobRequest`/`JobHandle` pair and a
+`begin_job` method on the `ArtifactStore` port; `create` opens the row before the dump, moves it to
+`staged` once both sinks are sealed — one call that covers the signed and the development branch —
+and to `complete` after publication. `backup-local` adapts the port through a `LocalJob` newtype,
+because the orphan rule forbids implementing `backup_application::JobHandle` for
+`backup_inventory::JobGuard` from a third crate.
+
+**The decisions worth writing down.** (1) **No `planned`, no `verified`.** The roadmap's sketch names
+both and the first cut of ADR 0003's table kept them; neither has a writer. `planned` in a
+synchronous CLI is a row that is one statement older than `running`, and `verified` belongs to
+`backup verify`, which choice 4 records as an event and not a job. Every state that shipped has a
+writer that means something. (2) **`failed` is written by `Drop`, and there is no reason column at
+all.** A guard going out of scope with a non-terminal row writes `failed`; a process that dies
+without running a destructor leaves `running` and is found as `interrupted` by the next open, which
+is the whole distinction. The reason would be an anyhow chain that can name a database, a host or
+`127.0.0.1`, and gate 5 greps the raw `.db` bytes for exactly those — so the operator's terminal
+gets the sentence and the index gets the state, and `Drop` swallows the write error because a
+`Drop` has no return value and panicking while unwinding from the failure it is recording would turn
+a handled refusal into an abort. (3) **Every store gets jobs and the lock**, including the plaintext
+development one, whose `job` rows may point at ids its `artifact` table has never seen — the
+unregistered state increment 2 already documented, and better than a store with no history at all.
+(4) **No CLI surface this increment**: `job list`/`job inspect` are the next thing, so the states
+are observable through the crate and its tests only.
+
+**Gate 9, asked in the only window where it means anything.** A test that starts a second
+`backup create` after the first has written its rows is refused by SQLite's write lock and proves
+nothing about overlap, because during a real dump no transaction is open — only the kernel's lock
+is. So `Capture` gained `on_dump_read`, a hook fired once from the first byte the stub dump actually
+reads, and the test calls `JobGuard::begin` for the same scope from inside it. The hook reports the
+lock files present, a read-back of the live rows (`running`, and nothing else — the refusal leaves
+no row of its own), the refusal text naming the lock it met, and a second guard for a *different*
+profile, which succeeds and whose `Drop` is the real writer of the real `failed` row on the real
+path. Stated as a limit in the test and in the ADR: this is one process with two open file
+descriptions, which finding 10 measured is the same mechanism two processes get, but the
+two-process `SIGKILL` version belongs to `tests/m5a_docker_smoke.sh`.
+
+**Files changed:** `crates/backup-inventory/src/schema.rs` (v2, the two tables, three migration
+tests), `crates/backup-inventory/src/job.rs` (new: states, rows, trail, guard, six of the seven new
+unit tests), `crates/backup-inventory/src/lib.rs` (`now_utc`, `in_transaction`, `begin_job`,
+`set_job_state`, `jobs`/`job`/`audit_events`, `sweep_interrupted`, `register` wrapped in one
+transaction, six job tests), `crates/backup-inventory/src/job_lock.rs` (`is_free`, one test),
+`crates/backup-application/src/lib.rs` (`JobRequest`, `JobHandle`, `ArtifactStore::begin_job`, the
+three calls in `create`), `crates/backup-local/src/lib.rs` (`LocalJob`, `begin_job`),
+`crates/backup-local/tests/common/mod.rs` (`on_dump_read`, the `MidDump` reader),
+`crates/backup-local/tests/signed_write_path.rs` (two tests, `write_signed_in`),
+`crates/backup-local/tests/write_path.rs` (one test),
+`docs/architecture/adr-0003-backup-inventory-jobs-retention.md` (choice 4 revised in four parts,
+gates 1 and 9 revised, status paragraph counts four revisions), `project.md` (increment 3),
+`session-log.md` (this entry).
+
+**Verification performed:** `cargo fmt --all --check` exits 0; `cargo clippy --workspace
+--all-targets -- -D warnings` exits 0; `cargo test --workspace` reports **167 passed, 0 failed** —
+`backup-inventory` 34 (up from 24), `signed_write_path` 7 (up from 5), `write_path` 4 (up from 3).
+Three negative controls, each reverted and diff-checked afterwards: `LOCK_EX` changed to `LOCK_SH`
+in `JobLock::acquire` makes the mid-dump test fail with "a second dump of one scope was accepted
+mid-dump"; deleting `job.staged()?` from `create` makes the trail test fail with
+`[JobStarted, ArtifactRegistered, JobCompleted]` against the expected four events; and a `Drop`
+that writes nothing makes the abandoned row read back `Interrupted` where the test expects `Failed`
+— which also proves the sweep is the backstop it was designed to be. One earlier assertion was
+removed rather than weakened silently: `started_at_utc != updated_at_utc` failed on a green run,
+because timestamps carry second resolution and a stub dump finishes inside one second, so the test
+now asserts both parse as UTC and that `updated_at_utc >= started_at_utc`, and leaves the ordering
+claim to the trail's monotone `event_id`.
+
+[2026-10-03 11:12] [AGENT] Reviewed AGENT.md, project.md and the complete session history against crate dependencies, backup/store/job code and tests. Design direction remains sound; M5a is incomplete. Independently verified cargo fmt --all --check, cargo clippy --workspace --all-targets -- -D warnings and cargo test --workspace (167 passed, 0 failed). Reproduced a live-cleanup blocker in a temporary synthetic store: backup list exited 0 and removed staging and scratch directories while an exclusive scope lock remained held. Existing mid-dump coverage bypasses LocalStore initialization. Recorded safe cleanup as the immediate next action, with job surface/reconciliation/rebuild/crash gates before M5b. Minimally aligned project roadmap and ARCHITECTURE lifecycle/SQLite summaries; appended README status. Archived completed M0–M4b entries verbatim under archive/SESSION-LOG-2026-09.md and archive/SESSION-LOG-2026-10.md under AGENT.md rule 9 (log had 799 lines); retained active M5 entries. No Rust source changes, Docker matrix rerun, commit or push.
+
+[2026-10-03 11:27] [AGENT] Operator explicitly authorized a complete project.md revision and requested a clean-code phase for simpler, human-readable code. Replaced the old roadmap with a 32-section implementation handoff: status/contract authority, locked stack, crate/data/state/artifact/process/inventory contracts, stable ordered tasks and acceptance gates, S cleanup safety before C1 behavior-preserving readability refactors, then remaining M5a/M5b/M6 and separate CLI/API/UI release tracks. Retained accepted v1/ADR decisions and historical evidence; labeled new shared activity/exclusive maintenance and conservative retention choices as planned baselines requiring task design records. Added explicit keyless expected-estate inputs, read-only audit limits, metadata-preserving enrichment and consistent inventory-copy requirements. Updated README roadmap paragraph. No Rust source, dependencies, flow documents, commits or pushes changed. Documentation checks recorded below.
+
+[2026-10-03 11:28] [AGENT] Verified the rewritten roadmap has all 32 ordered sections, one Current/Next pair, every defined task ID, resolving active-document local links/anchors and an active session log below 500 lines. git diff --check passed. No runtime tests rerun for this documentation-only revision; the preceding review's 167-test baseline is labeled separately from future acceptance.
+
+[2026-10-03 11:30] [AGENT] Operator requested a commit of the latest documentation changes. Preparing a documentation-only commit for project.md, README.md, ARCHITECTURE.md, session-log.md and the two completed-history archives, with message "docs: rewrite implementation roadmap and add clean-code phase". Existing M5a implementation, dependency, ADR and operator-protocol changes remain unstaged. Whitespace checks passed; no push requested.
