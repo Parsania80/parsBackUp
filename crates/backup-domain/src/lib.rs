@@ -20,7 +20,9 @@ mod utc;
 mod fixture;
 
 pub use artifact::{ArtifactScope, DevelopmentManifest};
-pub use artifact_v1::{ArtifactManifest, PublicHeader, RequestedSelection, source_fingerprint};
+pub use artifact_v1::{
+    ArtifactManifest, PublicHeader, RequestedSelection, profile_fingerprint, source_fingerprint,
+};
 pub use config::{Config, Encryption, Signing, Source, Storage};
 pub use profile::{Profile, SelectionMode, is_safe_created_schema_name};
 pub use restore::{RestorePlan, RestoreSections, RestoreSecurityPolicy};

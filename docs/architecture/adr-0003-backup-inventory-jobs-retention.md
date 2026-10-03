@@ -3,8 +3,13 @@
 Status: **accepted** (2026-10-01). This is a scoping document: it states what M5 has to make
 true, what the code can do today, and the seven decisions the increment turns on. The operator
 accepted all seven **exactly as recommended** on 2026-10-01, so every "Recommendation" line below
-is a decision rather than a proposal, and "Choices (accepted)" is their short form. No M5 code
-exists yet. The dependency question was deliberately left to a spike; the spike has now run
+is a decision rather than a proposal, and "Choices (accepted)" is their short form. M5a's first
+increment has since landed: `crates/backup-inventory`, whose schema v1 sits behind a
+`user_version` migration, whose open rules assert the pragmas below, and whose single-instance
+lock is the `flock` file finding 9 asked for. Two lines that the running code had to change are
+marked **Implementation revision** at the line itself rather than corrected quietly here — one in
+choice 5, one in gate 2 — and both are consequences of the freeze, not of a mistake in this
+document. The dependency question was deliberately left to a spike; the spike has now run
 (`/tmp/m5-catalog`, nine rounds, 2026-10-01) and its measured answers are under
 "Implementation dependencies" at the end of this document. One of them changed a recommendation:
 the inventory is **not** in WAL mode, and the reason is a read-only directory, not concurrency.
@@ -187,7 +192,7 @@ in-progress job needs. What needs deciding is the mechanism.
 
 | Sub-question | Options | Recommendation |
 | --- | --- | --- |
-| Which "last N" | per `source_fingerprint`; per (`source_fingerprint`, profile); global per store | Per (`source_fingerprint`, profile name from the manifest snapshot — which is why `backup create` without a profile records the synthetic `whole-database` snapshot name): a selective dump and a whole-database dump protect different accidents, and §10's "only known valid backup for a source" is a per-scope claim in practice |
+| Which "last N" | per `source_fingerprint`; per (`source_fingerprint`, profile); global per store | Per (`source_fingerprint`, profile): a selective dump and a whole-database dump protect different accidents, and §10's "only known valid backup for a source" is a per-scope claim in practice. **Implementation revision (2026-10-03), two parts.** (1) The scope key is not the profile *name* but `backup_domain::profile_fingerprint` — the same 16-hex, domain-prefixed digest pattern `source_fingerprint` already uses — because choice 2 forbids a profile name in a key-free file, and `backup create` with no profile digests the reserved `whole-database` snapshot name like any other. (2) That digest is computable only by a host that has decrypted `manifest.age`, which the v1 signature does not cover (it authenticates `backup_id` and two ciphertext digests and nothing else). So the column is nullable, `NULL` means "this host has never read the manifest", and **a row whose profile is unknown is invisible to retention in both directions**: it cannot satisfy a `keep_last` count, and it must never be a pruning candidate. A store whose inventory was rebuilt without keys has no retention information until a run with keys fills the rows back in. |
 | Where `protected` lives | inventory column; a sidecar file in the artifact directory; an operator-maintained file outside the store | **Inventory column**, and state the consequence plainly: a sidecar file inside `artifacts/<id>/` is a change to the frozen v1 shape (six files, or five without globals) and would need its own ADR and version decision, not a quiet edit; writing protection into the manifest would require the signing key and a DR host has none. So catalog loss costs protection flags, which is Choice 2's residual and an operator-checklist line in the M6 guide |
 | How deletion is confirmed | immediate with a `--yes` flag; a persisted plan with a digest and expiry, like restore plans | **The existing plan pattern**: `backup prune` computes a candidate set, persists it under `plans/` with an expiry and a digest over the exact id set, prints it, and `backup prune run --confirm-digest …` deletes nothing else. One confirmation mechanism in the CLI, already tested against expiry and target mismatch |
 | Delete order | remove files then the marker; remove the marker first | **Marker first.** The reader's first check is `complete`, so a crash partway through a deletion leaves a directory the store already refuses to open rather than a half-deleted artifact that lists fine. It reuses the freeze's own guarantee instead of adding a new one |
@@ -226,8 +231,13 @@ majors 16/17/18, refusals asserted as exact sentences, secrets grepped for rathe
    while one runs and it is refused; delete `inventory.db` and T12's rebuild finds every artifact
    through `public.json` with no key material.
 2. Schema migration: open a db from an older `user_version` and upgrade it transactionally; open
-   one from a newer version and refuse; open a db that belongs to a different `[storage] root` or
-   a different `source_fingerprint` and refuse rather than merge two estates into one index.
+   one from a newer version and refuse; open a db that belongs to a different `source_fingerprint`
+   and refuse rather than merge two estates into one index. **Implementation revision (2026-10-03):
+   the binding is the `source_fingerprint`, not the `[storage] root` path.** Choice 2A's whole
+   argument for keeping the file inside the root is that a copy of the root is a copy of the index,
+   and the DR read depends on that; a database which also refused an unfamiliar absolute path would
+   refuse exactly the copy it exists to serve. What is refused, and now tested, is an inventory
+   whose recorded estate is another database's.
 3. Mixed store: the three shapes recorded per id, and the current bare
    `No such file or directory (os error 2)` replaced by a sentence naming the shape — this
    closes an M4b limit and should be asserted, not just demoed.
@@ -439,7 +449,7 @@ decisions, and an implementation that contradicts one of them is a new ADR rathe
 | 6 | T03 | Local high-water-mark ledger, labeled as an accident alarm and not as a control (**B**); the chained signed inventory stays out of scope (**C** deferred, its own ADR) |
 | — | Naming: "inventory" for this subsystem, "catalog" reserved for PostgreSQL's | Adopted |
 
-Three consequences of the accepted set are worth restating, because each is a limit an operator can
+Four consequences of the accepted set are worth restating, because each is a limit an operator can
 be bitten by rather than a design detail:
 
 - **Losing `inventory.db` costs the protection flags.** Choice 5 puts them in the database and
@@ -452,6 +462,12 @@ be bitten by rather than a design detail:
   a 201-row inventory and `SELECT count(*)` still returned 201 while `integrity_check` reported
   corruption. Whatever command surface M5a ships, at least one path has to run the check itself;
   "the command exited 0" is not evidence about the inventory's state.
+- **An inventory rebuilt without the identity key is retention-blind** (choice 5's implementation
+  revision, part 2): `profile_fingerprint` and `completed_at_utc` live inside `manifest.age`, which
+  no signature covers, so a keyless rebuild records them as unknown and retention cannot group or
+  order such a row. M5b's `backup prune` therefore has to refuse on a store whose rows are unknown
+  rather than fall back to a per-source count — the fall-back would silently treat a selective dump
+  and a whole-database dump as the same accident, which is the distinction choice 5 exists to keep.
 
 Because choice 1 split the increment, gates 1–3, 5 and 7–9 under "Validation gates" run at M5a,
 which can therefore close without ever deleting a byte; gate 4 runs at M5b and gate 6 closes both.

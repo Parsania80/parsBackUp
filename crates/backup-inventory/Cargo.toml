@@ -1,0 +1,18 @@
+[package]
+name = "backup-inventory"
+version.workspace = true
+edition.workspace = true
+
+# Deliberately absent: `backup-crypto`. Every column in this crate's schema is either a
+# fingerprint, a digest, a size or a lifecycle state, and the one way to keep that true is that
+# nothing here can even receive a path to key material or a decrypted manifest. A dependency on
+# the crypto boundary would turn ADR 0003's key-free schema rule into a code-review note.
+#
+# Also absent, on purpose: `backup-local`. It will depend on this crate, not the other way
+# around, so a dev-dependency here would be a cycle kept alive only by cargo's tolerance.
+[dependencies]
+anyhow.workspace = true
+backup-domain = { path = "../backup-domain" }
+libc.workspace = true
+rusqlite.workspace = true
+uuid.workspace = true

@@ -14,9 +14,9 @@ use crate::protocol::{
     ARCHIVE_COMPRESSION, ARCHIVE_FORMAT, ARTIFACT_FORMAT_VERSION, DIGEST_HEX_LEN,
     ENGINE_POSTGRESQL, GLOBALS_POLICY_EXPORTED, GLOBALS_POLICY_SKIPPED, ID_HEX_LEN,
     MAX_COMPATIBILITY_NOTES, MAX_PUBLIC_JSON_BYTES, MAX_TEXT_FIELD_CHARS,
-    READABLE_RECIPIENT_SUITES, READABLE_SIGNATURE_SUITES, RECIPIENT_SUITES, SIGNATURE_SUITES,
-    SOURCE_FINGERPRINT_DOMAIN, SUBSCRIPTION_POLICY_DROPPED, SUPPORTED_MAJOR_RANGE,
-    SUPPORTED_MAJORS, VERIFICATION_NONE,
+    PROFILE_FINGERPRINT_DOMAIN, READABLE_RECIPIENT_SUITES, READABLE_SIGNATURE_SUITES,
+    RECIPIENT_SUITES, SIGNATURE_SUITES, SOURCE_FINGERPRINT_DOMAIN, SUBSCRIPTION_POLICY_DROPPED,
+    SUPPORTED_MAJOR_RANGE, SUPPORTED_MAJORS, VERIFICATION_NONE,
 };
 use crate::selection::ResolvedSelection;
 use crate::utc::is_utc_timestamp;
@@ -504,18 +504,41 @@ impl PublicHeader {
 /// manifest would answer a question no artifact file needs to answer, and the major is part
 /// of the input because a 16 dump and an 18 dump of one database are not the same generation.
 pub fn source_fingerprint(source: &Source, server_major: u32) -> String {
+    fingerprint(
+        SOURCE_FINGERPRINT_DOMAIN,
+        &[
+            ENGINE_POSTGRESQL,
+            &server_major.to_string(),
+            &source.host,
+            &source.port.to_string(),
+            &source.database,
+        ],
+    )
+}
+
+/// The inventory's retention scope key for one profile: a digest of its name, never the name.
+///
+/// `keep_last` counts per source *and* profile, because a selective dump and a whole-database
+/// dump protect different accidents — but a profile name exists only inside `manifest.age`,
+/// which v1 seals precisely because it names an operator's profiles. The digest keeps the
+/// grouping and leaves the disclosure sealed: two artifacts share a value exactly when their
+/// manifests record the same `profile_snapshot.name`, and `whole-database` folds in as the
+/// synthetic name a profile-less dump records.
+pub fn profile_fingerprint(name: &str) -> String {
+    fingerprint(PROFILE_FINGERPRINT_DOMAIN, &[name])
+}
+
+/// The construction every fingerprint in this format shares: a domain prefix, then each field
+/// followed by a length-separating byte, truncated to [`ID_HEX_LEN`] hex characters.
+///
+/// The domain prefix is load-bearing — a profile name must not be able to collide with a key
+/// fingerprint or a source digest — and so is the separator byte: two inputs whose field
+/// boundaries differ by one character must not hash alike.
+fn fingerprint(domain: &[u8], fields: &[&str]) -> String {
     let mut hasher = sha2::Sha256::new();
-    hasher.update(SOURCE_FINGERPRINT_DOMAIN);
-    for field in [
-        ENGINE_POSTGRESQL,
-        &server_major.to_string(),
-        &source.host,
-        &source.port.to_string(),
-        &source.database,
-    ] {
+    hasher.update(domain);
+    for field in fields {
         hasher.update(field);
-        // A length-separating byte: two configurations whose field boundaries differ by one
-        // character must not hash to the same digest.
         hasher.update([0_u8]);
     }
     let digest = hasher.finalize();
@@ -693,6 +716,41 @@ mod tests {
         shifted.host = "127.0.0.12".to_string();
         shifted.database = "backupctl_fixture_3".to_string();
         assert_ne!(source_fingerprint(&shifted, 16), digest);
+    }
+
+    #[test]
+    fn the_profile_fingerprint_is_a_stable_domain_separate_digest() {
+        let digest = profile_fingerprint("nightly");
+        assert!(is_hex_id(&digest), "{digest}");
+        assert_eq!(profile_fingerprint("nightly"), digest);
+        // Frozen: this digest is what a row in `inventory.db` stores as its retention scope key,
+        // so changing the construction silently re-scopes every existing row.
+        assert_eq!(digest, "651dd7a74505b176");
+
+        // The scope key groups artifacts, so distinct names must not share one — a case fold,
+        // a trailing space, or a one-character shift across the length boundary would silently
+        // merge two profiles' retention counts and let a prune delete the wrong set.
+        for other in [
+            "Nightly",
+            "nightly ",
+            "nightl",
+            "nightlyy",
+            "whole-database",
+        ] {
+            assert_ne!(
+                profile_fingerprint(other),
+                digest,
+                "{other} must not share a scope with \"nightly\""
+            );
+        }
+
+        // Domain separation: the same text under two domains is two values, so a profile name
+        // can never be mistaken for a key id or a source digest in a column.
+        assert_ne!(
+            digest,
+            fingerprint(SOURCE_FINGERPRINT_DOMAIN, &["nightly"]),
+            "a profile name must not digest to a source fingerprint"
+        );
     }
 
     #[test]

@@ -6,6 +6,7 @@ members = [
   "crates/backup-postgres",
   "crates/backup-local",
   "crates/backup-crypto",
+  "crates/backup-inventory",
   "crates/backupctl",
 ]
 
@@ -31,12 +32,24 @@ age = "=0.12.1"
 age-core = "=0.12.0"
 base64 = "0.22"
 hkdf = "0.12"
+
+# Only for `flock`: the job lock is held by the kernel, so nothing in this workspace has to decide
+# what a stale lock means. Already in the tree via `getrandom`, so this adds no crate.
+libc = "0.2"
 hpke = "0.12"
 ml-kem = { version = "0.2", features = ["deterministic"] }
 rand = "0.8"
 sha3 = "0.10"
 typenum = "1"
 x25519-dalek = { version = "2", features = ["static_secrets"] }
+
+# The M5 inventory engine, measured rather than assumed (ADR 0003): `bundled` because the
+# system libsqlite3 does not link on this host and would tie the inventory format to whatever
+# version the distro ships, and `default-features = false` because the statement cache those
+# features bring in is worth 5 KB and three crates to a CLI that opens the database, runs a
+# handful of statements, and exits. `modern_sqlite` stays on: the pragmas ADR 0003 depends on
+# (`busy_timeout` read-back, `user_version`) are asserted from the connection, not assumed.
+rusqlite = { version = "=0.40.2", default-features = false, features = ["bundled"] }
 
 # The M4b origin signature, pinned for two specific reasons. `ed25519-dalek` stays on
 # 2.x because 3.0 resolves a second, incompatible `curve25519-dalek`; 2.2 uses the 4.1.3

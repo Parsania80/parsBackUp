@@ -578,3 +578,89 @@ link check reports 0 broken links, and `cargo fmt --all --check` exits 0. `cargo
 and the spike's own crate lives outside it. Two things remain unmeasured and are written as limits
 rather than resolved: power-loss behaviour, which `SIGKILL` does not simulate, and the `.deb` build
 with a C toolchain in `Build-Depends`.
+
+## 2026-10-03 — M5a increment 1: the inventory exists, and the format decided two of its columns
+
+**Request:** Implement M5a's first increment — the `crates/backup-inventory` crate, the `rusqlite`
+pin, a key-free schema behind a `user_version` migration, and the `flock` job lock — then write the
+two revisions the running code forced back into ADR 0003 and `project.md`, and add this entry.
+
+**Implemented:** `crates/backup-inventory`, depending only on `anyhow`, `backup-domain`, `libc`,
+`rusqlite` and `uuid`. `schema.rs` keeps the whole history in a dense, append-only `MIGRATIONS` list
+keyed on `PRAGMA user_version`, and creating a file runs the same `0 -> 1` step an upgrade from an
+older host's database runs, so there is one code path that produces a schema. v1 is `meta` plus
+`artifact` plus the `(source, profile, completed_at_utc)` index. `lib.rs` exposes two opens and no
+second way to get one: `open` creates and migrates, `open_read_only` cannot create anything, because
+the spike had already measured that `PRAGMA query_only` creates the file it is supposed to spare.
+Every pragma this format depends on is set and then **read back** — `busy_timeout` must answer the
+2000 ms asked rather than rusqlite's own 5000 ms default, `journal_mode` must answer `delete`, and
+`synchronous` must answer 2 on a write path. `Estate` is checked on both opens, so a database left
+behind by another source is refused with the sentence the ADR asked for instead of being adopted.
+`integrity_problems` exists as a query that returns SQLite's complaints rather than a boolean,
+because the spike found a corrupt inventory still answering `SELECT count(*)`. `job_lock.rs` is
+`flock(LOCK_EX | LOCK_NB)` on `<root>/locks/<source>-<profile>.lock`, named only by fingerprints,
+file mode 0600 like everything else the store writes, and deliberately never unlinked.
+
+**The finding that changed two accepted lines.** Choice 5 counts `keep_last` per
+(`source_fingerprint`, profile *name from the manifest snapshot*), and choice 2 forbids a profile
+name in a key-free file. Both were accepted; the schema could satisfy only one. The operator chose
+the pattern the frozen format already uses — `profile_fingerprint`, a 16-hex domain-prefixed digest
+(`PROFILE_FINGERPRINT_DOMAIN`, golden `nightly → 651dd7a74505b176`) — which resolves the
+contradiction without disclosing anything. Writing the digest then exposed the half nobody had
+looked at: the v1 signature authenticates `backup_id` and two ciphertext digests and **nothing
+else**, so a host holding no key can list a `v1-signed` artifact perfectly and still not know which
+profile made it or when it finished. `profile_fingerprint` and `completed_at_utc` are therefore
+nullable, `NULL` means "this host never read the manifest" and never "oldest" or "whole-database",
+and an inventory rebuilt without the identity key is **retention-blind in both directions**: its
+rows cannot satisfy a `keep_last` count and must not be pruning candidates. M5b's `backup prune`
+has to refuse on such a store rather than fall back to a per-source count, which is the distinction
+choice 5 exists to keep. Gate 2's other half went the same way: the binding is the
+`source_fingerprint` and not the `[storage] root` path, because choice 2A's argument for keeping the
+file inside the root is that a copy of the root is a copy of the index, and a database that also
+refused an unfamiliar absolute path would refuse exactly the DR copy it exists to serve.
+
+**Two things the compiler and a failing test taught, not the design.** rusqlite under
+`default-features = false` does not implement `ToSql`/`FromSql` for `u64`, so the two ciphertext
+sizes cross the boundary as `i64` through helpers that **refuse** out-of-range values rather than
+casting them — which is the right shape anyway, since SQLite's INTEGER is signed and a silently
+negative byte count is a number no operator could explain. And the test that tried to prove
+"an edited row is reported, not defaulted" failed on its first half: `UPDATE artifact SET shape =
+'v1-unsigned'` was refused by SQLite itself, by the schema's own `CHECK`. That is better than what
+the test was written to check, so the test now asserts the asymmetry instead — `shape` cannot be
+edited into a word at all, while `state` is deliberately unconstrained (so that M5b can add
+`deleted` and reconcile can add `missing` without rebuilding every row) and does survive to the read,
+where it is refused by name. The `flock` turned out to be unit-testable without spawning anything:
+two `File` handles to one path are two open file descriptions, which is what `flock` is owned by, so
+the refusal is asserted in-process on a thread with a channel timeout — a missing `LOCK_NB` fails
+the test instead of hanging the suite. The `SIGKILL` release cannot be reached that way and is not
+claimed here; the spike measured it (0 ms, free lock, file left behind) and
+`tests/m5a_docker_smoke.sh` has to re-measure it against a real killed `backup create`.
+
+**Deliberately not built:** the `job` and `audit_event` tables, which will arrive as schema v2 so
+the migration path is exercised by a real upgrade of a real v1 file rather than by a hand-made
+database; `State` therefore ships with one variant, because a vocabulary entry with no writer is a
+claim. Nothing calls `register()` yet, `INVENTORY_FILE` and `locks/` are not in `backup-local`'s
+layout, and no command reads from the index — increment 1 is the storage and the rules, not the
+surface.
+
+**Files changed:** `crates/backup-inventory/` (new crate: `Cargo.toml`, `lib.rs`, `schema.rs`,
+`artifact.rs`, `job_lock.rs`), workspace `Cargo.toml` (member, `rusqlite = "=0.40.2"`
+`default-features = false, features = ["bundled"]`, `libc = "0.2"` for `flock` alone, already in the
+tree via `getrandom`), `crates/backup-domain/src/{protocol,artifact_v1,lib}.rs`
+(`PROFILE_FINGERPRINT_DOMAIN`, `profile_fingerprint`, a shared fingerprint helper),
+`docs/architecture/adr-0003-backup-inventory-jobs-retention.md` (status now says increment 1
+landed; two **Implementation revision** lines — choice 5 and gate 2; a fourth restated consequence),
+`project.md` (a new **M5a increment 1 — landed** paragraph, including what is not wired),
+`session-log.md` (this entry).
+
+**Verification performed:** `cargo fmt --all --check` exits 0; `cargo clippy --workspace
+--all-targets -- -D warnings` is clean; `cargo test --workspace` reports **153 passed, 0 failed**, of
+which 24 are the new crate's and 30 are `backup-domain`'s including the frozen profile-fingerprint
+golden. Two claims were corrected against measured output before being written down rather than
+after: the workspace test count was first written as 133 and is now the summed `test result` lines
+(153), and the lock's refusal is documented as "under 500 ms" because that is the bound the test
+asserts, with 0 ms attributed to the spike's separate run. The only slow test in the suite is
+`a_locked_inventory_answers_instead_of_waiting_five_seconds`, which costs the two seconds of busy
+timeout it exists to prove; the read-only-copy and mid-dump `SIGKILL` scenes from gates 7 and 9 are
+still Docker-script work and are not claimed by any unit test. Repo-relative Markdown links: 0
+broken. `git diff --check` clean. Nothing was committed or pushed.

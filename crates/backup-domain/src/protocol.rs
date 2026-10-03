@@ -89,6 +89,10 @@ pub const ID_HEX_LEN: usize = 16;
 /// The prefix a manifest's `source_fingerprint` hashes, so the digest of where a dump came
 /// from cannot collide with a key fingerprint and changing it is a format change.
 pub const SOURCE_FINGERPRINT_DOMAIN: &[u8] = b"backupctl-source-v1\0";
+/// The prefix the inventory hashes a profile name under to get its retention scope key. The
+/// name itself lives only in `manifest.age`, so the inventory holds this digest instead: see
+/// [`crate::profile_fingerprint`].
+pub const PROFILE_FINGERPRINT_DOMAIN: &[u8] = b"backupctl-profile-v1\0";
 /// `public.json` is bounded before it is parsed, so a hostile file cannot make a reader
 /// allocate first and complain later.
 pub const MAX_PUBLIC_JSON_BYTES: usize = 4096;
