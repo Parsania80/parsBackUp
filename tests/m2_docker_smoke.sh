@@ -83,6 +83,16 @@ for major in 16 17 18; do
 
     docker exec "$source_name" createdb -U postgres backupctl_fixture_m1
     src_sql -d backupctl_fixture_m1 < tests/fixtures/postgres/core.sql >/dev/null
+    # Native pg_dumpall exports must preserve quoted identifiers and role settings.
+    src_sql -d backupctl_fixture_m1 >/dev/null <<'SQL'
+CREATE ROLE "backupctl_fixture Mixed Case" LOGIN;
+CREATE ROLE "backupctl_fixture;semi" NOLOGIN;
+CREATE ROLE "backupctl_fixture ""quote""" NOLOGIN;
+CREATE ROLE "backupctl_fixture
+line" NOLOGIN;
+ALTER ROLE "backupctl_fixture Mixed Case" SET application_name TO 'semi;--colon';
+GRANT "backupctl_fixture;semi" TO "backupctl_fixture Mixed Case";
+SQL
     # Placeholder on the rebuilt cluster so plans can probe its catalogs; the
     # restores below only ever write into fresh target databases.
     docker exec "$target_name" createdb -U postgres -h 127.0.0.1 -p "$target_port" backupctl_fixture_m1
@@ -224,6 +234,24 @@ PY
     # Tests 1-4 and 11: the rebuilt cluster regained its security model.
     dst_sql -d backupctl_fixture_dr < tests/fixtures/postgres/assertions.sql >/dev/null
     dst_sql -d backupctl_fixture_dr < tests/fixtures/postgres/security-assertions.sql >/dev/null
+    dst_sql -d backupctl_fixture_dr >/dev/null <<'SQL'
+DO $$
+BEGIN
+    IF (SELECT count(*) FROM pg_roles WHERE rolname = ANY(ARRAY[
+        'backupctl_fixture Mixed Case', 'backupctl_fixture;semi',
+        'backupctl_fixture "quote"', E'backupctl_fixture\nline'])) <> 4 THEN
+        RAISE EXCEPTION 'DR restore lost a quoted role name';
+    END IF;
+    IF NOT pg_has_role('backupctl_fixture Mixed Case', 'backupctl_fixture;semi', 'MEMBER') THEN
+        RAISE EXCEPTION 'DR restore lost quoted role membership';
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'backupctl_fixture Mixed Case'
+        AND rolconfig @> ARRAY['application_name=semi;--colon']) THEN
+        RAISE EXCEPTION 'DR restore lost a quoted role setting';
+    END IF;
+END
+$$;
+SQL
     # After DR the roles exist, so a second DR plan is refused (test 9 again).
     if ctlt restore plan "$backup_id" --target backupctl_fixture_dr2 --security dr \
         > "$test_root/twice.err" 2>&1; then

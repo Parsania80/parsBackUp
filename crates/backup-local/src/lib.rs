@@ -45,7 +45,7 @@ use layout::{
 use sha2::{Digest, Sha256};
 use stage::Target;
 use std::fs::{self, DirBuilder, File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -260,11 +260,13 @@ impl LocalStore {
     ///
     /// `max_plaintext_bytes` is the size the manifest recorded for this payload when it
     /// has one; `None` applies the format-wide cap instead.
+    /// A recorded ciphertext binding is checked against the stream before the view is returned.
     fn decrypt_to_scratch(
         &self,
         ciphertext: &Path,
         name: &str,
         max_plaintext_bytes: Option<u64>,
+        expected_ciphertext: Option<(u64, &str)>,
     ) -> Result<LocalPlaintext> {
         let keys = self
             .keys
@@ -277,27 +279,45 @@ impl LocalStore {
             .mode(0o700)
             .create(&scratch)
             .context("create private scratch directory")?;
-        let path = scratch.join(name);
+        let view = LocalPlaintext {
+            path: scratch.join(name),
+            scratch: Some(scratch),
+            _claim: Some(claim),
+        };
         let file = OpenOptions::new()
             .write(true)
             .create_new(true)
             .mode(0o600)
-            .open(&path)
+            .open(&view.path)
             .context("create private scratch file")?;
-        let ciphertext = File::open(ciphertext).context("open encrypted payload")?;
-        // The view takes the directory before a single byte is decrypted, so every
-        // failure path below drops it on the way out. A refused or over-cap decryption
-        // must not leave a half-written plaintext file sitting in the store, which is
-        // the one thing this directory exists to avoid.
-        let view = LocalPlaintext {
-            path,
-            scratch: Some(scratch),
-            _claim: Some(claim),
+        let ciphertext = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(ciphertext)
+            .context("open encrypted payload")?;
+        if !ciphertext.metadata()?.is_file() {
+            bail!("encrypted payload must be a regular file");
+        }
+        let bound = match expected_ciphertext {
+            Some((bytes, _)) => bytes.checked_add(1).context("ciphertext size overflow")?,
+            None => u64::MAX,
+        };
+        let mut reader = DigestReader {
+            inner: ciphertext.take(bound),
+            digest: Sha256::new(),
+            bytes: 0,
         };
         match max_plaintext_bytes {
-            Some(limit) => decrypt_with_limit(keys.identity.identity()?, ciphertext, file, limit)?,
-            None => decrypt(keys.identity.identity()?, ciphertext, file)?,
+            Some(limit) => decrypt_with_limit(keys.identity.identity()?, &mut reader, file, limit)?,
+            None => decrypt(keys.identity.identity()?, &mut reader, file)?,
         };
+        if let Some((bytes, digest)) = expected_ciphertext {
+            // Bind the exact stream decrypted, including any bytes age did not consume.
+            io::copy(&mut reader, &mut io::sink())?;
+            if reader.bytes != bytes || format!("{:x}", reader.digest.finalize()) != digest {
+                bail!("ciphertext changed after authentication; plaintext was not released");
+            }
+        }
         Ok(view)
     }
 
@@ -383,8 +403,17 @@ impl LocalStore {
 
     /// Decrypts `manifest.age` into scratch, reads it under the manifest size cap, and
     /// returns the authenticated manifest. The scratch copy is gone before this returns.
-    fn authenticated_manifest(&self, path: &Path) -> Result<ArtifactManifest> {
-        let view = self.decrypt_to_scratch(path, MANIFEST_FILE, Some(MAX_MANIFEST_BYTES))?;
+    fn authenticated_manifest(
+        &self,
+        path: &Path,
+        header: &PublicHeader,
+    ) -> Result<ArtifactManifest> {
+        let view = self.decrypt_to_scratch(
+            path,
+            MANIFEST_FILE,
+            Some(MAX_MANIFEST_BYTES),
+            Some((header.manifest_ciphertext_bytes, &header.manifest_sha256)),
+        )?;
         let result = (|| -> Result<ArtifactManifest> {
             let bytes = read_bounded(view.path(), MAX_MANIFEST_BYTES + 1)?;
             let manifest: ArtifactManifest = serde_json::from_slice(&bytes)
@@ -704,7 +733,12 @@ impl ArtifactStore for LocalStore {
             .manifest
             .payload_plaintext_bytes
             .context("encrypted artifact records no plaintext payload size")?;
-        self.decrypt_to_scratch(&artifact.payload, PAYLOAD_FILE, Some(limit))
+        self.decrypt_to_scratch(
+            &artifact.payload,
+            PAYLOAD_FILE,
+            Some(limit),
+            Some((artifact.manifest.size_bytes, &artifact.manifest.sha256)),
+        )
     }
 
     fn plaintext_staged_payload(&self, stage: &Self::Stage) -> Result<Self::Plaintext> {
@@ -717,7 +751,7 @@ impl ArtifactStore for LocalStore {
             });
         }
         // A stage has no manifest yet, so only the format-wide cap applies.
-        self.decrypt_to_scratch(&stage.payload, PAYLOAD_FILE, None)
+        self.decrypt_to_scratch(&stage.payload, PAYLOAD_FILE, None, None)
     }
 
     fn plaintext_globals(&self, artifact: &Self::Artifact) -> Result<Self::Plaintext> {
@@ -734,7 +768,22 @@ impl ArtifactStore for LocalStore {
         }
         // Globals carry no recorded plaintext size, so the cap here is the format's own;
         // a role dump past it is refused rather than trusted.
-        self.decrypt_to_scratch(path, GLOBALS_FILE, None)
+        self.decrypt_to_scratch(
+            path,
+            GLOBALS_FILE,
+            None,
+            Some((
+                artifact
+                    .manifest
+                    .globals_size_bytes
+                    .context("globals size missing")?,
+                artifact
+                    .manifest
+                    .globals_sha256
+                    .as_deref()
+                    .context("globals digest missing")?,
+            )),
+        )
     }
 
     fn rewrite_manifest(
@@ -1007,7 +1056,7 @@ impl ArtifactStore for LocalStore {
         let header = self.verify_signed(id)?;
         // Everything from here in was written by whoever holds the configured signing key.
         let dir = self.artifact_dir(id);
-        let manifest = self.authenticated_manifest(&dir.join(AGE_MANIFEST_FILE))?;
+        let manifest = self.authenticated_manifest(&dir.join(AGE_MANIFEST_FILE), &header)?;
         manifest.matches_header(&header)?;
         if manifest.backup_id != id {
             bail!(
@@ -1059,6 +1108,10 @@ impl ArtifactStore for LocalStore {
             &artifact.payload,
             PAYLOAD_FILE,
             Some(artifact.manifest.archive_plaintext_bytes),
+            Some((
+                artifact.manifest.payload_ciphertext_bytes,
+                &artifact.manifest.payload_ciphertext_sha256,
+            )),
         )
     }
 
@@ -1069,7 +1122,22 @@ impl ArtifactStore for LocalStore {
             .globals
             .as_ref()
             .context("authenticated manifest declares no globals file")?;
-        self.decrypt_to_scratch(path, GLOBALS_FILE, None)
+        self.decrypt_to_scratch(
+            path,
+            GLOBALS_FILE,
+            None,
+            Some((
+                artifact
+                    .manifest
+                    .globals_ciphertext_bytes
+                    .context("globals size missing")?,
+                artifact
+                    .manifest
+                    .globals_sha256
+                    .as_deref()
+                    .context("globals digest missing")?,
+            )),
+        )
     }
 
     fn save_plan(&self, plan: &RestorePlan) -> Result<()> {
@@ -1107,6 +1175,21 @@ impl ArtifactStore for LocalStore {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(error) => Err(error).context("inspect restore plan"),
         }
+    }
+}
+
+struct DigestReader<R> {
+    inner: R,
+    digest: Sha256,
+    bytes: u64,
+}
+
+impl<R: Read> Read for DigestReader<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let n = self.inner.read(buffer)?;
+        self.digest.update(&buffer[..n]);
+        self.bytes += n as u64;
+        Ok(n)
     }
 }
 
@@ -1228,6 +1311,45 @@ mod tests {
             recipient_suite: None,
             payload_plaintext_bytes: None,
         }
+    }
+
+    #[test]
+    fn manifest_decryption_binds_the_stream_to_the_verified_header() -> Result<()> {
+        let root = temp_root();
+        let keydir = temp_keys();
+        let (identity, recipient) = key_pair(&keydir);
+        let store = LocalStore::with_keys(root.clone(), &identity, &recipient)?;
+        let recipient = KeyFile::load(&recipient, backup_crypto::keystore::KeyRole::Recipient)?;
+        let path = root.join("manifest.age");
+        let mut original = Vec::new();
+        backup_crypto::stream::encrypt(recipient.recipient(), &b"{}"[..], &mut original)?;
+        let header = PublicHeader {
+            format_version: 1,
+            backup_id: Uuid::new_v4(),
+            recipient_id: "a".repeat(64),
+            signer_id: "b".repeat(64),
+            recipient_suite: "mlkem768x25519-v0".to_string(),
+            signature_suite: "ed25519+ml-dsa-65".to_string(),
+            manifest_ciphertext_bytes: original.len() as u64,
+            payload_ciphertext_bytes: 1,
+            manifest_sha256: format!("{:x}", Sha256::digest(&original)),
+            payload_sha256: "c".repeat(64),
+        };
+        // A shorter valid unsigned stream cannot be mistaken for the authenticated JSON.
+        let mut replacement = Vec::new();
+        backup_crypto::stream::encrypt(recipient.recipient(), &b""[..], &mut replacement)?;
+        fs::write(&path, replacement)?;
+        let error = store.authenticated_manifest(&path, &header).unwrap_err();
+        let error = format!("{error:#}");
+        assert!(
+            error.contains("ciphertext changed after authentication")
+                || error.contains("failed to decrypt completely"),
+            "{error}"
+        );
+        assert_eq!(fs::read_dir(root.join(SCRATCH_DIR))?.count(), 0);
+        fs::remove_dir_all(root)?;
+        fs::remove_dir_all(keydir)?;
+        Ok(())
     }
 
     #[test]

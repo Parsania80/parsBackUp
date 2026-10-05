@@ -799,3 +799,89 @@ fn a_second_dump_of_one_scope_is_refused_while_the_first_is_still_running() {
 
     fixture.remove();
 }
+
+#[test]
+fn restore_refusals_precede_cluster_mutation() {
+    let capture = Capture::default();
+    let fixture = write_signed(&capture);
+    let service = RestoreService::new(StubEngine { capture: &capture }, fixture.reader());
+    let plan = service
+        .plan(
+            &fixture.config,
+            fixture.id,
+            DR_TARGET,
+            RestoreSecurityPolicy::dr_full(),
+            RestoreSections::full(),
+        )
+        .unwrap();
+    capture.target_exists.set(true);
+    let error = failure(service.run(&fixture.config, plan.id, DR_TARGET));
+    assert!(
+        error.contains("target database appeared after planning"),
+        "{error}"
+    );
+    assert_eq!(capture.globals_applied.get(), 0);
+    assert!(capture.created().is_empty());
+    capture.target_exists.set(false);
+    // Re-sign a corrupt age stream: signature verification succeeds, decryption must
+    // still fail before any globals or CREATE DATABASE call.
+    use sha2::{Digest, Sha256};
+    let path = fixture.artifact_dir().join("payload.age");
+    let mut bytes = fs::read(&path).unwrap();
+    *bytes.last_mut().unwrap() ^= 1;
+    fs::write(path, &bytes).unwrap();
+    let payload_digest: [u8; 32] = Sha256::digest(&bytes).into();
+    let mut manifest = fixture.manifest.clone();
+    manifest.payload_ciphertext_sha256 = format!("{:x}", Sha256::digest(&bytes));
+    let recipient = backup_crypto::keystore::KeyFile::load(
+        &fixture.keys.recipient,
+        backup_crypto::keystore::KeyRole::Recipient,
+    )
+    .unwrap();
+    let mut sealed = Vec::new();
+    backup_crypto::stream::encrypt(
+        recipient.recipient(),
+        serde_json::to_vec(&manifest).unwrap().as_slice(),
+        &mut sealed,
+    )
+    .unwrap();
+    let manifest_digest: [u8; 32] = Sha256::digest(&sealed).into();
+    let header = PublicHeader::seal(
+        &manifest,
+        &format!("{:x}", Sha256::digest(&sealed)),
+        sealed.len() as u64,
+    )
+    .unwrap();
+    let signer = backup_crypto::signing::SigningKeyFile::load(
+        &fixture.keys.signing,
+        backup_crypto::signing::SigningRole::Signing,
+    )
+    .unwrap();
+    let signature = signer
+        .signer()
+        .unwrap()
+        .try_sign(&backup_crypto::signing::signature_tuple(
+            fixture.id.as_bytes(),
+            &manifest_digest,
+            &payload_digest,
+        ))
+        .unwrap();
+    fs::write(fixture.artifact_dir().join("manifest.age"), sealed).unwrap();
+    fs::write(
+        fixture.artifact_dir().join("public.json"),
+        header.to_json().unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        fixture.artifact_dir().join("signature.hybrid"),
+        signature.as_bytes(),
+    )
+    .unwrap();
+    use backup_application::ArtifactStore;
+    assert!(fixture.reader().open_signed(fixture.id).is_ok());
+    let error = failure(service.run(&fixture.config, plan.id, DR_TARGET));
+    assert!(error.contains("failed to decrypt completely"), "{error}");
+    assert_eq!(capture.globals_applied.get(), 0);
+    assert!(capture.created().is_empty());
+    fixture.remove();
+}

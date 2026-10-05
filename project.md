@@ -1,6 +1,6 @@
 # PostgreSQL Backup Platform — Implementation Roadmap
 
-Revision: 2026-10-03. This rewrite is authorized by the operator. It replaces the earlier mixed design/status document with an implementation handoff and adds a dedicated clean-code phase. It changes the work plan; it does not claim that planned behavior is implemented.
+Revision: 2026-10-05. The operator authorized the review corrections and this detailed roadmap revision; §34 is the current implementation handoff. The 2026-10-03 rewrite was authorized by the operator. It replaces the earlier mixed design/status document with an implementation handoff and adds a dedicated clean-code phase. It changes the work plan; it does not claim that planned behavior is implemented.
 
 ## 1. Project vision and how to use this document
 
@@ -44,9 +44,10 @@ Local artifacts share the host's failure domain. Do not claim host-loss recovery
 | M5a increment 2 | Signed publication registers an artifact row after the completion marker | Development artifacts remain unregistered. |
 | M5a increment 3 | Schema v2 jobs/audit; backup creation drives running/staged/complete | Restore jobs, verification events, reconcile/rebuild and crash matrix remain. |
 | Phase S | Same-scope acquisition is tested mid-dump **and** by two real CLI processes | Opening a store removes nothing; work owns `activity.lock` shared, only `backup create` cleans it exclusively. Recovery, job surface and crash matrix remain for phase A. |
+| Review corrections R | Consumption-bound signed/encrypted reads; process-group cleanup; overflow refusal; quoted native role exports; restore checks/preparation before mutations | Target/use locks remain A05; captured catalog/TOC output above 64 KiB is refused; service isolation remains H02. |
 | Operations/service | None yet | Scheduling, packaging, production hardening, API and UI remain planned. |
 
-Review evidence: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo test --workspace` passed; 167 tests passed, zero failed. Existing PostgreSQL 16/17/18 matrices have historical passing records through M4b. They were not rerun in the review or this rewrite. Test counts describe the baseline, not a target future count.
+Historical review evidence (before the S/C02/R increments): `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo test --workspace` passed; 167 tests passed, zero failed. Existing PostgreSQL 16/17/18 matrices have historical passing records through M4b. They were not rerun in the review or this rewrite. Test counts describe the baseline, not a target future count.
 
 Current guard: writes require `--confirm-synthetic`, source connections are local, and database names start with `backupctl_fixture_`. Encryption and signatures are necessary but insufficient to permit production use. Removing this guard belongs to the explicit CLI release gate after M5/M6 and production validation.
 
@@ -204,7 +205,7 @@ Restore plan validates artifact trust before any target creation, source identit
 
 Current policies: `dr` restores explicit exported roles/memberships, ownership and privileges; `portable` skips them. A section-limited restore requires portable policy and starts at pre-data, with no pre-data/post-data gap. Table-selected restore prepares required namespaces because the native table dump does not create them. Default target is a new database; do not add destructive overwrite during refactoring.
 
-Execution order: authenticate artifact; validate plan/confirmation/current source; recheck DR role conflicts; apply opt-in validated globals; recheck target absence; create fresh database; prepare required schemas; restore native archive; report outcome. Failure may leave cluster roles or target objects partially changed. Leave them for explicit operator repair, report that fact, and never auto-retry or auto-drop them.
+Execution order: authenticate artifact; validate plan/confirmation/current source; check target absence; fully decrypt and bind payload bytes; decrypt/bind globals and recheck DR role conflicts; apply opt-in validated globals; recheck target absence; create fresh database; prepare required schemas; restore native archive; report outcome. Failure may leave cluster roles or target objects partially changed. Leave them for explicit operator repair, report that fact, and never auto-retry or auto-drop them.
 
 M5a adds restore job/resource ownership and audit. Successful native restore is `restore-completed`; `restore-tested` requires an isolated restore plus stated validation of the required fixture/content. Keep the distinction explicit so a partial section restore or successful process exit never claims more than it proves. Preserve legacy development-manifest updates for compatibility until an explicit migration decision removes them; do not alter v1.
 
@@ -373,6 +374,7 @@ A new model should be able to resume from status plus contracts without trusting
 | 5 | M4a hybrid encryption/keys | ✅ Done | Streams, custody, recovery drills. |
 | 6 | M4b signing/v1 freeze | ✅ Done | Frozen 2026-10-01 with explicit limits. |
 | 7 | S — M5a cleanup/concurrency correction | ✅ Done | Startup purge removed; ownership proved by two-process scenes and both lock controls. |
+| 8R | R — review correctness corrections | ✅ Done | R01–R05 accepted 2026-10-05: 185 workspace tests, fast gates and all six PG16/17/18 matrices pass; evidence and handoff in §34. |
 | 8 | C1 — clean code and human readability | 🟡 Started | C01 measured in §33; §33.6 approved as C02's boundaries; C02-1 (`keys.rs`), C02-2/C02-3 (`store.rs`, complete) and C02-4 (`stage.rs`, the sink half of that boundary — `LocalStage`/`LocalJob`/`begin` held back, see §33.6's note) moved; `scratch`/`signed`/`development`/`plans`/`inventory`, `backupctl/src/command/`, C03 and C04 pending. |
 | 9 | A — complete M5a inventory/jobs/recovery | ⬜ Todo | Three earlier increments already implemented. |
 | 10 | B — M5b retention/protection/deletion | ⬜ Todo | Requires complete M5a and C1. |
@@ -382,8 +384,8 @@ A new model should be able to resume from status plus contracts without trusting
 | 14 | U — M8 API-backed UI | ⬜ Todo | Requires stable API. |
 | 15 | F — platform validation/release | ⬜ Todo | Original M9 full-platform track. |
 
-### ➡️ Current: #8 - C1 — clean code and human readability
-### ⏭️ Next: #9 - A — complete M5a without deletion
+### ➡️ Current: #8 - C1 — resume at C02-5 after accepted R corrections
+### ⏭️ Next: #9 - A — complete M5a after C1 acceptance
 
 Task IDs below remain stable even if a phase is split into several commits. Complete dependent tasks in listed order. Independent documentation can proceed alongside its owning task; later feature coding waits for the phase prerequisites.
 
@@ -407,9 +409,9 @@ Acceptance: active backup/restore/verify survives unrelated reads and refused co
 
 ### C1 — Clean code and human readability
 
-Purpose: make routine behavior understandable from named modules and straight-line orchestration. This is a separate phase, not permission to rewrite cryptography or change product behavior. Prerequisite: S acceptance. Preserve runtime dependencies and public contracts; the full refactor diff should explain structural moves, not new features.
+Purpose: make routine behavior understandable from named modules and straight-line orchestration. This is a separate phase, not permission to rewrite cryptography or change product behavior. Prerequisites: S and R acceptance (§34). Preserve runtime dependencies and public contracts; the full refactor diff should explain structural moves, not new features.
 
-Current pressure points: `backup-local/src/lib.rs` has 2202 lines, application lib.rs 1158 and inventory lib.rs 1217 including tests. Counts identify inspection targets, not quality thresholds. Long tests are not a reason to fragment coherent production logic, and a smaller file is not proof of simpler code.
+Current pressure points: the store, application and inventory crate roots mix several responsibilities. Historical line counts below belong to their recorded baselines; remeasure with `wc -l crates/*/src/*.rs` before a new extraction. Counts identify inspection targets, not quality thresholds. Long tests are not a reason to fragment coherent production logic, and a smaller file is not proof of simpler code.
 
 | Task | Ordered changes | Acceptance |
 |---|---|---|
@@ -448,7 +450,7 @@ Proposed private module destinations, adjusted only when code review shows a cle
 
 ```text
 backup-application/src/{lib,ports,backup,verify,restore,artifact_facts}.rs
-backup-local/src/{lib,layout,store,stage,signed,development,scratch,activity,plans,keys,inventory}.rs
+backup-local/src/{lib,layout,store,stage,signed,development,scratch,plans,keys,inventory}.rs
 backup-inventory/src/{lib,connection,artifact,job,job_lock,recovery,schema}.rs
 ```
 
@@ -495,7 +497,7 @@ Deletion is non-atomic across several directories. Report partial execution hone
 Prerequisites: B acceptance. Implement in reviewable increments; do not enable production data merely because a package installs.
 
 1. **H01 — configuration/release policy.** Record versioned production configuration, allowed connection/target topologies, secure local credential modes and any remote TLS extension. Preserve old fixture configuration for tests. Record error/JSON version policy and public-only/read-only key custody. Decide full/data-only/overwrite support explicitly; excluded behavior stays refused.
-2. **H02 — process/filesystem hardening.** Implement process-group timeout/cancellation for descendants; tests include a wrapper retaining pipes after the client dies. Verify tool provenance/matching versions, permission/ownership/no-follow paths, disk/scratch bounds and stable safe errors. Resolve key-command partial writes by validation before mutation or a documented transactional creation path. Validate true read-only discovery/verification and explicitly configured private scratch where decryption needs writes.
+2. **H02 — process/filesystem hardening.** Preserve R02’s delivered process-group timeout/exit cleanup; add explicit cancellation only with its real caller. Revalidate wrappers retaining pipes after their parent exits or times out under service permissions. Verify tool provenance/matching versions, permission/ownership/no-follow paths, disk/scratch bounds and stable safe errors. Resolve key-command partial writes by validation before mutation or a documented transactional creation path. Validate true read-only discovery/verification and explicitly configured private scratch where decryption needs writes.
 3. **H03 — systemd/package.** Build .deb targets/units under deploy/, install dedicated user and mode-controlled paths, wire profile invocation and chosen timer semantics, preserve data/keys on upgrade/removal. Verify process locks and SQLite migration under actual service permissions/sandbox. Test package reinstall/purge policy.
 4. **H04 — CI and operating guides.** Add pinned fast/matrix/package workflows; document installation, matching clients, credentials, key backup, inventory-copy consistency, recovery, stale alerts and isolated restore drills. A live SQLite database copy must use a consistent backup/export or quiescent maintenance ownership; DELETE journal does not make arbitrary concurrent raw copying safe.
 5. **H05 — clean-code checkpoint.** Review modules introduced by A/B/H against C1 rules, remove redundant adapters/branches and update ownership comments. Keep fixes and refactors distinguishable. Run affected regressions and package lifecycle gates; no global rewrite.
@@ -562,7 +564,7 @@ If a baseline cannot satisfy a frozen/accepted invariant, state the conflict and
 
 ## 29. Gate checklist for the next implementing model
 
-Start at C1. Phase S is accepted: the startup purge is gone, working directories are owned through `locks/activity.lock`, and `crates/backupctl/tests/store_concurrency.rs` runs competing CLI processes rather than one process calling a guard. Read [ADR 0004](docs/architecture/adr-0004-working-directory-ownership.md) for the acquisition order before touching any store or lock code, and keep its two controls (exclusive maintenance, exclusive scope) failing when weakened. C1 is behavior-preserving readability only; do not jump to the job surface because it looks small.
+Start with §34 and the current-status table. Finish R acceptance before resuming C1; C02-1 through C02-4 are already delivered and must not be repeated. Phase S is accepted: the startup purge is gone, working directories are owned through `locks/activity.lock`, and `crates/backupctl/tests/store_concurrency.rs` runs competing CLI processes rather than one process calling a guard. Read [ADR 0004](docs/architecture/adr-0004-working-directory-ownership.md) for the acquisition order before touching any store or lock code, and keep its two controls (exclusive maintenance, exclusive scope) failing when weakened. C1 is behavior-preserving readability only, using the corrected R behavior as its new baseline; do not jump to the job surface because it looks small.
 
 Before M5a close: S and C1 accepted; job/read-only/keyless modes exposed; discovery differs from adoption; source provenance of keyless rows honest; observations bound to bytes; restore jobs/use locks real; rebuild flags/history losses stated; corruption/secret-content/PG16–18 crash and regression gates pass.
 
@@ -709,3 +711,114 @@ Adjustments the measurements force, each with the failure it prevents:
 - **`backup-crypto`, `backup-postgres`, `backup-domain` are not in scope for C02.** `backup-postgres` exports one item, `backup-domain` is already module-per-concern, and the crypto module is frozen by vectors.
 
 Deferred to C03 by rule ("SQL stays in inventory, filesystem/crypto stays in local/crypto", and because these are semantic extractions, not moves): the six `Duration::from_secs` recomputes, the triple `config.validate()`, the duplicated level dispatch, and the plan-vs-run DR refusal wording — the last one changes a CLI error sentence and therefore needs an explicit decision rather than a helper.
+
+
+## 34. Review corrections and agent execution handoff — 2026-10-05
+
+This section supersedes older instructions to start immediately with C1. The operator requested implementation of the five review findings and a roadmap another agent can execute. R is a behavior-fix phase; C1 remains structural refactoring. Artifact v1 fields, signing tuple, suites, restore-plan format, CLI syntax and synthetic-only guards stay frozen. Existing `libc` and `serde_json` workspace packages are reused by adapters; Cargo.lock changes dependency edges only, not resolved versions.
+
+### 34.1 Start and finish rules
+
+1. Read this section, §§3/10/11/26/27/28, AGENT.md, ADRs 0002–0004, then the current source and every caller of the function to change. Historical file:line references are evidence, not live navigation; use `rg` to locate symbols.
+2. Inspect `git status --short` and preserve existing changes. Select the first unfinished task below. Do not redo delivered key/store/stage extractions, reimplement an existing lock, add empty modules, broaden production support, or start retention before A acceptance.
+3. For a behavior correction, establish a focused failing case, fix the common boundary and rerun its tests. For a move, preserve API and operation order and compare moved bodies. Never label a logic correction as a move-only refactor.
+4. Run affected checks during development and the phase gates after the final source edit. Record commands, exit codes, environment/majors, test totals and limitations in session-log.md. A historical passing matrix or a new unit test is not proof that the current matrix passes.
+5. Update the relevant task status, current/next markers and README after verification. A missing prerequisite leaves that acceptance gate pending with its precise reason; never mark the enclosing phase complete because code exists.
+
+### 34.2 R task contracts
+
+| ID | Owner and concrete change | Regression and acceptance |
+|---|---|---|
+| R01 | `backup-local/src/lib.rs`: `decrypt_to_scratch`, `authenticated_manifest`, `payload_plaintext`, `globals_plaintext`. Hash/count the exact ciphertext stream consumed by decryption; drain remaining bytes within recorded-size-plus-one; compare against the verified header or signed manifest before returning a plaintext view. Open ciphertext with O_NOFOLLOW and inspect the opened file. Construct the scratch owner before fallible file opens so refusal cleans up. | `signed_views_refuse_ciphertext_replaced_after_opening` replaces paths and overwrites inodes for payload/globals using only the public recipient; both are refused and scratch is empty. `manifest_decryption_binds_the_stream_to_the_verified_header` refuses a replaced manifest stream before JSON interpretation. Existing signed reads, plaintext limits and crypto vectors pass. A second hash of a path before decryption is insufficient: it recreates the race. |
+| R02 | `backup-postgres/src/tools.rs`: both `run` and `run_streaming`. Use `CommandExt::process_group(0)` and terminate that group on deadline and parent exit so descendants cannot hold inherited stdout/stderr open. Reap the direct child; retain bounded capture, warning refusals and safe errors. Reuse workspace libc. | `deadlines_close_descendant_pipes_in_both_runners` covers a sleeping child with a live parent and a background child after parent exit. Both runners finish within the test bound; streaming remains unbounded for archive bytes. Descendants that deliberately escape their group require later service/cgroup hardening in H02; this does not certify hostile executable supervision. |
+| R03 | Shared `read_bounded` in PostgreSQL runner: retain at most 65,536 bytes, continue draining to avoid pipe deadlock, remember overflow and refuse incomplete parsed stdout/stderr. Never echo dropped/captured content. Archive stdout uses streaming and is unaffected. | `capture_overflow_is_drained_and_refused` accepts exactly the limit, refuses overflowing stdout and stderr, and covers streaming stderr. All catalog/TOC callers inherit the refusal. Large catalog/TOC output above the cap is an explicit current limitation; a later supported-size task may introduce typed streaming or a justified larger bound with tests, never silent truncation. |
+| R04 | `backup-postgres/src/globals.rs`: replace whitespace/semicolon splitting with a small lexer for native role-export syntax: quoted identifiers, doubled quotes, quoted strings, E-string escapes and line comments. Preserve quoted text when rebuilding statements; reject unterminated quotes. `existing_roles` returns/decodes a JSON array so embedded whitespace/newlines survive lookup. Reuse workspace serde_json. | `quoted_identifiers_and_literals_survive_the_complete_parser` checks spaces, semicolons, embedded/trailing quotes, comment-looking literal text, memberships, existing-role exclusion and malformed input. M2 adds a native export/DR round trip for spaces, semicolons, quotes, newlines, membership and a semicolon/comment-looking role setting on all three majors; M4 matrices independently restore roles. Keep roles-only filtering and password-verifier refusal; arbitrary SQL/dollar-quoted function bodies are outside this parser’s contract. |
+| R05 | `RestoreService::run`: repeat target absence before cluster mutation, prepare fully decrypted/bound payload, then check/apply globals. Keep the second absence check immediately before CREATE DATABASE. Retain private payload view until native restore finishes. | `restore_refusals_precede_cluster_mutation` proves a target appearing after planning causes zero globals/CREATE DATABASE calls; a newly signed ciphertext with a corrupt age body passes signature/open checks but fails decryption with zero mutations. Existing successful DR/portable/partial restores pass. A target race after the first check is still possible until A05 target/use locks; failures never trigger automatic rollback/drop/retry. |
+
+R implementation status: **R01–R05 accepted 2026-10-05**. All fast and matrix gates pass; evidence is §34.7. The corrected behavior is the baseline for further C1 work. No planned A/B/H feature is implied by these corrections.
+
+### 34.3 Reproducible gates
+
+Run from the repository root:
+
+```sh
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --locked
+git diff --check
+bash tests/m1_docker_smoke.sh
+bash tests/m2_docker_smoke.sh
+bash tests/m3_docker_smoke.sh
+bash tests/m4a_docker_smoke.sh
+bash tests/m4b_docker_smoke.sh
+bash tests/m4a_key_drill.sh
+```
+
+Prerequisites: working Docker daemon, the scripts’ PostgreSQL 16/17/18 images, writable private temporary storage, available fixture ports and stock rage/rage-keygen (the scripts also check `$HOME/.cargo/bin`). Scripts own their synthetic containers and cleanup. Run matrices sequentially because several reuse ports 54336–54338. Capture each script’s stdout/stderr separately; verify its exit code and evidence for all three majors. Do not modify scripts merely to bypass a failed assertion. The historical 67-invocation CLI comparison harness under /tmp may be absent on another host; never claim that battery passed without reconstructing or retaining a reproducible harness. Focused tests and delivered smoke scripts are the reproducible R gates.
+
+### 34.4 Remaining C1 work, in order
+
+| Task | Starting symbols / implementation boundary | Completion evidence |
+|---|---|---|
+| C02-5 | Inspect `decrypt_to_scratch`, `authenticated_manifest`, `DigestReader`, `LocalPlaintext` and Drop ownership for a cohesive scratch extraction. Move private inherent helpers and their tests into scratch.rs only if it improves navigation. Keep public type definitions/guard fields at the crate root when moving them would widen ownership. | R01 replacement tests and store_concurrency scratch scenes pass. Plaintext cleanup occurs before activity-claim release on success/refusal/drop. Existing crate-root import paths compile. |
+| C02-6 | Inspect signed/development publication and reading, plan save/load, and `record_published`. Extract cohesive inherent bodies where useful; trait methods can remain at the root. Keep marker/fsync/rename/signature/decrypt order explicit and inventory bridge below application. | Signed/development store tests, plan expiry tests and M1–M4b matrices. Do not duplicate the signed binding reader, or add a wrapper per method solely to match a diagram. |
+| C02-7 | Inspect backupctl’s TopCommand match: parse/config → open/call → human/JSON report. Move command families only if their independent size warrants it. Reuse `open_store`, report.rs and existing JSON builders. | Same flags, JSON keys, refusal reasons and exit semantics; real CLI concurrency scenes still cover startup. Recovery stays in writable create and never ordinary read/dry-run. |
+| C03 | Inspect application ports/use cases/Opened and inventory open/recovery/SQL operations. Preserve `Opened`’s shared signed/development facts and LocalJob’s required orphan-rule bridge. Factor only repeated semantic work, with all callers traced. | Restore R05 order remains visible, no I/O in domain, SQL remains in inventory, no new runtime or trait without an actual adapter/test use. All composed-path and inventory migration tests pass. |
+| C04 | Remove demonstrably dead code/stale comments; shorten narration while retaining durability/trust/lock rationale; consolidate duplicate fixtures. Audit exported surface and dependency directions. | Full fast/matrix gates, accurate README/roadmap, no unexplained visibility widening, no mandatory file-count/line-count target. Mark C1 accepted only when the reviewable resulting structure satisfies these conditions. |
+
+Previously recorded JobLock no-follow/mode gap (§33.5.1) remains an explicit separate behavior task before A acceptance: use the opened descriptor’s regular-file/permission checks and O_NOFOLLOW without reversing dependencies or unlinking flock names. Test symlink/world-readable refusal and same-scope contention; preserve ActivityLock’s existing protection and ADR 0004 acquisition order. Do not silently fix it inside a structural move.
+
+### 34.5 Feature continuation and phase exits
+
+After R and C1 acceptance, execute existing §26 task IDs unchanged:
+
+| Phase | Ordered task sequence and prerequisites | Exit decision |
+|---|---|---|
+| A / M5a | A01 modes/jobs CLI → A02 observational reconciliation → A03 rebuild/recovery → A04 digest-bound events/enrichment → A05 restore target/artifact ownership → A06 PG crash/migration drill → A07 leakage/transaction checks → A08 operating guide and close. Existing backup rows are delivered; implement their missing readers/recovery, not a second inventory. | All unknown/conflict/adoption rules and real ownership/crash/privacy gates pass. No deletion enabled. |
+| B / M5b | Only after A: B01 exact policy/plan → B02 protection → B03 saved plans → B04 confirmed marker-first execution → B05 local rollback warning → B06 retention drill and close. | Last-valid/protected/active/job-dependent exclusions, exact-set revalidation, interruption/tombstone tests and recovery prove deletion safety. |
+| H / M6 | Only after B: H01 production configuration policy → H02 remaining process/filesystem/service hardening → H03 package/timer → H04 CI/operating guide → H05 readability review. Preserve R fixes; do not reimplement them. | Actual supported package/service environments pass lifecycle, permissions, key custody and recovery checks. Synthetic guard remains until V03. |
+| V / CLI release | V01 supported matrix/security/failure review → V02 benchmarks/recovery rehearsal → V03 explicit release/production-source decision. | Release limits, license/security/support docs and measured recovery agree. API/UI are not prerequisites. |
+| P → U → F | Explicit API/auth/worker decisions, existing-core adapters, then API-only UI, then full-platform verification. | Interface tests cannot bypass core trust/confirmation/ownership gates; no platform completion before all prerequisites pass. |
+
+Every handoff names the next exact task, affected symbols/files, tests executed and pending gates. Recheck current code/status rather than trusting a dated “done” sentence. A future issue discovered while refactoring becomes its own behavior correction with regression evidence.
+
+
+### 34.6 Change inventory
+
+| File path | Change type | Description |
+|---|---|---|
+| crates/backup-application/src/lib.rs | Modified | Target check and payload preparation before cluster mutations; later absence check retained. |
+| crates/backup-local/src/lib.rs | Modified | Consumption-bound ciphertext reader, no-follow open, early scratch ownership, manifest regression; encrypted development reads also use their recorded checksum binding. |
+| crates/backup-local/Cargo.toml | Modified | Reuse workspace libc for no-follow opens. |
+| crates/backup-local/tests/common/mod.rs | Modified | Existing test capture can observe target appearance and globals calls. |
+| crates/backup-local/tests/signed_store.rs | Modified | Replacement/in-place overwrite tests for payload and globals, with scratch cleanup. |
+| crates/backup-local/tests/signed_write_path.rs | Modified | Target-after-plan and valid-signature/corrupt-age refusals before mutation. |
+| crates/backup-postgres/src/tools.rs | Modified | Process-group cleanup and capture-overflow refusal, with regressions. |
+| crates/backup-postgres/src/globals.rs | Modified | Native-export quote-aware lexer and complete-parser regression. |
+| crates/backup-postgres/src/lib.rs | Modified | JSON role lookup preserves quoted names and keeps decode errors data-free. |
+| crates/backup-postgres/Cargo.toml | Modified | Reuse workspace libc/serde_json. |
+| Cargo.lock | Modified | Dependency edges only; no package version changes. |
+| tests/m2_docker_smoke.sh | Modified | Quoted-role native export/DR assertions on PostgreSQL 16/17/18. |
+| docs/backup-format/manifest-v1.md | Modified | Clarify consumption-time binding without changing the frozen format. |
+| docs/security/threat-model.md | Modified | Record T02 coverage and remaining filesystem/replay/host limits. |
+| project.md | Modified | Correct operation order, phase dependencies, current/next status and executable agent handoff. |
+| README.md | Modified | Describe corrections and link to the handoff. |
+| session-log.md | Modified | Append implementation and final verification evidence. |
+
+
+### 34.7 Acceptance evidence and next task
+
+Accepted 2026-10-05 on the working tree based on commit `2303019`:
+
+| Gate | Result |
+|---|---|
+| Workspace tests | 185 passed, 0 failed; includes six new regressions, existing crypto vectors, composed write/restore paths and four real-CLI concurrency scenes. |
+| Formatting / Clippy / diff | `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, `git diff --check`: exit 0. |
+| Shell syntax | `bash -n tests/m2_docker_smoke.sh`: exit 0. |
+| M1 / M2 / M3 / M4a / M4b / key drill | All six scripts exit 0 and each reports PostgreSQL 16, 17 and 18. |
+| Changes after initial matrix pass | M2 rerun with its new native quoted-role checks; M4a and key drill rerun after adding encrypted-development consumption binding. All three refreshed runs exit 0 on all majors. |
+| Compatibility / dependency check | No v1/plan field, signature input, suite, CLI syntax or resolved package version changes. Existing packages reused through three additional adapter dependency edges. |
+
+Local evidence logs: `/tmp/parsbackup-review-tests.log`, `/tmp/parsbackup-review-clippy.log`, `/tmp/parsbackup-review-matrices.txt`, `/tmp/parsbackup-review-refreshed-matrices.txt` and `/tmp/parsbackup-review-<script-name>.log`. These are ephemeral run evidence, not prerequisites for another agent; §34.3 supplies the checked-in commands/scripts to regenerate them. The historical 67-invocation comparison battery was not rerun and is not claimed here. No commit or push was requested.
+
+**Next implementing task: C02-5.** Inspect scratch/decryption helpers and their callers against the accepted consumption-binding and activity-lifetime invariants. If extraction adds delegation/visibility without improving cohesion, retain the current boundary and record that decision; then proceed to C02-6. Do not repeat C02-1 through C02-4 or start A features before C1 acceptance. The separate JobLock no-follow/mode task remains due before A acceptance.

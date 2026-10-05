@@ -31,71 +31,88 @@ pub(crate) fn has_password_clause(script: &[u8]) -> bool {
 }
 
 fn sql_role_name(token: &str) -> String {
-    let token = token.trim_end_matches(';').trim();
+    let token = token.trim();
     if token.starts_with('"') {
         // Identifier quoting doubles embedded quotes.
-        return token.trim_matches('"').replace("\"\"", "\"");
+        return token
+            .strip_prefix('"')
+            .and_then(|name| name.strip_suffix('"'))
+            .unwrap_or(token)
+            .replace("\"\"", "\"");
     }
     token.to_string()
 }
 
-fn classify_statement(statement: &str) -> StatementKind {
-    let mut parts = statement.split_whitespace();
-    let first = loop {
-        match parts.next() {
-            Some(word) if word.starts_with("--") => continue,
-            other => break other,
-        }
-    };
-    match first {
-        Some("CREATE") => match parts.next() {
-            Some(kind)
-                if kind.eq_ignore_ascii_case("ROLE") || kind.eq_ignore_ascii_case("USER") =>
-            {
-                match parts.next() {
-                    Some(name) => StatementKind::Role(sql_role_name(name)),
-                    None => StatementKind::Other,
+// ponytail: only pg_dumpall role syntax; use a full SQL parser if arbitrary SQL is accepted.
+// Quoted identifiers/strings, doubled quotes, E-string escapes and line comments are supported.
+fn sql_tokens(text: &str) -> Result<Vec<String>> {
+    let mut tokens = Vec::new();
+    let mut token = String::new();
+    let mut quote = None;
+    let mut escaped_string = false;
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if let Some(delimiter) = quote {
+            token.push(ch);
+            if escaped_string && ch == '\\' {
+                token.push(chars.next().context("unterminated SQL escape in globals")?);
+            } else if ch == delimiter {
+                if chars.peek() == Some(&delimiter) {
+                    token.push(chars.next().expect("peeked quote"));
+                } else {
+                    quote = None;
                 }
             }
-            _ => StatementKind::Other,
-        },
-        Some("ALTER") => match parts.next() {
-            Some(kind) if kind.eq_ignore_ascii_case("ROLE") => match parts.next() {
-                Some(name) => StatementKind::Role(sql_role_name(name)),
-                None => StatementKind::Other,
-            },
-            _ => StatementKind::Other,
-        },
-        Some("GRANT") => {
-            // GRANT <member-role> [,...] TO <grantee> [,...]
-            let grantee = parts
-                .position(|token| token.eq_ignore_ascii_case("TO"))
-                .and_then(|_| parts.next());
-            match grantee {
-                Some(name) => StatementKind::Membership(sql_role_name(name)),
-                None => StatementKind::Other,
+        } else if ch == '-' && chars.peek() == Some(&'-') {
+            for next in chars.by_ref() {
+                if next == '\n' {
+                    break;
+                }
             }
+            if !token.is_empty() {
+                tokens.push(std::mem::take(&mut token));
+            }
+        } else if ch == '\'' || ch == '"' {
+            escaped_string = ch == '\'' && token.eq_ignore_ascii_case("E");
+            quote = Some(ch);
+            token.push(ch);
+        } else if ch.is_whitespace() || ch == ';' {
+            if !token.is_empty() {
+                tokens.push(std::mem::take(&mut token));
+            }
+            if ch == ';' {
+                tokens.push(";".to_string());
+            }
+        } else {
+            token.push(ch);
         }
-        _ => StatementKind::Other,
     }
+    if quote.is_some() {
+        bail!("unterminated SQL quote in globals");
+    }
+    if !token.is_empty() {
+        tokens.push(token);
+    }
+    Ok(tokens)
 }
 
-/// Split a semicolon-delimited SQL script into statements, dropping trailing
-/// empty fragments. String literals in role statements contain no semicolons
-/// in our exports, so a naive split is safe here.
-fn split_statements(text: &str) -> Vec<String> {
-    text.split(';')
-        .map(|chunk| {
-            chunk
-                .lines()
-                .filter(|line| !line.trim_start().starts_with("--"))
-                .collect::<Vec<_>>()
-                .join(" ")
-                .trim()
-                .to_string()
-        })
-        .filter(|statement| !statement.is_empty())
-        .collect()
+fn classify_statement(parts: &[String]) -> StatementKind {
+    match parts {
+        [command, kind, name, ..]
+            if (command == "CREATE" && matches!(kind.as_str(), "ROLE" | "USER"))
+                || (command == "ALTER" && kind == "ROLE") =>
+        {
+            StatementKind::Role(sql_role_name(name))
+        }
+        [command, rest @ ..] if command == "GRANT" => rest
+            .iter()
+            .position(|token| token == "TO")
+            .and_then(|index| rest.get(index + 1))
+            .map_or(StatementKind::Other, |name| {
+                StatementKind::Membership(sql_role_name(name))
+            }),
+        _ => StatementKind::Other,
+    }
 }
 
 pub(crate) fn parse_role_statements(path: &Path) -> Result<Vec<(StatementKind, String)>> {
@@ -105,12 +122,11 @@ pub(crate) fn parse_role_statements(path: &Path) -> Result<Vec<(StatementKind, S
     }
     let bytes = fs::read(path).context("read globals file")?;
     let text = String::from_utf8(bytes).context("globals file is not valid UTF-8")?;
-    Ok(split_statements(&text)
-        .into_iter()
-        .map(|statement| {
-            let kind = classify_statement(&statement);
-            (kind, statement)
-        })
+    let tokens = sql_tokens(&text)?;
+    Ok(tokens
+        .split(|token| token == ";")
+        .filter(|parts| !parts.is_empty())
+        .map(|parts| (classify_statement(parts), parts.join(" ")))
         .collect())
 }
 
@@ -158,6 +174,38 @@ mod tests {
     use super::*;
     use uuid::Uuid;
 
+    #[test]
+    fn quoted_identifiers_and_literals_survive_the_complete_parser() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("backupctl-quoted-{}", Uuid::new_v4()));
+        fs::create_dir_all(&dir)?;
+        let path = dir.join("globals.sql");
+        let input = "-- roles\nCREATE ROLE \"Mixed Case\";\nCREATE ROLE \"semi;colon\";\nCREATE ROLE \"a\"\"quote\"\"\";\nALTER ROLE \"Mixed Case\" SET application_name TO 'semi;--colon';\nGRANT \"semi;colon\" TO \"Mixed Case\";";
+        fs::write(&path, input)?;
+        let statements = parse_role_statements(&path)?;
+        assert_eq!(
+            exported_role_names(&statements),
+            ["Mixed Case", "a\"quote\"", "semi;colon"]
+        );
+        assert_eq!(statements.len(), 5);
+        assert_eq!(
+            statements[4].0,
+            StatementKind::Membership("Mixed Case".to_string())
+        );
+        let (script, applied) = build_globals_script(&statements, &["Mixed Case".to_string()]);
+        assert_eq!(applied, 3);
+        assert!(!script.contains("ALTER ROLE"));
+        assert!(script.contains("GRANT \"semi;colon\" TO \"Mixed Case\";"));
+        assert!(sql_tokens("CREATE ROLE \"unfinished").is_err());
+        assert!(sql_tokens("ALTER ROLE x SET application_name TO 'unfinished").is_err());
+        assert_eq!(
+            sql_tokens("ALTER ROLE x SET application_name TO E'it\\'s;ok';")?
+                .last()
+                .unwrap(),
+            ";"
+        );
+        fs::remove_dir_all(dir)?;
+        Ok(())
+    }
     #[test]
     fn password_clause_detection_is_fail_closed() {
         assert!(has_password_clause(
@@ -251,6 +299,6 @@ mod tests {
     fn quoted_role_names_are_decoded() {
         assert_eq!(sql_role_name("\"Mixed Case\""), "Mixed Case");
         assert_eq!(sql_role_name("plain"), "plain");
-        assert_eq!(sql_role_name("trailing;"), "trailing");
+        assert_eq!(sql_role_name("trailing"), "trailing");
     }
 }

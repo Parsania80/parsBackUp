@@ -36,6 +36,8 @@ pub fn archive_bytes() -> Vec<u8> {
 pub struct Capture {
     reads: RefCell<Vec<(PathBuf, Vec<u8>)>>,
     created: RefCell<Vec<String>>,
+    pub target_exists: std::cell::Cell<bool>,
+    pub globals_applied: std::cell::Cell<usize>,
     /// Fired once, from the first byte a dump's stream is actually read.
     ///
     /// That instant is the point. It is mid-dump, on a real `backup create`, with no SQL
@@ -162,7 +164,7 @@ impl DatabaseAdapter for StubEngine<'_> {
         _database: &str,
         _timeout: Duration,
     ) -> Result<bool> {
-        Ok(false)
+        Ok(self.capture.target_exists.get())
     }
 
     fn role_conflicts(
@@ -180,6 +182,9 @@ impl DatabaseAdapter for StubEngine<'_> {
     }
 
     fn apply_globals(&self, _source: &Source, globals: &Path, _timeout: Duration) -> Result<()> {
+        self.capture
+            .globals_applied
+            .set(self.capture.globals_applied.get() + 1);
         self.capture.slurp(globals).map(|_| ())
     }
 

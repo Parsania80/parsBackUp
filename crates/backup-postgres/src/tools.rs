@@ -8,14 +8,14 @@ use anyhow::{Context, Result, bail};
 use backup_domain::Source;
 use std::fs;
 use std::io::{Read, Write};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-/// How much of a tool's stdout/stderr is kept for parsing; the rest is dropped
-/// rather than buffered, so a runaway query cannot exhaust memory.
+/// Capture remains bounded; overflow is drained and refused rather than parsed as complete.
 const MAX_CAPTURE: usize = 64 * 1024;
 
 pub(crate) const PG_DUMP: &str = "pg_dump";
@@ -114,6 +114,7 @@ pub(crate) fn run(
     timeout: Duration,
     stdin_data: Option<Vec<u8>>,
 ) -> Result<ProcessResult> {
+    command.process_group(0);
     let mut child = match stdin_data {
         Some(script) => {
             command
@@ -143,10 +144,11 @@ pub(crate) fn run(
     let started = Instant::now();
     let status: ExitStatus = loop {
         if let Some(status) = child.try_wait()? {
+            kill_group(child.id());
             break status;
         }
         if started.elapsed() >= timeout {
-            let _ = child.kill();
+            kill_group(child.id());
             let _ = child.wait();
             let _ = out_reader.join();
             let _ = err_reader.join();
@@ -170,6 +172,7 @@ pub(crate) fn run(
 
 fn read_bounded(mut reader: impl Read) -> Result<Vec<u8>> {
     let mut captured = Vec::new();
+    let mut overflow = false;
     let mut buffer = [0_u8; 8192];
     loop {
         let n = reader.read(&mut buffer)?;
@@ -177,9 +180,22 @@ fn read_bounded(mut reader: impl Read) -> Result<Vec<u8>> {
             break;
         }
         let remaining = MAX_CAPTURE.saturating_sub(captured.len());
+        overflow |= n > remaining;
         captured.extend_from_slice(&buffer[..n.min(remaining)]);
     }
+    if overflow {
+        bail!(
+            "PostgreSQL client output exceeds the {MAX_CAPTURE} byte capture limit; output withheld to protect data"
+        );
+    }
     Ok(captured)
+}
+
+fn kill_group(pid: u32) {
+    // Each tool starts its own group; descendants must release inherited pipes too.
+    unsafe {
+        libc::kill(-(pid as i32), libc::SIGKILL);
+    }
 }
 
 /// Runs a tool whose standard output *is* the artifact, streaming it into `consume`.
@@ -197,6 +213,7 @@ pub(crate) fn run_streaming(
     consume: &mut dyn FnMut(&mut dyn Read) -> Result<()>,
 ) -> Result<()> {
     let mut child = command
+        .process_group(0)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -211,12 +228,13 @@ pub(crate) fn run_streaming(
         loop {
             match child.try_wait() {
                 Ok(Some(status)) => {
+                    kill_group(child.id());
                     let _ = sender.send(Ok(status));
                     return;
                 }
                 Ok(None) => {
                     if Instant::now() >= deadline {
-                        let _ = child.kill();
+                        kill_group(child.id());
                         let _ = child.wait();
                         let _ = sender.send(Err(anyhow::anyhow!(
                             "{name} timed out; output was not used"
@@ -226,6 +244,8 @@ pub(crate) fn run_streaming(
                     thread::sleep(Duration::from_millis(50));
                 }
                 Err(error) => {
+                    kill_group(child.id());
+                    let _ = child.wait();
                     let _ = sender.send(Err(error).context("wait for PostgreSQL client tool"));
                     return;
                 }
@@ -275,6 +295,47 @@ mod tests {
         Ok(collected)
     }
 
+    #[test]
+    fn deadlines_close_descendant_pipes_in_both_runners() {
+        for script in ["echo started; sleep 5", "sleep 5 & exit 0"] {
+            let started = Instant::now();
+            let result = run(shell(script), Duration::from_millis(100), None);
+            if !script.contains("exit 0") {
+                assert!(result.err().unwrap().to_string().contains("timed out"));
+            } else {
+                assert!(result.is_ok());
+            }
+            assert!(started.elapsed() < Duration::from_secs(2));
+            let started = Instant::now();
+            let result = collect(script, Duration::from_millis(100));
+            if !script.contains("exit 0") {
+                assert!(result.unwrap_err().to_string().contains("timed out"));
+            } else {
+                assert!(result.is_ok());
+            }
+            assert!(started.elapsed() < Duration::from_secs(2));
+        }
+    }
+
+    #[test]
+    fn capture_overflow_is_drained_and_refused() {
+        assert_eq!(
+            read_bounded(&vec![b'x'; MAX_CAPTURE][..]).unwrap().len(),
+            MAX_CAPTURE
+        );
+        for script in ["head -c 70000 /dev/zero", "head -c 70000 /dev/zero >&2"] {
+            let error = run(shell(script), Duration::from_secs(5), None)
+                .err()
+                .unwrap();
+            assert!(error.to_string().contains("capture limit"), "{error}");
+        }
+        let error = collect(
+            "echo payload; head -c 70000 /dev/zero >&2",
+            Duration::from_secs(5),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("capture limit"), "{error}");
+    }
     #[test]
     fn streaming_is_not_bounded_by_the_capture_limit() {
         // Thirty times `MAX_CAPTURE`: a dump the size of a real database has to survive

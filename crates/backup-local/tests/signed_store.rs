@@ -652,3 +652,48 @@ fn the_signed_tuple_is_the_documented_width() {
     let tuple = signature_tuple(Uuid::nil().as_bytes(), &digest, &digest);
     assert_eq!(tuple.as_bytes().len(), 22 + 16 + 32 + 32);
 }
+
+#[test]
+fn signed_views_refuse_ciphertext_replaced_after_opening() -> Result<()> {
+    let root = Scratch::new("v1-replaced-after-open");
+    let keydir = Scratch::new("v1-replaced-after-open-keys");
+    let keys = Keys::generate(keydir.path());
+    let store = signed_store(root.path(), &keys);
+    let id = publish_one(&store, 1, true)?;
+    let artifact = store.open_signed(id)?;
+    let recipient = backup_crypto::keystore::KeyFile::load(
+        &keys.recipient,
+        backup_crypto::keystore::KeyRole::Recipient,
+    )?;
+    for (name, bytes) in [
+        ("payload.age", payload_bytes(9)),
+        ("globals.age", GLOBALS_SQL.to_vec()),
+    ] {
+        let mut forged = Vec::new();
+        backup_crypto::stream::encrypt(recipient.recipient(), bytes.as_slice(), &mut forged)?;
+        // Test both replacing the pathname and changing the existing inode.
+        for rename in [true, false] {
+            let path = artifact_dir(root.path(), id).join(name);
+            if rename {
+                let replacement = path.with_extension("replacement");
+                fs::write(&replacement, &forged)?;
+                fs::rename(replacement, &path)?;
+            } else {
+                fs::write(&path, &forged)?;
+            }
+            let result = if name == "payload.age" {
+                store.payload_plaintext(&artifact)
+            } else {
+                store.globals_plaintext(&artifact)
+            };
+            let error = failure(result);
+            assert!(
+                error.contains("ciphertext changed after authentication")
+                    || error.contains("failed to decrypt completely"),
+                "{error}"
+            );
+            assert_eq!(fs::read_dir(root.path().join("scratch"))?.count(), 0);
+        }
+    }
+    Ok(())
+}

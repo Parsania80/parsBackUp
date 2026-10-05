@@ -5,6 +5,8 @@ edition.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+libc.workspace = true
 backup-application = { path = "../backup-application" }
 backup-domain = { path = "../backup-domain" }
 uuid.workspace = true
+serde_json.workspace = true

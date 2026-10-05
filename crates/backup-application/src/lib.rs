@@ -1055,6 +1055,14 @@ impl<E: DatabaseAdapter, S: ArtifactStore> RestoreService<E, S> {
         // Re-bound here as well: a plan is a claim about a file that another process may
         // have swapped out while it sat in the store.
         Self::check_source(config, &facts, info.source_major)?;
+        if self
+            .engine
+            .database_exists(&config.source, &plan.target_database, timeout)?
+        {
+            bail!("target database appeared after planning; refusing to touch it");
+        }
+        // Complete decryption and ciphertext binding before any cluster mutation.
+        let payload = artifact.payload(&self.store)?;
         // Step 1 of the DR order: security metadata validated (digest binding
         // happened when the artifact was opened); re-check role conflicts at execution time.
         if plan.security.roles {
@@ -1100,7 +1108,6 @@ impl<E: DatabaseAdapter, S: ArtifactStore> RestoreService<E, S> {
         // Steps 4-6: schema/data, then ownership and privileges from the
         // archive's own ALTER OWNER/GRANT entries (skipped per policy). The view is
         // held for the length of the restore and its plaintext is removed after.
-        let payload = artifact.payload(&self.store)?;
         let restored = self.engine.restore_to_database(
             &config.source,
             &plan.target_database,

@@ -657,16 +657,14 @@ impl PostgresAdapter {
             .collect::<Vec<_>>()
             .join(", ");
         let statement = format!(
-            "SELECT rolname FROM pg_catalog.pg_roles WHERE rolname IN ({list}) ORDER BY rolname"
+            "SELECT COALESCE(json_agg(rolname ORDER BY rolname), '[]'::json) FROM pg_catalog.pg_roles WHERE rolname IN ({list})"
         );
         command.args(PSQL_QUERY_ARGS);
         command.arg(format!("--command={statement}"));
         let result = run(command, timeout, None).context("probe existing roles")?;
-        let text = String::from_utf8(result.stdout)?;
-        Ok(text
-            .lines()
-            .map(str::to_owned)
-            .filter(|l| !l.is_empty())
-            .collect())
+        // JSON preserves whitespace/newlines inside quoted role names.
+        serde_json::from_slice(&result.stdout).map_err(|_| {
+            anyhow::anyhow!("cannot decode existing role names; output withheld to protect data")
+        })
     }
 }
