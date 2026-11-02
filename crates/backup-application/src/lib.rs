@@ -1,3 +1,7 @@
+mod inventory;
+
+pub use inventory::{InventoryCheck, InventoryReader, InventoryService, JobInfo};
+
 use anyhow::{Context, Result, bail};
 use backup_domain::{
     AGE_FORMAT, ARCHIVE_COMPRESSION, ARCHIVE_FORMAT, ARTIFACT_FORMAT_VERSION, ArtifactManifest,

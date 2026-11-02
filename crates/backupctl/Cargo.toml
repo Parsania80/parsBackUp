@@ -16,3 +16,4 @@ uuid.workspace = true
 
 [dev-dependencies]
 backup-inventory = { path = "../backup-inventory" }
+rusqlite.workspace = true

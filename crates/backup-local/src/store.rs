@@ -6,8 +6,8 @@
 //! else here assumes that decision was already made, which is why publishing, reading and
 //! recovering never inspect a key file.
 //!
-//! [`LocalStore::recover`] is the only code in this crate that deletes anything, and it does so
-//! only under the store's exclusive maintenance claim — ADR 0004.
+//! [`LocalStore::recover`] removes abandoned working directories only under the store's exclusive
+//! maintenance claim; live stage and scratch owners remove their own directories on drop — ADR 0004.
 
 use crate::keys::load_pair;
 use crate::layout::{

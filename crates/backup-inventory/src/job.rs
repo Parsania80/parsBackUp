@@ -363,11 +363,17 @@ pub(super) fn events(conn: &Connection) -> Result<Vec<AuditEvent>> {
 fn read(row: &Row<'_>) -> Result<JobRow> {
     let started = text_column(row, "started_at_utc")?;
     let updated = text_column(row, "updated_at_utc")?;
+    let source_fingerprint = text_column(row, "source_fingerprint")?;
+    let profile_fingerprint = text_column(row, "profile_fingerprint")?;
+    ensure!(
+        crate::is_hex_id(&source_fingerprint) && crate::is_hex_id(&profile_fingerprint),
+        "inventory holds an invalid job fingerprint"
+    );
     Ok(JobRow {
         job_id: uuid_column(row, "job_id")?,
         backup_id: opt_uuid_column(row, "backup_id")?,
-        source_fingerprint: text_column(row, "source_fingerprint")?,
-        profile_fingerprint: text_column(row, "profile_fingerprint")?,
+        source_fingerprint,
+        profile_fingerprint,
         state: JobState::parse(&text_column(row, "state")?)?,
         started_at_utc: checked_timestamp("started_at_utc", started)?,
         updated_at_utc: checked_timestamp("updated_at_utc", updated)?,

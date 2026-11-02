@@ -9,6 +9,9 @@ backupctl --config /absolute/path/to/m4b.toml key generate
 backupctl --config /absolute/path/to/m4b.toml key publish
 backupctl --config /absolute/path/to/m4b.toml key status
 backupctl --config /absolute/path/to/m3.toml config check
+backupctl --config /absolute/path/to/m3.toml job list
+backupctl --config /absolute/path/to/m3.toml job inspect JOB_UUID
+backupctl --config /absolute/path/to/m3.toml inventory check
 backupctl --config /absolute/path/to/m3.toml profile list
 backupctl --config /absolute/path/to/m3.toml profile validate PROFILE_NAME
 backupctl --config /absolute/path/to/m3.toml backup create --confirm-synthetic
@@ -37,4 +40,30 @@ Each roadmap phase is complete only after its stated acceptance checks pass. Pha
 
 Review corrections (2026-10-05): signed decryption binds the ciphertext actually consumed to its authenticated digest before releasing plaintext; both PostgreSQL runners terminate their process groups; captured output above 64 KiB is refused rather than silently truncated; native role exports preserve quoted names; and restore checks target absence and decrypts the payload before changing roles. The [agent handoff and regression gates](project.md#34-review-corrections-and-agent-execution-handoff--2026-10-05) describe implementation boundaries, remaining clean-code work, acceptance checks and the order of later milestones. Production use remains gated by the roadmap.
 
-Verification for these corrections: 185 workspace tests and all six PostgreSQL 16/17/18 smoke/recovery matrices pass, including native quoted-role DR checks. Review phase R is accepted; the next roadmap task is C02-5, with C1 and later feature phases still unfinished.
+Verification for these corrections: 185 workspace tests and all six PostgreSQL 16/17/18 smoke/recovery matrices pass, including native quoted-role DR checks. Review phase R is accepted; C1 and later feature phases are still unfinished.
+
+Resumption review (2026-10-25): the next step remains C02-5 in roadmap §34.4: inspect scratch/decryption helpers and ownership, extracting a cohesive module only if it improves navigation without weakening ciphertext binding or cleanup/lock lifetimes. The working tree was clean at review start; the recorded test results above were not rerun for this documentation review.
+
+C02-5 implementation (2026-10-25): `backup-local/src/scratch.rs` now groups scratch decryption, consumed-ciphertext hashing, manifest decryption and plaintext-view cleanup, with its direct manifest regression. Public ownership types and private guard fields remain at the crate root. All 185 workspace tests, strict Clippy, formatting and diff checks pass on this extraction. Native PostgreSQL matrices were not rerun because Docker and stock rage tools are absent; C1 acceptance remains pending. The next implementation task is C02-6 in roadmap §34.4.
+
+C02-6 inspection (2026-10-25): the smallest justified next change is to move the existing artifact-to-inventory registration helper into `backup-local/src/inventory.rs`, preserving registration after durable publication. Publication/read sequences and the compact restore-plan methods can stay together. This inspection changed documentation only; C02-6 implementation and C1 acceptance remain pending.
+
+Resumption review (2026-11-02): C02-6 remains the next implementation step. The C02-5 changes are still uncommitted, and C1's native PostgreSQL matrix checks remain pending.
+
+C02-6 extraction (2026-11-02): artifact registration now lives in `backup-local/src/inventory.rs`, with publication order unchanged. The focused signed-write tests and 183 workspace tests passed; two existing replacement tests were excluded after full runs failed on a safe decryption error their assertions did not anticipate. Full-suite and native matrix verification remain pending.
+
+C02-6 verification follow-up (2026-11-02): both replacement tests now accept the safe header-parsing refusal caused when random age padding exceeds the authenticated ciphertext size bound, while still checking scratch cleanup. All 185 workspace tests, formatting and strict Clippy pass. Native matrices remain pending.
+
+Native test prerequisites (2026-11-02): stock `rage` and `rage-keygen` were installed temporarily and passed a round trip; the local V2Ray proxy reached both relevant registries. Docker still requires administrator installation, so the PostgreSQL matrices have not yet run.
+
+Native test results (2026-11-02): Docker is installed and all six PostgreSQL 16/17/18 matrices passed on the current working tree. The signing matrix passed on retry after an initial IPv4 fixture-port conflict. C1 remains open; C02-7 inspection is next.
+
+C02-7 (2026-11-02): the backup command dispatch now lives in `backupctl/src/backup.rs`, keeping recovery and reporting in their existing order; the other command families remain in the entry point. All 185 workspace tests and six PostgreSQL 16/17/18 matrices pass. C03 inspection is next.
+
+C03 inspection (2026-11-02): the shared restore and inventory paths already preserve distinct trust, recovery and transaction rules. No source simplification was justified; the C04 cleanup and acceptance review is next.
+
+C1 acceptance (2026-11-02): the cleanup review, 185 workspace tests, reconstructed CLI comparisons and all six PostgreSQL 16/17/18 matrices pass. Inventory and job command work is next; the separate job-lock permission and symlink hardening remains required before that phase is accepted.
+
+A01: `job list`, `job inspect` and `inventory check` read the existing inventory without loading keys, contacting PostgreSQL, migrating the database or changing job state. Operation type is reported as unknown because the existing schema does not record it. See the [inventory read contract](docs/development/m5a-inventory.md) for JSON, errors and limitations.
+
+The next implementation step is A02: discovery and reconciliation of inventory entries.

@@ -11,41 +11,44 @@ mod layout;
 
 #[cfg(test)]
 mod fixture;
+mod inventory;
 mod keys;
+mod scratch;
 mod stage;
 mod store;
 
 use anyhow::{Context, Result, bail};
 use backup_application::{
-    ArtifactHandle, ArtifactStore, JobHandle, JobRequest, PayloadSink, PlaintextView,
-    SignedArtifactHandle, SignedKeyFacts, StageHandle, StoreListing, WriteOptions,
+    ArtifactHandle, ArtifactStore, JobHandle, JobRequest, PayloadSink, SignedArtifactHandle,
+    SignedKeyFacts, StageHandle, StoreListing, WriteOptions,
 };
 use backup_crypto::HybridRecipient;
 use backup_crypto::keyid::{recipient_id, signer_id};
+use backup_crypto::keystore::KeyFile;
 pub use backup_crypto::keystore::KeyStatus;
-use backup_crypto::keystore::{IdentityProvider, KeyFile};
 use backup_crypto::protocol::{DIGEST_BYTES, HYBRID_SIGNATURE_BYTES};
 use backup_crypto::signing::{SigningKeyFile, signature_tuple};
 pub use backup_crypto::signing::{SigningKeyStatus, SigningRole};
-use backup_crypto::stream::{EncryptSink, decrypt, decrypt_with_limit};
+use backup_crypto::stream::EncryptSink;
 use backup_domain::{
     AGE_FORMAT, ArtifactManifest, DevelopmentManifest, GLOBALS_POLICY_EXPORTED,
     GLOBALS_POLICY_SKIPPED, MAX_PUBLIC_JSON_BYTES, PublicHeader, RestorePlan, profile_fingerprint,
 };
-use backup_inventory::{ActivityLock, ArtifactRow, Estate, Shape, State};
+use backup_inventory::ActivityLock;
+pub use inventory::LocalInventory;
 pub use keys::{
     generate_key_pair, generate_signing_pair, key_status, publish_recipient, publish_verifying,
     signing_key_status,
 };
 use layout::{
     AGE_GLOBALS_FILE, AGE_MANIFEST_FILE, AGE_PAYLOAD_FILE, ARTIFACTS_DIR, COMPLETE_MARKER,
-    GLOBALS_FILE, INVENTORY_FILE, MANIFEST_FILE, MANIFEST_TMP_FILE, MAX_MANIFEST_BYTES,
-    MAX_PLAN_BYTES, PAYLOAD_FILE, PLANS_DIR, PUBLIC_FILE, SCRATCH_DIR, SIGNATURE_FILE, STAGING_DIR,
+    GLOBALS_FILE, MANIFEST_FILE, MANIFEST_TMP_FILE, MAX_MANIFEST_BYTES, MAX_PLAN_BYTES,
+    PAYLOAD_FILE, PLANS_DIR, PUBLIC_FILE, SIGNATURE_FILE, STAGING_DIR,
 };
 use sha2::{Digest, Sha256};
 use stage::Target;
 use std::fs::{self, DirBuilder, File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{Read, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -149,20 +152,6 @@ impl Drop for LocalStage {
     }
 }
 
-impl Drop for LocalPlaintext {
-    fn drop(&mut self) {
-        if let Some(dir) = &self.scratch {
-            let _ = fs::remove_dir_all(dir);
-        }
-    }
-}
-
-impl PlaintextView for LocalPlaintext {
-    fn path(&self) -> &Path {
-        &self.path
-    }
-}
-
 impl StageHandle for LocalStage {
     fn payload_path(&self) -> &Path {
         &self.payload
@@ -213,114 +202,6 @@ impl ArtifactHandle for LocalArtifact {
 }
 
 impl LocalStore {
-    /// Adds the just-published artifact to the store's inventory index.
-    ///
-    /// Every discovery field is read from the [`PublicHeader`] this command sealed, because that
-    /// is the record a keyless reader will rebuild the index from later: a row stating anything
-    /// the file does not would make an honest rebuild look like a corrupt one. Only the profile
-    /// and the completion time come from the sealed manifest, and only because the writer host
-    /// holds the key that just read it — the whole reason those two columns are nullable.
-    ///
-    /// Runs after `complete`, so a failure here cannot un-publish a backup. ADR 0003 makes the
-    /// files authoritative for existence and the inventory an index over them, which means this
-    /// is exactly the state the reconcile pass was designed for and the one retention can never
-    /// act on: the artifact is reported as unregistered, never deleted as an unknown.
-    fn record_published(&self, manifest: &ArtifactManifest, header: &PublicHeader) -> Result<()> {
-        let estate = Estate::new(manifest.source_fingerprint.clone())?;
-        let path = self.root.join(INVENTORY_FILE);
-        let inventory = backup_inventory::Inventory::open(&path, &estate)
-            .with_context(|| format!("cannot open inventory {}", path.display()))?;
-        let row = ArtifactRow {
-            backup_id: header.backup_id,
-            source_fingerprint: estate.source_fingerprint,
-            profile_fingerprint: Some(profile_fingerprint(&manifest.profile_snapshot.name)),
-            shape: Shape::V1Signed,
-            signer_id: Some(header.signer_id.clone()),
-            recipient_id: Some(header.recipient_id.clone()),
-            payload_sha256: Some(header.payload_sha256.clone()),
-            manifest_sha256: Some(header.manifest_sha256.clone()),
-            recipient_suite: Some(header.recipient_suite.clone()),
-            signature_suite: Some(header.signature_suite.clone()),
-            payload_bytes: Some(header.payload_ciphertext_bytes),
-            manifest_bytes: Some(header.manifest_ciphertext_bytes),
-            completed_at_utc: Some(manifest.completed_at_utc.clone()),
-            state: State::Registered,
-        };
-        inventory.register(&row).with_context(|| {
-            format!(
-                "backup {} is published and restorable; only its inventory row failed, so it is \
-                 unregistered until a reconcile pass adopts it",
-                header.backup_id
-            )
-        })?;
-        Ok(())
-    }
-
-    /// Decrypts an age file into a fresh scratch directory.
-    ///
-    /// `max_plaintext_bytes` is the size the manifest recorded for this payload when it
-    /// has one; `None` applies the format-wide cap instead.
-    /// A recorded ciphertext binding is checked against the stream before the view is returned.
-    fn decrypt_to_scratch(
-        &self,
-        ciphertext: &Path,
-        name: &str,
-        max_plaintext_bytes: Option<u64>,
-        expected_ciphertext: Option<(u64, &str)>,
-    ) -> Result<LocalPlaintext> {
-        let keys = self
-            .keys
-            .as_ref()
-            .context("artifact is encrypted but no key files are configured")?;
-        ensure_regular_file(ciphertext)?;
-        let claim = ActivityLock::hold(&self.root)?;
-        let scratch = self.root.join(SCRATCH_DIR).join(Uuid::new_v4().to_string());
-        DirBuilder::new()
-            .mode(0o700)
-            .create(&scratch)
-            .context("create private scratch directory")?;
-        let view = LocalPlaintext {
-            path: scratch.join(name),
-            scratch: Some(scratch),
-            _claim: Some(claim),
-        };
-        let file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&view.path)
-            .context("create private scratch file")?;
-        let ciphertext = OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(ciphertext)
-            .context("open encrypted payload")?;
-        if !ciphertext.metadata()?.is_file() {
-            bail!("encrypted payload must be a regular file");
-        }
-        let bound = match expected_ciphertext {
-            Some((bytes, _)) => bytes.checked_add(1).context("ciphertext size overflow")?,
-            None => u64::MAX,
-        };
-        let mut reader = DigestReader {
-            inner: ciphertext.take(bound),
-            digest: Sha256::new(),
-            bytes: 0,
-        };
-        match max_plaintext_bytes {
-            Some(limit) => decrypt_with_limit(keys.identity.identity()?, &mut reader, file, limit)?,
-            None => decrypt(keys.identity.identity()?, &mut reader, file)?,
-        };
-        if let Some((bytes, digest)) = expected_ciphertext {
-            // Bind the exact stream decrypted, including any bytes age did not consume.
-            io::copy(&mut reader, &mut io::sink())?;
-            if reader.bytes != bytes || format!("{:x}", reader.digest.finalize()) != digest {
-                bail!("ciphertext changed after authentication; plaintext was not released");
-            }
-        }
-        Ok(view)
-    }
-
     /// The ids this store's own key files derive, as a v1 manifest and `public.json` must
     /// record them.
     ///
@@ -399,30 +280,6 @@ impl LocalStore {
         let text = std::str::from_utf8(&bytes)
             .with_context(|| format!("{} is not valid UTF-8", path.display()))?;
         PublicHeader::from_json(text)
-    }
-
-    /// Decrypts `manifest.age` into scratch, reads it under the manifest size cap, and
-    /// returns the authenticated manifest. The scratch copy is gone before this returns.
-    fn authenticated_manifest(
-        &self,
-        path: &Path,
-        header: &PublicHeader,
-    ) -> Result<ArtifactManifest> {
-        let view = self.decrypt_to_scratch(
-            path,
-            MANIFEST_FILE,
-            Some(MAX_MANIFEST_BYTES),
-            Some((header.manifest_ciphertext_bytes, &header.manifest_sha256)),
-        )?;
-        let result = (|| -> Result<ArtifactManifest> {
-            let bytes = read_bounded(view.path(), MAX_MANIFEST_BYTES + 1)?;
-            let manifest: ArtifactManifest = serde_json::from_slice(&bytes)
-                .context("manifest.age does not hold a v1 artifact manifest")?;
-            manifest.validate()?;
-            Ok(manifest)
-        })();
-        drop(view);
-        result
     }
 
     /// Refuses an artifact directory holding both a plaintext `manifest.json` and a sealed
@@ -1178,21 +1035,6 @@ impl ArtifactStore for LocalStore {
     }
 }
 
-struct DigestReader<R> {
-    inner: R,
-    digest: Sha256,
-    bytes: u64,
-}
-
-impl<R: Read> Read for DigestReader<R> {
-    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-        let n = self.inner.read(buffer)?;
-        self.digest.update(&buffer[..n]);
-        self.bytes += n as u64;
-        Ok(n)
-    }
-}
-
 fn ensure_real_dir(path: &Path) -> Result<()> {
     let meta = fs::symlink_metadata(path)?;
     if meta.file_type().is_symlink() || !meta.is_dir() {
@@ -1269,6 +1111,7 @@ fn digest_bytes(value: &str) -> Result<[u8; DIGEST_BYTES]> {
 mod tests {
     use super::*;
     use crate::fixture::{key_pair, temp_keys, temp_root};
+    use backup_application::PlaintextView;
     use backup_crypto::protocol::SUITE_HYBRID;
     use backup_domain::{DEV_FORMAT, PLAN_FORMAT, RestoreSecurityPolicy};
 
@@ -1311,45 +1154,6 @@ mod tests {
             recipient_suite: None,
             payload_plaintext_bytes: None,
         }
-    }
-
-    #[test]
-    fn manifest_decryption_binds_the_stream_to_the_verified_header() -> Result<()> {
-        let root = temp_root();
-        let keydir = temp_keys();
-        let (identity, recipient) = key_pair(&keydir);
-        let store = LocalStore::with_keys(root.clone(), &identity, &recipient)?;
-        let recipient = KeyFile::load(&recipient, backup_crypto::keystore::KeyRole::Recipient)?;
-        let path = root.join("manifest.age");
-        let mut original = Vec::new();
-        backup_crypto::stream::encrypt(recipient.recipient(), &b"{}"[..], &mut original)?;
-        let header = PublicHeader {
-            format_version: 1,
-            backup_id: Uuid::new_v4(),
-            recipient_id: "a".repeat(64),
-            signer_id: "b".repeat(64),
-            recipient_suite: "mlkem768x25519-v0".to_string(),
-            signature_suite: "ed25519+ml-dsa-65".to_string(),
-            manifest_ciphertext_bytes: original.len() as u64,
-            payload_ciphertext_bytes: 1,
-            manifest_sha256: format!("{:x}", Sha256::digest(&original)),
-            payload_sha256: "c".repeat(64),
-        };
-        // A shorter valid unsigned stream cannot be mistaken for the authenticated JSON.
-        let mut replacement = Vec::new();
-        backup_crypto::stream::encrypt(recipient.recipient(), &b""[..], &mut replacement)?;
-        fs::write(&path, replacement)?;
-        let error = store.authenticated_manifest(&path, &header).unwrap_err();
-        let error = format!("{error:#}");
-        assert!(
-            error.contains("ciphertext changed after authentication")
-                || error.contains("failed to decrypt completely"),
-            "{error}"
-        );
-        assert_eq!(fs::read_dir(root.join(SCRATCH_DIR))?.count(), 0);
-        fs::remove_dir_all(root)?;
-        fs::remove_dir_all(keydir)?;
-        Ok(())
     }
 
     #[test]

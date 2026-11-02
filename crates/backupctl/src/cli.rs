@@ -53,6 +53,25 @@ pub(crate) enum TopCommand {
         #[command(subcommand)]
         command: RestoreCommand,
     },
+    Job {
+        #[command(subcommand)]
+        command: JobCommand,
+    },
+    Inventory {
+        #[command(subcommand)]
+        command: InventoryCommand,
+    },
+}
+
+#[derive(Subcommand)]
+pub(crate) enum JobCommand {
+    List,
+    Inspect { id: Uuid },
+}
+
+#[derive(Subcommand)]
+pub(crate) enum InventoryCommand {
+    Check,
 }
 
 #[derive(Subcommand)]

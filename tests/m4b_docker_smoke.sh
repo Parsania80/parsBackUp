@@ -35,7 +35,7 @@ IDENTITY_MARKER='!backupctl-mlkem768x25519-v0'
 rage_bin=$(command -v rage || true)
 [[ -n "$rage_bin" ]] || rage_bin="$HOME/.cargo/bin/rage"
 [[ -x "$rage_bin" ]] || {
-    echo "the stock-rage assertion needs rage on PATH (cargo install age --locked)" >&2
+    echo "the stock-rage assertion needs rage on PATH (cargo install rage --locked)" >&2
     exit 1
 }
 rage_keygen="$(dirname "$rage_bin")/rage-keygen"

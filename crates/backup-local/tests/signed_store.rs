@@ -689,7 +689,8 @@ fn signed_views_refuse_ciphertext_replaced_after_opening() -> Result<()> {
             let error = failure(result);
             assert!(
                 error.contains("ciphertext changed after authentication")
-                    || error.contains("failed to decrypt completely"),
+                    || error.contains("failed to decrypt completely")
+                    || error.contains("artifact is not a readable age stream"),
                 "{error}"
             );
             assert_eq!(fs::read_dir(root.path().join("scratch"))?.count(), 0);

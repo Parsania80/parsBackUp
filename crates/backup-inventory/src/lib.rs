@@ -224,6 +224,31 @@ impl Inventory {
     /// matters here is the database's own journal mode — a WAL database copied without its
     /// sidecars cannot be opened read-only at all, which is why the inventory is not WAL.
     pub fn open_read_only(path: &Path, estate: &Estate) -> Result<Self> {
+        let conn = Self::read_only_connection(path)?;
+        let this = Self {
+            conn,
+            estate: estate.clone(),
+        };
+        this.check_binding(path)?;
+        Ok(this)
+    }
+
+    /// Opens an existing inventory read-only using its recorded estate binding.
+    pub fn open_read_only_bound(path: &Path) -> Result<Self> {
+        let conn = Self::read_only_connection(path)?;
+        let found = Self::binding(&conn)?.with_context(|| {
+            format!(
+                "{} has no source binding; refusing to guess its estate",
+                path.display()
+            )
+        })?;
+        Ok(Self {
+            conn,
+            estate: Estate::new(found)?,
+        })
+    }
+
+    fn read_only_connection(path: &Path) -> Result<Connection> {
         ensure!(
             path.is_file(),
             "no inventory at {}: the file does not exist, and a read of the store's history is not \
@@ -247,12 +272,7 @@ impl Inventory {
             "inventory {} is schema version {version}; this build understands up to {SCHEMA_VERSION}. Upgrade backupctl before reading it.",
             path.display()
         );
-        let this = Self {
-            conn,
-            estate: estate.clone(),
-        };
-        this.check_binding(path)?;
-        Ok(this)
+        Ok(conn)
     }
 
     /// Applies and then *reads back* the pragmas this format depends on.
@@ -449,12 +469,24 @@ impl Inventory {
 
     /// Every job, oldest start first, across all scopes.
     pub fn jobs(&self) -> Result<Vec<JobRow>> {
-        job::all(&self.conn)
+        let jobs = job::all(&self.conn)?;
+        ensure!(
+            jobs.iter()
+                .all(|row| row.source_fingerprint == self.estate.source_fingerprint),
+            "inventory holds a job from a different source estate"
+        );
+        Ok(jobs)
     }
 
     /// The row for one job id, if this index has seen it.
     pub fn job(&self, job_id: Uuid) -> Result<Option<JobRow>> {
-        job::one(&self.conn, job_id)
+        let job = job::one(&self.conn, job_id)?;
+        ensure!(
+            job.as_ref()
+                .is_none_or(|row| row.source_fingerprint == self.estate.source_fingerprint),
+            "inventory holds a job from a different source estate"
+        );
+        Ok(job)
     }
 
     /// The whole audit trail, in the order it was written.
