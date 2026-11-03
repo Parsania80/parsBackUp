@@ -355,6 +355,32 @@ fn a_read_command_leaves_a_live_backups_staging_directory_alone() {
     );
 }
 
+#[test]
+fn reconciliation_refuses_while_a_backup_is_publishing() {
+    let scene = Scene::new("reconcile-vs-backup", false, true);
+    let mut backup = scene.spawn(&["backup", "create", "--confirm-synthetic"]);
+    wait_for(
+        &scene.marker("dump-started"),
+        "backup did not reach its dump",
+    );
+    let stage = one_entry(&scene.staging(), "the running backup");
+    let listing = scene.run(&["inventory", "list"]);
+    assert!(listing.status.success(), "{}", text(&listing));
+    let output = scene.run(&["inventory", "reconcile"]);
+    assert!(
+        !output.status.success(),
+        "reconciliation must not race publication"
+    );
+    assert!(
+        text(&output).contains("RECONCILE_BUSY"),
+        "{}",
+        text(&output)
+    );
+    assert!(stage.is_dir());
+    scene.release();
+    assert!(backup.wait().unwrap().success());
+}
+
 /// The duplicate backup is refused by the scope lock, and that refusal is the point of ADR 0003's
 /// gate 9. The lock is still taken after the store opens, which is exactly where the startup purge
 /// used to destroy the dump its own refusal protected: the duplicate ran its recovery pass before

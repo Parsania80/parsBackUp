@@ -112,6 +112,141 @@ pub(crate) fn inventory(
                 bail!("INVENTORY_CORRUPT: structural integrity check failed");
             }
         }
+        command @ (InventoryCommand::List | InventoryCommand::Reconcile) => {
+            let reader = backup_local::LocalReconciler(config.storage.root.clone());
+            let report = match command {
+                InventoryCommand::List => backup_application::discover(&reader)?,
+                InventoryCommand::Reconcile => backup_application::reconcile(&reader)?,
+                InventoryCommand::Check => unreachable!(),
+                InventoryCommand::Rebuild { .. } => unreachable!(),
+                InventoryCommand::Adopt { .. } => unreachable!(),
+            };
+            if json_output {
+                let entries: Vec<_> = report
+                    .entries
+                    .iter()
+                    .map(|entry| {
+                        json!({
+                            "backup_id": entry.backup_id,
+                            "shape": entry.shape,
+                            "status": entry.status,
+                            "reason": entry.reason,
+                            "provenance": entry.provenance,
+                        })
+                    })
+                    .collect();
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(
+                        &json!({"entries": entries, "audit_recorded": report.audit_recorded})
+                    )?
+                );
+            } else {
+                for entry in report.entries {
+                    println!(
+                        "{}  {}  {}  {}  provenance={}",
+                        entry
+                            .backup_id
+                            .map_or_else(|| "unknown".to_owned(), |id| id.to_string()),
+                        entry.shape.unwrap_or("unknown"),
+                        entry.status,
+                        entry.reason.unwrap_or("-"),
+                        entry.provenance.unwrap_or("unknown")
+                    );
+                }
+            }
+        }
+        InventoryCommand::Adopt {
+            id,
+            source_fingerprint,
+        } => {
+            backup_local::LocalReconciler(config.storage.root.clone())
+                .adopt(id, &source_fingerprint)?;
+            if json_output {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(
+                        &json!({"backup_id": id, "source_fingerprint": source_fingerprint, "estate_provenance": "unconfirmed", "audit_recorded": true})
+                    )?
+                );
+            } else {
+                println!("adopted {id}; source {source_fingerprint} is unconfirmed");
+            }
+        }
+        InventoryCommand::Rebuild {
+            source_fingerprint,
+            dry_run: _,
+            prepare_rebuild,
+            confirm_rebuild,
+            plan_id,
+        } => {
+            let scanner = backup_local::LocalReconciler(config.storage.root.clone());
+            let (report, previous_inventory, prepared_plan) = if confirm_rebuild {
+                let (report, previous) =
+                    scanner.rebuild(&source_fingerprint, plan_id.expect("clap requires a plan"))?;
+                (report, previous, None)
+            } else if prepare_rebuild {
+                let (id, report) = scanner.prepare_rebuild(&source_fingerprint)?;
+                (report, None, Some(id))
+            } else {
+                (scanner.preview_rebuild(&source_fingerprint)?, None, None)
+            };
+            if json_output {
+                let entries: Vec<_> = report
+                    .entries
+                    .iter()
+                    .map(|entry| {
+                        json!({
+                            "backup_id": entry.backup_id,
+                            "shape": entry.shape,
+                            "status": entry.status,
+                            "reason": entry.reason,
+                        "provenance": entry.provenance,
+                        })
+                    })
+                    .collect();
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({
+                        "source_fingerprint": source_fingerprint,
+                        "entries": entries,
+                        "estate_provenance": "unconfirmed",
+                        "unknown_facts": ["source_provenance", "profile_fingerprint", "completed_at_utc", "verification"],
+                        "lost_history": ["jobs", "audit", "protection", "verification"],
+                        "audit_recorded": report.audit_recorded,
+                        "previous_inventory": previous_inventory,
+                        "rebuilt": confirm_rebuild,
+                        "plan_id": prepared_plan,
+                    }))?
+                );
+            } else {
+                println!(
+                    "source {source_fingerprint} is unconfirmed; rebuild loses job, audit, protection, and verification history"
+                );
+                for entry in report.entries {
+                    println!(
+                        "{}  {}  {}  {}",
+                        entry
+                            .backup_id
+                            .map_or_else(|| "unknown".to_owned(), |id| id.to_string()),
+                        entry.shape.unwrap_or("unknown"),
+                        entry.status,
+                        entry.reason.unwrap_or("-")
+                    );
+                }
+                if confirm_rebuild {
+                    println!(
+                        "inventory rebuilt; previous inventory: {}",
+                        previous_inventory
+                            .as_ref()
+                            .map_or_else(|| "none".to_owned(), |path| path.display().to_string())
+                    );
+                }
+                if let Some(id) = prepared_plan {
+                    println!("rebuild plan: {id}");
+                }
+            }
+        }
     }
     Ok(())
 }

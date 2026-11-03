@@ -60,3 +60,29 @@ impl<R: InventoryReader> InventoryService<R> {
         Ok(())
     }
 }
+
+pub struct DiscoveryEntry {
+    pub backup_id: Option<Uuid>,
+    pub shape: Option<&'static str>,
+    pub status: &'static str,
+    pub reason: Option<&'static str>,
+    pub provenance: Option<&'static str>,
+}
+
+pub struct ReconcileReport {
+    pub entries: Vec<DiscoveryEntry>,
+    pub audit_recorded: bool,
+}
+
+pub trait Reconciler {
+    fn discover(&self) -> Result<ReconcileReport>;
+    fn reconcile(&self) -> Result<ReconcileReport>;
+}
+
+pub fn discover<R: Reconciler>(reader: &R) -> Result<ReconcileReport> {
+    reader.discover()
+}
+
+pub fn reconcile<R: Reconciler>(reader: &R) -> Result<ReconcileReport> {
+    reader.reconcile()
+}

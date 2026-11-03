@@ -1,4 +1,6 @@
-use backup_inventory::{INVENTORY_FILE, JobGuard, JobScope};
+use backup_inventory::{
+    ActivityLock, ArtifactRow, Estate, INVENTORY_FILE, Inventory, JobGuard, JobScope, Shape, State,
+};
 use serde_json::Value;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -76,6 +78,297 @@ fn scope(id: Uuid) -> JobScope {
 }
 
 #[test]
+fn rebuild_preview_needs_neither_inventory_nor_keys() {
+    let scene = Scene::new();
+    fs::create_dir_all(scene.root().join("artifacts")).unwrap();
+    let id = Uuid::new_v4();
+    fs::create_dir(scene.root().join("artifacts").join(id.to_string())).unwrap();
+    let preview = json(scene.run(&[
+        "inventory",
+        "rebuild",
+        "--source-fingerprint",
+        SOURCE,
+        "--dry-run",
+    ]));
+    assert_eq!(preview["source_fingerprint"], SOURCE);
+    assert_eq!(preview["estate_provenance"], "unconfirmed");
+    assert!(
+        preview["unknown_facts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v == "source_provenance")
+    );
+    assert_eq!(preview["entries"][0]["status"], "incomplete");
+    assert_eq!(preview["audit_recorded"], false);
+    assert!(!scene.inventory().exists());
+    fs::write(scene.inventory(), b"damaged inventory").unwrap();
+    let before = fs::read(scene.inventory()).unwrap();
+    let preview = json(scene.run(&[
+        "inventory",
+        "rebuild",
+        "--source-fingerprint",
+        SOURCE,
+        "--dry-run",
+    ]));
+    assert_eq!(preview["entries"][0]["status"], "incomplete");
+    assert_eq!(fs::read(scene.inventory()).unwrap(), before);
+    assert!(
+        !scene
+            .run(&[
+                "inventory",
+                "rebuild",
+                "--source-fingerprint",
+                "wrong",
+                "--dry-run"
+            ])
+            .status
+            .success()
+    );
+    assert!(
+        !scene
+            .run(&["inventory", "rebuild", "--source-fingerprint", SOURCE])
+            .status
+            .success()
+    );
+    assert!(
+        !scene
+            .run(&[
+                "inventory",
+                "rebuild",
+                "--source-fingerprint",
+                SOURCE,
+                "--prepare-rebuild"
+            ])
+            .status
+            .success()
+    );
+    assert_eq!(fs::read(scene.inventory()).unwrap(), before);
+    fs::remove_dir(scene.root().join("artifacts").join(id.to_string())).unwrap();
+    assert!(
+        !scene
+            .run(&[
+                "inventory",
+                "rebuild",
+                "--source-fingerprint",
+                SOURCE,
+                "--confirm-rebuild"
+            ])
+            .status
+            .success()
+    );
+    let prepared = json(scene.run(&[
+        "inventory",
+        "rebuild",
+        "--source-fingerprint",
+        SOURCE,
+        "--prepare-rebuild",
+    ]));
+    let plan = prepared["plan_id"].as_str().unwrap();
+    let report = json(scene.run(&[
+        "inventory",
+        "rebuild",
+        "--source-fingerprint",
+        SOURCE,
+        "--confirm-rebuild",
+        "--plan-id",
+        plan,
+    ]));
+    assert_eq!(report["rebuilt"], true);
+    let backup = report["previous_inventory"].as_str().unwrap();
+    assert_eq!(fs::read(backup).unwrap(), before);
+    assert_eq!(
+        Inventory::open_read_only_bound(&scene.inventory())
+            .unwrap()
+            .estate()
+            .source_fingerprint,
+        SOURCE
+    );
+}
+
+#[test]
+fn rebuild_refuses_a_job_before_staging_starts() {
+    let scene = Scene::new();
+    fs::create_dir_all(scene.root().join("artifacts")).unwrap();
+    drop(Inventory::open(&scene.inventory(), &Estate::new(SOURCE.into()).unwrap()).unwrap());
+    let prepared = json(scene.run(&[
+        "inventory",
+        "rebuild",
+        "--source-fingerprint",
+        SOURCE,
+        "--prepare-rebuild",
+    ]));
+    let plan = prepared["plan_id"].as_str().unwrap();
+    let job = JobGuard::begin(&scene.root(), &scope(Uuid::new_v4())).unwrap();
+    error(
+        scene.run(&[
+            "inventory",
+            "rebuild",
+            "--source-fingerprint",
+            SOURCE,
+            "--confirm-rebuild",
+            "--plan-id",
+            plan,
+        ]),
+        "RECONCILE_BUSY",
+    );
+    job.complete().unwrap();
+    error(
+        scene.run(&[
+            "inventory",
+            "rebuild",
+            "--source-fingerprint",
+            SOURCE,
+            "--confirm-rebuild",
+            "--plan-id",
+            plan,
+        ]),
+        "RECONCILE_BUSY",
+    );
+    drop(job);
+    error(
+        scene.run(&[
+            "inventory",
+            "rebuild",
+            "--source-fingerprint",
+            SOURCE,
+            "--confirm-rebuild",
+            "--plan-id",
+            plan,
+        ]),
+        "stale",
+    );
+}
+
+#[test]
+fn cli_adopts_a_development_artifact_as_unconfirmed() {
+    let scene = Scene::new();
+    let id = Uuid::new_v4();
+    let artifact = scene.root().join("artifacts").join(id.to_string());
+    fs::create_dir_all(&artifact).unwrap();
+    fs::write(artifact.join("complete"), []).unwrap();
+    fs::write(artifact.join("payload.dump"), b"abc").unwrap();
+    fs::write(
+        artifact.join("manifest.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "format": "m1-development-plaintext", "id": id, "synthetic_only": true,
+            "database": "backupctl_fixture_a03", "source_major": 16, "source_version": "16",
+            "dump_client_version": "16", "application_version": "test", "archive_format": "custom",
+            "compression": "gzip", "created_unix_ms": 1, "size_bytes": 3,
+            "sha256": "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+            "status": "complete", "security_globals": false
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    drop(Inventory::open(&scene.inventory(), &Estate::new(SOURCE.into()).unwrap()).unwrap());
+    let adopted = json(scene.run(&[
+        "inventory",
+        "adopt",
+        &id.to_string(),
+        "--source-fingerprint",
+        SOURCE,
+    ]));
+    assert_eq!(adopted["estate_provenance"], "unconfirmed");
+    assert_eq!(adopted["audit_recorded"], true);
+    let listing = json(scene.run(&["inventory", "list"]));
+    assert_eq!(listing["entries"][0]["provenance"], "unconfirmed");
+    assert!(
+        !scene
+            .run(&[
+                "inventory",
+                "adopt",
+                &id.to_string(),
+                "--source-fingerprint",
+                SOURCE
+            ])
+            .status
+            .success()
+    );
+}
+
+#[test]
+fn reconcile_cli_is_explicit_idempotent_and_transactional() {
+    let scene = Scene::new();
+    fs::create_dir_all(scene.root().join("artifacts")).unwrap();
+    let estate = Estate::new(SOURCE.into()).unwrap();
+    let inventory = Inventory::open(&scene.inventory(), &estate).unwrap();
+    let row = ArtifactRow {
+        backup_id: Uuid::new_v4(),
+        source_fingerprint: SOURCE.into(),
+        profile_fingerprint: Some(PROFILE.into()),
+        shape: Shape::PlaintextDev,
+        signer_id: None,
+        recipient_id: None,
+        payload_sha256: None,
+        manifest_sha256: None,
+        recipient_suite: None,
+        signature_suite: None,
+        payload_bytes: None,
+        manifest_bytes: None,
+        completed_at_utc: Some("2026-01-01T00:00:00Z".into()),
+        state: State::Registered,
+    };
+    inventory.register(&row).unwrap();
+    let event_count = inventory.audit_events().unwrap().len();
+    drop(inventory);
+    let claim = ActivityLock::hold(&scene.root()).unwrap();
+    let before = fs::read(scene.inventory()).unwrap();
+    let listed = json(scene.run(&["inventory", "list"]));
+    assert_eq!(listed["audit_recorded"], false);
+    assert_eq!(listed["entries"][0]["status"], "missing");
+    assert_eq!(fs::read(scene.inventory()).unwrap(), before);
+    error(scene.run(&["inventory", "reconcile"]), "RECONCILE_BUSY");
+    drop(claim);
+    fs::remove_dir(scene.root().join("artifacts")).unwrap();
+    assert!(!scene.run(&["inventory", "reconcile"]).status.success());
+    let inventory = Inventory::open_read_only_bound(&scene.inventory()).unwrap();
+    assert_eq!(inventory.artifact(row.backup_id).unwrap().unwrap(), row);
+    assert_eq!(inventory.audit_events().unwrap().len(), event_count);
+    drop(inventory);
+    fs::create_dir(scene.root().join("artifacts")).unwrap();
+    let conn = rusqlite::Connection::open(scene.inventory()).unwrap();
+    conn.execute_batch("CREATE TRIGGER reject_observation BEFORE INSERT ON audit_event WHEN NEW.action = 'artifact_missing' BEGIN SELECT RAISE(FAIL, 'test rollback'); END;").unwrap();
+    drop(conn);
+    assert!(!scene.run(&["inventory", "reconcile"]).status.success());
+    let inventory = Inventory::open_read_only_bound(&scene.inventory()).unwrap();
+    assert_eq!(inventory.artifact(row.backup_id).unwrap().unwrap(), row);
+    assert_eq!(inventory.audit_events().unwrap().len(), event_count);
+    drop(inventory);
+    let conn = rusqlite::Connection::open(scene.inventory()).unwrap();
+    conn.execute_batch("DROP TRIGGER reject_observation")
+        .unwrap();
+    drop(conn);
+    let first = json(scene.run(&["inventory", "reconcile"]));
+    assert_eq!(first["audit_recorded"], true);
+    assert_eq!(first["entries"][0]["status"], "missing");
+    assert_eq!(first["entries"][0]["backup_id"], row.backup_id.to_string());
+    let second = json(scene.run(&["inventory", "reconcile"]));
+    assert_eq!(second["audit_recorded"], false);
+    let inventory = Inventory::open_read_only_bound(&scene.inventory()).unwrap();
+    let updated = inventory.artifact(row.backup_id).unwrap().unwrap();
+    assert_eq!(updated.state, State::Missing);
+    assert_eq!(updated.profile_fingerprint, row.profile_fingerprint);
+    assert_eq!(updated.completed_at_utc, row.completed_at_utc);
+    assert_eq!(inventory.audit_events().unwrap().len(), event_count + 1);
+}
+
+#[test]
+fn reconciliation_refuses_symlinked_inventory() {
+    let scene = Scene::new();
+    fs::create_dir_all(scene.root().join("artifacts")).unwrap();
+    let outside = scene.0.join("outside.db");
+    drop(Inventory::open(&outside, &Estate::new(SOURCE.into()).unwrap()).unwrap());
+    let before = fs::read(&outside).unwrap();
+    std::os::unix::fs::symlink(&outside, scene.inventory()).unwrap();
+    error(
+        scene.run(&["inventory", "reconcile"]),
+        "INVENTORY_OPEN_FAILED",
+    );
+    assert_eq!(fs::read(outside).unwrap(), before);
+}
+
+#[test]
 fn reads_jobs_and_integrity_without_keys_writes_or_sweeping() {
     let scene = Scene::new();
     fs::create_dir_all(scene.root()).unwrap();
@@ -96,6 +389,7 @@ fn reads_jobs_and_integrity_without_keys_writes_or_sweeping() {
     let backup_id = Uuid::new_v4();
     let running = JobGuard::begin(&scene.root(), &scope(backup_id)).unwrap();
     let running_id = running.id();
+    fs::create_dir_all(scene.root().join("artifacts")).unwrap();
     let before = fs::read(scene.inventory()).unwrap();
     fs::set_permissions(scene.inventory(), fs::Permissions::from_mode(0o400)).unwrap();
     fs::set_permissions(scene.root(), fs::Permissions::from_mode(0o500)).unwrap();
@@ -120,8 +414,14 @@ fn reads_jobs_and_integrity_without_keys_writes_or_sweeping() {
     assert_eq!(current["job"]["source_fingerprint"], SOURCE);
     let check = json(scene.run(&["inventory", "check"]));
     assert_eq!(check["valid"], true);
-    assert_eq!(check["schema_version"], 2);
+    assert_eq!(check["schema_version"], backup_inventory::SCHEMA_VERSION);
     assert_eq!(check["audit_recorded"], false);
+    assert!(
+        json(scene.run(&["inventory", "list"]))["entries"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
     error(
         scene.run(&["job", "inspect", &Uuid::new_v4().to_string()]),
         "JOB_NOT_FOUND",
@@ -130,16 +430,23 @@ fn reads_jobs_and_integrity_without_keys_writes_or_sweeping() {
     assert!(!scene.root().join("inventory.db-journal").exists());
     let copy = Scene::new();
     fs::create_dir_all(copy.root()).unwrap();
+    fs::create_dir(copy.root().join("artifacts")).unwrap();
     fs::copy(scene.inventory(), copy.inventory()).unwrap();
     fs::set_permissions(copy.inventory(), fs::Permissions::from_mode(0o400)).unwrap();
     fs::set_permissions(copy.root(), fs::Permissions::from_mode(0o500)).unwrap();
     assert_eq!(json(copy.run(&["inventory", "check"]))["valid"], true);
+    assert!(
+        json(copy.run(&["inventory", "list"]))["entries"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
     assert_eq!(
         json(copy.run(&["job", "inspect", &running_id.to_string()]))["job"]["state"],
         "running"
     );
     assert_eq!(before, fs::read(copy.inventory()).unwrap());
-    assert_eq!(fs::read_dir(copy.root()).unwrap().count(), 1);
+    assert_eq!(fs::read_dir(copy.root()).unwrap().count(), 2);
     fs::set_permissions(copy.root(), fs::Permissions::from_mode(0o700)).unwrap();
     fs::set_permissions(scene.root(), fs::Permissions::from_mode(0o700)).unwrap();
     fs::set_permissions(scene.inventory(), fs::Permissions::from_mode(0o600)).unwrap();
@@ -191,6 +498,14 @@ fn old_inventory_is_checked_without_migration_and_jobs_fail() {
         1
     );
     error(scene.run(&["job", "list"]), "INVENTORY_READ_FAILED");
+    fs::create_dir_all(scene.root().join("artifacts")).unwrap();
+    assert!(
+        json(scene.run(&["inventory", "list"]))["entries"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(!scene.run(&["inventory", "reconcile"]).status.success());
     assert_eq!(before, fs::read(scene.inventory()).unwrap());
     let conn = rusqlite::Connection::open_with_flags(
         scene.inventory(),
@@ -273,7 +588,8 @@ fn damaged_job_and_newer_schema_are_refused() {
         "INVENTORY_READ_FAILED",
     );
     let conn = rusqlite::Connection::open(scene.inventory()).unwrap();
-    conn.pragma_update(None, "user_version", 3).unwrap();
+    conn.pragma_update(None, "user_version", backup_inventory::SCHEMA_VERSION + 1)
+        .unwrap();
     drop(conn);
     error(scene.run(&["inventory", "check"]), "INVENTORY_OPEN_FAILED");
 }

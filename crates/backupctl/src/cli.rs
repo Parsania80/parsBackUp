@@ -72,6 +72,29 @@ pub(crate) enum JobCommand {
 #[derive(Subcommand)]
 pub(crate) enum InventoryCommand {
     Check,
+    List,
+    Reconcile,
+    Adopt {
+        id: Uuid,
+        #[arg(long)]
+        source_fingerprint: String,
+    },
+    Rebuild {
+        #[arg(long)]
+        source_fingerprint: String,
+        #[arg(long, conflicts_with_all = ["confirm_rebuild", "prepare_rebuild"], required_unless_present_any = ["confirm_rebuild", "prepare_rebuild"])]
+        dry_run: bool,
+        #[arg(long, conflicts_with_all = ["dry_run", "confirm_rebuild"], required_unless_present_any = ["dry_run", "confirm_rebuild"])]
+        prepare_rebuild: bool,
+        #[arg(long, conflicts_with_all = ["dry_run", "prepare_rebuild"], required_unless_present_any = ["dry_run", "prepare_rebuild"])]
+        confirm_rebuild: bool,
+        #[arg(
+            long,
+            requires = "confirm_rebuild",
+            required_if_eq("confirm_rebuild", "true")
+        )]
+        plan_id: Option<Uuid>,
+    },
 }
 
 #[derive(Subcommand)]

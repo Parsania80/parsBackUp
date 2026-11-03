@@ -138,6 +138,33 @@ pub struct Inventory {
 }
 
 impl Inventory {
+    pub fn probe_version(path: &Path) -> Result<i64> {
+        let conn = Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )?;
+        Ok(schema::user_version(&conn)?)
+    }
+
+    /// Initialize a securely pre-created empty staging file.
+    pub fn initialize_staged(path: &Path, estate: &Estate) -> Result<Self> {
+        let conn = Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )?;
+        ensure!(
+            schema::user_version(&conn)? == 0,
+            "staged inventory is not empty"
+        );
+        Self::configure(&conn, path, false)?;
+        schema::migrate(&conn)?;
+        let inventory = Self {
+            conn,
+            estate: estate.clone(),
+        };
+        inventory.bind_or_check(path)?;
+        Ok(inventory)
+    }
     /// Opens for writing, creating the file and migrating the schema as needed.
     ///
     /// `Estate` is checked, not assumed: a database left behind by a different source is refused
@@ -186,8 +213,11 @@ impl Inventory {
         if !path.exists() {
             return Ok(None);
         }
-        let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)
-            .with_context(|| format!("cannot open inventory {}", path.display()))?;
+        let conn = Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )
+        .with_context(|| format!("cannot open inventory {}", path.display()))?;
         Self::configure(&conn, path, false)?;
         let version = schema::user_version(&conn)?;
         ensure!(
@@ -215,6 +245,51 @@ impl Inventory {
             conn,
             estate: Estate::new(found)?,
         }))
+    }
+
+    /// Opens an existing current-schema inventory for writing without migrating it.
+    pub fn open_existing_current(path: &Path, estate: &Estate) -> Result<Self> {
+        let conn = Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )?;
+        ensure!(
+            schema::user_version(&conn)? == SCHEMA_VERSION,
+            "inventory schema changed during reconciliation"
+        );
+        let binding = Self::binding(&conn)?.context("inventory has no source binding")?;
+        ensure!(
+            binding == estate.source_fingerprint,
+            "inventory estate changed during reconciliation"
+        );
+        Self::configure(&conn, path, false)?;
+        Ok(Self {
+            conn,
+            estate: Estate::new(binding)?,
+        })
+    }
+
+    /// Upgrade an existing bound inventory without creating a database or following a symlink.
+    pub fn open_existing_upgrade(path: &Path, estate: &Estate) -> Result<Self> {
+        let conn = Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )?;
+        let version = schema::user_version(&conn)?;
+        ensure!(
+            version > 0 && version <= SCHEMA_VERSION,
+            "unsupported inventory schema"
+        );
+        ensure!(
+            Self::binding(&conn)?.as_deref() == Some(&estate.source_fingerprint),
+            "inventory estate mismatch"
+        );
+        Self::configure(&conn, path, false)?;
+        schema::migrate(&conn)?;
+        Ok(Self {
+            conn,
+            estate: estate.clone(),
+        })
     }
 
     /// Opens an existing inventory without writing, creating, or migrating anything.
@@ -255,8 +330,11 @@ impl Inventory {
              the moment to create one",
             path.display()
         );
-        let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
-            .with_context(|| format!("cannot open inventory {} read-only", path.display()))?;
+        let conn = Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )
+        .with_context(|| format!("cannot open inventory {} read-only", path.display()))?;
         Self::configure(&conn, path, true)
             .with_context(|| format!("cannot open inventory {} read-only", path.display()))?;
         let version = schema::user_version(&conn)?;
@@ -394,9 +472,7 @@ impl Inventory {
         Ok(problems)
     }
 
-    /// Inserts or replaces the row for one artifact. Idempotent by design: a successful backup and
-    /// a reconcile pass both land here, and re-recording what the files already say is not an
-    /// error — see [`UPSERT`][artifact::UPSERT_ARTIFACT] for why replacement, not merge.
+    /// Registers an artifact without replacing existing observations or conflicting facts.
     ///
     /// The [`AuditAction::ArtifactRegistered`] event carries no job id, because the store's publish
     /// path is what calls this and it holds no job; the link back to a `backup create` is the
@@ -415,6 +491,62 @@ impl Inventory {
         })
     }
 
+    /// Record an observed artifact without claiming its source or signature is authenticated.
+    pub fn adopt(&self, row: &ArtifactRow) -> Result<()> {
+        row.validate(&self.estate)?;
+        ensure!(
+            row.profile_fingerprint.is_none() && row.completed_at_utc.is_none(),
+            "adoption cannot assert private facts"
+        );
+        in_transaction(&self.conn, |conn| {
+            let present: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM artifact WHERE backup_id = ?1)",
+                [row.backup_id.to_string()],
+                |r| r.get(0),
+            )?;
+            ensure!(!present, "artifact is already registered");
+            artifact::write(conn, row)?;
+            conn.execute(
+                "INSERT INTO provisional_artifact (backup_id) VALUES (?1)",
+                [row.backup_id.to_string()],
+            )?;
+            job::record(
+                conn,
+                AuditAction::ArtifactAdopted,
+                None,
+                Some(row.backup_id),
+            )
+        })
+    }
+
+    /// Check provenance after a signed manifest has been authenticated, without mutating it.
+    pub fn check_provisional_source(&self, id: Uuid, source: &str) -> Result<()> {
+        let provisional: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM provisional_artifact WHERE backup_id = ?1)",
+            [id.to_string()],
+            |r| r.get(0),
+        )?;
+        ensure!(
+            !provisional || source == self.estate.source_fingerprint,
+            "authenticated artifact source conflicts with its provisional inventory estate"
+        );
+        Ok(())
+    }
+
+    pub fn is_provisional(&self, id: Uuid) -> Result<bool> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM provisional_artifact WHERE backup_id = ?1)",
+            [id.to_string()],
+            |r| r.get(0),
+        )?)
+    }
+
+    pub fn record_rebuild(&self) -> Result<()> {
+        in_transaction(&self.conn, |conn| {
+            job::record(conn, AuditAction::InventoryRebuilt, None, None)
+        })
+    }
+
     /// Every row, oldest completion first, with the never-completed ones last.
     ///
     /// `completed_at_utc` orders this, and only it: `backup_id` is a random UUIDv4 and orders
@@ -425,7 +557,39 @@ impl Inventory {
             "SELECT {} FROM artifact ORDER BY completed_at_utc IS NULL, completed_at_utc, backup_id",
             artifact::ARTIFACT_COLUMNS
         ))?;
-        self.read_rows(&mut stmt)
+        let rows = self.read_rows(&mut stmt)?;
+        for row in &rows {
+            row.validate(&self.estate)?;
+        }
+        Ok(rows)
+    }
+
+    /// Applies observations without replacing discovery or authenticated fields.
+    pub fn reconcile_states(
+        &self,
+        snapshot: &[ArtifactRow],
+        changes: &[(Uuid, State, State)],
+    ) -> Result<()> {
+        in_transaction(&self.conn, |conn| {
+            ensure!(
+                self.artifacts()? == snapshot,
+                "inventory changed during reconciliation"
+            );
+            for &(id, from, to) in changes {
+                let count = conn.execute(
+                    "UPDATE artifact SET state = ?1 WHERE backup_id = ?2 AND state = ?3",
+                    rusqlite::params![to.as_str(), id.to_string(), from.as_str()],
+                )?;
+                ensure!(count == 1, "inventory changed during reconciliation");
+                let action = match to {
+                    State::Registered => AuditAction::ArtifactObserved,
+                    State::Missing => AuditAction::ArtifactMissing,
+                    State::Conflict => AuditAction::ArtifactConflict,
+                };
+                job::record(conn, action, None, Some(id))?;
+            }
+            Ok(())
+        })
     }
 
     /// The row for one id, if this index has seen it.
@@ -619,14 +783,24 @@ mod tests {
             .collect::<rusqlite::Result<Vec<_>>>()
             .unwrap();
         tables.sort();
-        assert_eq!(tables, ["artifact", "audit_event", "job", "meta"]);
+        assert_eq!(
+            tables,
+            [
+                "artifact",
+                "audit_event",
+                "job",
+                "meta",
+                "provisional_artifact"
+            ]
+        );
         assert_eq!(
             tables,
             vec![
                 "artifact".to_string(),
                 "audit_event".to_string(),
                 "job".to_string(),
-                "meta".to_string()
+                "meta".to_string(),
+                "provisional_artifact".to_string()
             ]
         );
         // And with it the jobs the sweep reads.
@@ -688,6 +862,22 @@ mod tests {
         assert!(error.contains("refusing to merge two estates"), "{error}");
 
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn adoption_rolls_back_row_and_provenance_when_audit_fails() {
+        let (dir, path) = created("adopt-rollback");
+        let inventory = Inventory::open(&path, &estate()).unwrap();
+        let mut row = signed_row("00000000-0000-4000-8000-000000000001");
+        row.profile_fingerprint = None;
+        row.completed_at_utc = None;
+        inventory.conn.execute_batch("CREATE TRIGGER reject_adopt BEFORE INSERT ON audit_event WHEN NEW.action = 'artifact_adopted' BEGIN SELECT RAISE(FAIL, 'injected'); END;").unwrap();
+        assert!(inventory.adopt(&row).is_err());
+        assert!(inventory.artifact(row.backup_id).unwrap().is_none());
+        assert!(!inventory.is_provisional(row.backup_id).unwrap());
+        assert!(inventory.audit_events().unwrap().is_empty());
+        drop(inventory);
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -805,6 +995,53 @@ mod tests {
             completed_at_utc: Some("2026-09-28T06:15:00Z".to_string()),
             ..row.clone()
         }
+    }
+
+    #[test]
+    fn registration_preserves_known_facts_and_observed_state() {
+        let (dir, path) = created("preserve-observations");
+        let inventory = Inventory::open(&path, &estate()).unwrap();
+        let row = signed_row("3f7a1c92-8a3e-4b6d-9c21-0d5f7a1c928a");
+        inventory.register(&row).unwrap();
+        inventory
+            .reconcile_states(
+                std::slice::from_ref(&row),
+                &[(row.backup_id, State::Registered, State::Missing)],
+            )
+            .unwrap();
+        let mut partial = row.clone();
+        partial.profile_fingerprint = None;
+        partial.completed_at_utc = None;
+        inventory.register(&partial).unwrap();
+        let stored = inventory.artifact(row.backup_id).unwrap().unwrap();
+        assert_eq!(stored.profile_fingerprint, row.profile_fingerprint);
+        assert_eq!(stored.completed_at_utc, row.completed_at_utc);
+        assert_eq!(stored.state, State::Missing);
+        let before = inventory.audit_events().unwrap();
+        partial.payload_sha256 = Some("e".repeat(64));
+        assert!(inventory.register(&partial).is_err());
+        assert_eq!(inventory.artifact(row.backup_id).unwrap().unwrap(), stored);
+        assert_eq!(inventory.audit_events().unwrap(), before);
+        let snapshot = inventory.artifacts().unwrap();
+        inventory.conn.execute(
+            "UPDATE artifact SET completed_at_utc = '2026-09-29T06:15:00Z' WHERE backup_id = ?1",
+            [row.backup_id.to_string()],
+        ).unwrap();
+        assert!(
+            inventory
+                .reconcile_states(
+                    &snapshot,
+                    &[(row.backup_id, State::Missing, State::Conflict)]
+                )
+                .is_err()
+        );
+        assert_eq!(
+            inventory.artifact(row.backup_id).unwrap().unwrap().state,
+            State::Missing
+        );
+        assert_eq!(inventory.audit_events().unwrap(), before);
+        drop(inventory);
+        fs::remove_dir_all(dir).unwrap();
     }
 
     /// The ordering the retention rule and the replay ledger both read: by completion, with the

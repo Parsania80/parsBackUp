@@ -13,6 +13,7 @@ mod layout;
 mod fixture;
 mod inventory;
 mod keys;
+mod reconcile;
 mod scratch;
 mod stage;
 mod store;
@@ -45,6 +46,7 @@ use layout::{
     GLOBALS_FILE, MANIFEST_FILE, MANIFEST_TMP_FILE, MAX_MANIFEST_BYTES, MAX_PLAN_BYTES,
     PAYLOAD_FILE, PLANS_DIR, PUBLIC_FILE, SIGNATURE_FILE, STAGING_DIR,
 };
+pub use reconcile::LocalReconciler;
 use sha2::{Digest, Sha256};
 use stage::Target;
 use std::fs::{self, DirBuilder, File, OpenOptions};
@@ -910,6 +912,7 @@ impl ArtifactStore for LocalStore {
     /// so a swapped globals file is caught through the signature rather than by its own
     /// metadata.
     fn open_signed(&self, id: Uuid) -> Result<SignedArtifact> {
+        let _claim = ActivityLock::hold(&self.root)?;
         let header = self.verify_signed(id)?;
         // Everything from here in was written by whoever holds the configured signing key.
         let dir = self.artifact_dir(id);
@@ -920,6 +923,17 @@ impl ArtifactStore for LocalStore {
                 "authenticated manifest records backup id {}, requested {id}",
                 manifest.backup_id
             );
+        }
+        let inventory_path = self.root.join(layout::INVENTORY_FILE);
+        match fs::symlink_metadata(&inventory_path) {
+            Ok(_) => {
+                let inventory = backup_inventory::Inventory::open_read_only_bound(&inventory_path)?;
+                if inventory.schema_version()? >= 3 {
+                    inventory.check_provisional_source(id, &manifest.source_fingerprint)?;
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
         }
         let payload = dir.join(AGE_PAYLOAD_FILE);
         let globals_path = dir.join(AGE_GLOBALS_FILE);

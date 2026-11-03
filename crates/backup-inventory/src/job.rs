@@ -108,6 +108,11 @@ pub enum AuditAction {
     /// trail says when the gap became known as well as when it happened.
     JobInterrupted,
     ArtifactRegistered,
+    ArtifactMissing,
+    ArtifactConflict,
+    ArtifactObserved,
+    ArtifactAdopted,
+    InventoryRebuilt,
 }
 
 impl AuditAction {
@@ -119,6 +124,11 @@ impl AuditAction {
             AuditAction::JobFailed => "job_failed",
             AuditAction::JobInterrupted => "job_interrupted",
             AuditAction::ArtifactRegistered => "artifact_registered",
+            AuditAction::ArtifactMissing => "artifact_missing",
+            AuditAction::ArtifactConflict => "artifact_conflict",
+            AuditAction::ArtifactObserved => "artifact_observed",
+            AuditAction::ArtifactAdopted => "artifact_adopted",
+            AuditAction::InventoryRebuilt => "inventory_rebuilt",
         }
     }
 
@@ -130,6 +140,11 @@ impl AuditAction {
             "job_failed" => Ok(AuditAction::JobFailed),
             "job_interrupted" => Ok(AuditAction::JobInterrupted),
             "artifact_registered" => Ok(AuditAction::ArtifactRegistered),
+            "artifact_missing" => Ok(AuditAction::ArtifactMissing),
+            "artifact_conflict" => Ok(AuditAction::ArtifactConflict),
+            "artifact_observed" => Ok(AuditAction::ArtifactObserved),
+            "artifact_adopted" => Ok(AuditAction::ArtifactAdopted),
+            "inventory_rebuilt" => Ok(AuditAction::InventoryRebuilt),
             other => bail!("inventory holds audit action {other:?}, which this build cannot write"),
         }
     }
@@ -432,6 +447,7 @@ pub struct JobGuard {
     job_id: Uuid,
     /// `None` once the job reaches a terminal state, so a drop after `complete` writes nothing.
     open: Cell<Option<JobState>>,
+    _activity: crate::ActivityLock,
 }
 
 impl JobGuard {
@@ -441,6 +457,7 @@ impl JobGuard {
     /// must not have created a database it was then refused entry to, and it must not have taken a
     /// write lock that a second later holder would have to wait out.
     pub fn begin(root: &Path, scope: &JobScope) -> Result<Self> {
+        let activity = crate::ActivityLock::hold(root)?;
         let lock = JobLock::acquire(root, &scope.source_fingerprint, &scope.profile_fingerprint)?;
         let estate = Estate::new(scope.source_fingerprint.clone())?;
         let inventory = Inventory::open(&root.join(INVENTORY_FILE), &estate)?;
@@ -460,6 +477,7 @@ impl JobGuard {
             lock,
             job_id,
             open: Cell::new(Some(JobState::Running)),
+            _activity: activity,
         })
     }
 

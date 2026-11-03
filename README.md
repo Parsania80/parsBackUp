@@ -12,6 +12,12 @@ backupctl --config /absolute/path/to/m3.toml config check
 backupctl --config /absolute/path/to/m3.toml job list
 backupctl --config /absolute/path/to/m3.toml job inspect JOB_UUID
 backupctl --config /absolute/path/to/m3.toml inventory check
+backupctl --config /absolute/path/to/m3.toml inventory list
+backupctl --config /absolute/path/to/m3.toml inventory reconcile
+backupctl --config /absolute/path/to/m3.toml inventory rebuild --source-fingerprint FINGERPRINT --dry-run
+backupctl --config /absolute/path/to/m3.toml inventory adopt BACKUP_UUID --source-fingerprint FINGERPRINT
+backupctl --config /absolute/path/to/m3.toml inventory rebuild --source-fingerprint FINGERPRINT --prepare-rebuild
+backupctl --config /absolute/path/to/m3.toml inventory rebuild --source-fingerprint FINGERPRINT --confirm-rebuild --plan-id PLAN_UUID
 backupctl --config /absolute/path/to/m3.toml profile list
 backupctl --config /absolute/path/to/m3.toml profile validate PROFILE_NAME
 backupctl --config /absolute/path/to/m3.toml backup create --confirm-synthetic
@@ -67,3 +73,19 @@ C1 acceptance (2026-11-02): the cleanup review, 185 workspace tests, reconstruct
 A01: `job list`, `job inspect` and `inventory check` read the existing inventory without loading keys, contacting PostgreSQL, migrating the database or changing job state. Operation type is reported as unknown because the existing schema does not record it. See the [inventory read contract](docs/development/m5a-inventory.md) for JSON, errors and limitations.
 
 The next implementation step is A02: discovery and reconciliation of inventory entries.
+
+Resumption review (2026-11-03): A01 is committed; A02 remains next.
+
+A02 inspection (2026-11-03): mixed-shape discovery and safe reconciliation need per-entry diagnostics, preservation of existing inventory facts, and coordination with active publication. Implementation remains next.
+
+A02 (2026-11-03): `inventory list` observes mixed backup shapes without changing them; `inventory reconcile` records missing or conflicting registered entries and their recovery when the store is idle. Neither command adopts backups or verifies their signatures. The existing `backup list` keeps its shape-specific behavior. See the [discovery and reconciliation contract](docs/development/m5a-inventory.md#a02-discovery-and-reconciliation-contract) for results and limitations. Explicit adoption and keyless rebuild are the next implementation step.
+
+A02 verification: 195 workspace tests and all six PostgreSQL 16–18 smoke and key-drill matrices passed; formatting and strict Clippy passed too.
+
+A03 has started with a keyless rebuild preview that also works when the inventory is missing or corrupt. It reports unconfirmed source provenance and unrecoverable history; adoption and confirmed rebuild remain under development.
+
+A03 now supports explicit adoption and a saved-plan rebuild. Both record discovered sources as unconfirmed; rebuild preserves the old inventory under a reported recovery name and cannot recover its lost history. A signed read refuses an authenticated source that disagrees with the provisional inventory. See the [A03 contract](docs/development/m5a-inventory.md#a03-adoption-and-rebuild) before replacing an inventory.
+
+A03 verification: 201 workspace tests, formatting, strict Clippy, and all six PostgreSQL 16–18 smoke and key-drill matrices passed. Authenticated enrichment and verification events are next.
+
+The A02 and A03 inventory changes are being committed together; A04 is the next implementation step.

@@ -1,6 +1,9 @@
 mod inventory;
 
-pub use inventory::{InventoryCheck, InventoryReader, InventoryService, JobInfo};
+pub use inventory::{
+    DiscoveryEntry, InventoryCheck, InventoryReader, InventoryService, JobInfo, ReconcileReport,
+    Reconciler, discover, reconcile,
+};
 
 use anyhow::{Context, Result, bail};
 use backup_domain::{

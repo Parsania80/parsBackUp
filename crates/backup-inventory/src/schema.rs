@@ -9,7 +9,7 @@
 //! runs — so there is one code path that produces a schema and one test that exercises it.
 
 /// The schema version this build writes, and the maximum it will open.
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 
 /// One step up the schema. `MIGRATIONS` must stay dense and ordered: a gap would be a version
 /// no build can reach, and an out-of-order pair would run a later step against an earlier shape.
@@ -32,6 +32,11 @@ static MIGRATIONS: &[Migration] = &[
         from: 1,
         to: 2,
         sql: SCHEMA_V2,
+    },
+    Migration {
+        from: 2,
+        to: 3,
+        sql: "CREATE TABLE provisional_artifact (backup_id TEXT PRIMARY KEY) WITHOUT ROWID;",
     },
 ];
 
@@ -297,6 +302,21 @@ mod tests {
 
         drop(inventory);
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn version_two_upgrades_without_inventing_provenance() {
+        let (dir, path) = fresh("upgrade-v2");
+        let row = as_v1(&path);
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(SCHEMA_V2).unwrap();
+        set_user_version(&conn, 2).unwrap();
+        drop(conn);
+        let inventory = crate::Inventory::open_existing_upgrade(&path, &estate()).unwrap();
+        assert_eq!(inventory.artifacts().unwrap(), vec![row.clone()]);
+        assert!(!inventory.is_provisional(row.backup_id).unwrap());
+        drop(inventory);
+        fs::remove_dir_all(dir).unwrap();
     }
 
     /// A step that fails partway has to leave the old schema *and* the old version together, or the

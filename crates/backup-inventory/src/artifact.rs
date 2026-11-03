@@ -36,26 +36,30 @@ pub(super) const ARTIFACT_COLUMNS: &str = "backup_id, source_fingerprint, profil
     shape, signer_id, recipient_id, payload_sha256, manifest_sha256, recipient_suite, \
     signature_suite, payload_bytes, manifest_bytes, completed_at_utc, state";
 
-/// Registers a row, replacing whatever this id's row said.
-///
-/// `INSERT OR REPLACE` rather than an upsert with a per-column list: every column is rewritten
-/// from the same row, there is no foreign key pointing here for a delete-then-insert to break,
-/// and the two callers that land on the same id — a backup that just published, and a reconcile
-/// pass that found the same directory again — are expected to disagree about *completeness*
-/// rather than about truth. A keyless rebuild writes a row of NULLs; the first run that holds the
-/// keys fills it in, and that replacement is the point.
-pub(super) const UPSERT_ARTIFACT: &str = "INSERT OR REPLACE INTO artifact \
+/// Preserve existing observations and enrich unknown private fields only for matching bytes.
+pub(super) const UPSERT_ARTIFACT: &str = "INSERT INTO artifact \
     (backup_id, source_fingerprint, profile_fingerprint, shape, signer_id, recipient_id, \
     payload_sha256, manifest_sha256, recipient_suite, signature_suite, payload_bytes, \
     manifest_bytes, completed_at_utc, state) \
-    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)";
+    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14) \
+    ON CONFLICT(backup_id) DO UPDATE SET \
+      profile_fingerprint = COALESCE(artifact.profile_fingerprint, excluded.profile_fingerprint), \
+      completed_at_utc = COALESCE(artifact.completed_at_utc, excluded.completed_at_utc) \
+    WHERE artifact.source_fingerprint IS excluded.source_fingerprint \
+      AND artifact.shape IS excluded.shape AND artifact.signer_id IS excluded.signer_id \
+      AND artifact.recipient_id IS excluded.recipient_id AND artifact.payload_sha256 IS excluded.payload_sha256 \
+      AND artifact.manifest_sha256 IS excluded.manifest_sha256 AND artifact.recipient_suite IS excluded.recipient_suite \
+      AND artifact.signature_suite IS excluded.signature_suite AND artifact.payload_bytes IS excluded.payload_bytes \
+      AND artifact.manifest_bytes IS excluded.manifest_bytes \
+      AND (artifact.profile_fingerprint IS NULL OR excluded.profile_fingerprint IS NULL OR artifact.profile_fingerprint = excluded.profile_fingerprint) \
+      AND (artifact.completed_at_utc IS NULL OR excluded.completed_at_utc IS NULL OR artifact.completed_at_utc = excluded.completed_at_utc)";
 
 /// Writes one row. Split out so [`crate::Inventory::register`] is the only place that decides
 /// what an inventory error becomes.
 pub(super) fn write(conn: &Connection, row: &ArtifactRow) -> Result<()> {
     let payload_bytes = sql_size("payload_bytes", row.payload_bytes)?;
     let manifest_bytes = sql_size("manifest_bytes", row.manifest_bytes)?;
-    conn.execute(
+    let changed = conn.execute(
         UPSERT_ARTIFACT,
         params![
             row.backup_id.to_string(),
@@ -74,6 +78,11 @@ pub(super) fn write(conn: &Connection, row: &ArtifactRow) -> Result<()> {
             row.state.as_str()
         ],
     )?;
+    ensure!(
+        changed == 1,
+        "artifact {} conflicts with its existing inventory row",
+        row.backup_id
+    );
     Ok(())
 }
 
@@ -157,18 +166,24 @@ impl Shape {
 pub enum State {
     /// This host saw the artifact's files. The one state anything writes today.
     Registered,
+    Missing,
+    Conflict,
 }
 
 impl State {
     pub fn as_str(self) -> &'static str {
         match self {
             State::Registered => "registered",
+            State::Missing => "missing",
+            State::Conflict => "conflict",
         }
     }
 
     fn parse(text: &str) -> Result<Self> {
         match text {
             "registered" => Ok(State::Registered),
+            "missing" => Ok(State::Missing),
+            "conflict" => Ok(State::Conflict),
             other => bail!("inventory holds state {other:?}, which this build cannot write"),
         }
     }
@@ -575,8 +590,7 @@ mod tests {
         for word in ["", "V1-SIGNED", "v1", "signed", "deleted", "missing"] {
             assert!(Shape::parse(word).is_err(), "{word} is not a shape");
         }
-        // `deleted` and `missing` are states a future build will write, and this one must say so
-        // rather than read them as a row it does not understand.
+        // `deleted` is reserved for a future lifecycle task and must not be guessed here.
         for word in ["", "registered ", "deleted", "v1-signed"] {
             assert!(
                 State::parse(word).is_err(),
