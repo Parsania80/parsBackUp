@@ -14,21 +14,24 @@ fn job_json(job: &JobInfo) -> Value {
         "state": job.state,
         "started_at_utc": job.started_at_utc,
         "updated_at_utc": job.updated_at_utc,
-        "operation": null,
+        "operation": job.operation,
+        "target_fingerprint": job.target_fingerprint,
     })
 }
 
 fn print_job(job: &JobInfo) {
     println!(
-        "{}  {}  {}  backup={}  source={}  profile={}  updated={}  operation=unknown",
+        "{}  {}  {}  backup={}  source={}  profile={}  updated={}  operation={}  target={}",
         job.job_id,
         job.started_at_utc,
         job.state,
         job.backup_id
             .map_or_else(|| "unknown".to_owned(), |id| id.to_string()),
         job.source_fingerprint,
-        job.profile_fingerprint,
+        job.profile_fingerprint.as_deref().unwrap_or("unknown"),
         job.updated_at_utc,
+        job.operation.as_deref().unwrap_or("unknown"),
+        job.target_fingerprint.as_deref().unwrap_or("unknown"),
     );
 }
 
@@ -78,6 +81,32 @@ pub(crate) fn inventory(
     json_output: bool,
 ) -> Result<()> {
     match command {
+        InventoryCommand::Verification { id } => {
+            let service = InventoryService::new(LocalInventory::open(&config.storage.root)?);
+            let events = service.verification_events(id)?;
+            if json_output {
+                let events: Vec<_> = events.iter().map(|e| json!({"backup_id":e.backup_id, "at_utc":e.at_utc, "level":e.level, "outcome":e.outcome, "payload_sha256":e.payload_sha256, "manifest_sha256":e.manifest_sha256, "current":e.current})).collect();
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(
+                        &json!({"events": events, "audit_recorded": false})
+                    )?
+                );
+            } else {
+                for e in events {
+                    println!(
+                        "{}  {}  {}  current={}  payload={}  manifest={}",
+                        e.at_utc,
+                        e.level,
+                        e.outcome,
+                        e.current,
+                        e.payload_sha256.as_deref().unwrap_or("unknown"),
+                        e.manifest_sha256.as_deref().unwrap_or("unknown")
+                    );
+                }
+                println!("audit not recorded (read-only)");
+            }
+        }
         InventoryCommand::Check => {
             let service = InventoryService::new(LocalInventory::open(&config.storage.root)?);
             let check = service.check()?;
@@ -118,6 +147,7 @@ pub(crate) fn inventory(
                 InventoryCommand::List => backup_application::discover(&reader)?,
                 InventoryCommand::Reconcile => backup_application::reconcile(&reader)?,
                 InventoryCommand::Check => unreachable!(),
+                InventoryCommand::Verification { .. } => unreachable!(),
                 InventoryCommand::Rebuild { .. } => unreachable!(),
                 InventoryCommand::Adopt { .. } => unreachable!(),
             };

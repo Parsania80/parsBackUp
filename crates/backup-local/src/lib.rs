@@ -20,8 +20,8 @@ mod store;
 
 use anyhow::{Context, Result, bail};
 use backup_application::{
-    ArtifactHandle, ArtifactStore, JobHandle, JobRequest, PayloadSink, SignedArtifactHandle,
-    SignedKeyFacts, StageHandle, StoreListing, WriteOptions,
+    ArtifactHandle, ArtifactStore, JobHandle, JobRequest, PayloadSink, RestoreJobRequest,
+    SignedArtifactHandle, SignedKeyFacts, StageHandle, StoreListing, WriteOptions,
 };
 use backup_crypto::HybridRecipient;
 use backup_crypto::keyid::{recipient_id, signer_id};
@@ -118,6 +118,17 @@ pub struct LocalStage {
 /// type. This crate is the one place that is allowed to know both, so the seam between a port the
 /// service can call and a row the index can write is stated here rather than in either of them.
 pub struct LocalJob(backup_inventory::JobGuard);
+
+struct LocalRestoreJob(backup_inventory::RestoreGuard);
+
+impl JobHandle for LocalRestoreJob {
+    fn staged(&self) -> Result<()> {
+        bail!("restore jobs do not stage artifacts")
+    }
+    fn complete(&self) -> Result<()> {
+        self.0.complete()
+    }
+}
 
 impl JobHandle for LocalJob {
     fn staged(&self) -> Result<()> {
@@ -456,6 +467,21 @@ impl ArtifactStore for LocalStore {
         Ok(Box::new(LocalJob(backup_inventory::JobGuard::begin(
             &self.root, &scope,
         )?)))
+    }
+
+    fn begin_restore_job(&self, request: &RestoreJobRequest<'_>) -> Result<Box<dyn JobHandle>> {
+        let mut digest = Sha256::new();
+        digest.update(b"backupctl-restore-target-v1\0");
+        digest.update(request.target_port.to_be_bytes());
+        digest.update(request.target_database.as_bytes());
+        let fingerprint = format!("{:x}", digest.finalize());
+        Ok(Box::new(LocalRestoreJob(
+            backup_inventory::RestoreGuard::begin(
+                &self.root,
+                &fingerprint[..16],
+                request.artifact_id,
+            )?,
+        )))
     }
 
     fn payload_sink<'a>(&'a self, stage: &'a LocalStage) -> Result<Box<dyn PayloadSink + 'a>> {
@@ -966,6 +992,34 @@ impl ArtifactStore for LocalStore {
             payload,
             globals,
         })
+    }
+
+    fn record_verification(
+        &self,
+        id: Uuid,
+        level: &str,
+        report: Option<&backup_application::VerifyReport>,
+    ) -> Result<bool> {
+        let _claim = ActivityLock::hold(&self.root)?;
+        let path = self.root.join(layout::INVENTORY_FILE);
+        match fs::symlink_metadata(&path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error.into()),
+            Ok(_) => {}
+        }
+        let inventory = backup_inventory::Inventory::open_read_only_bound(&path)?;
+        if inventory.artifact(id)?.is_none() {
+            return Ok(false);
+        }
+        let estate = inventory.estate().clone();
+        drop(inventory);
+        let inventory = backup_inventory::Inventory::open_existing_upgrade(&path, &estate)?;
+        let digests = report.map(|r| (r.payload_sha256.as_str(), r.manifest_sha256.as_deref()));
+        let authenticated = report
+            .and_then(|r| r.authenticated_facts.as_ref())
+            .map(|(s, p, t)| (s.as_str(), p.as_str(), t.as_str()));
+        inventory.record_verification(id, level, report.is_some(), digests, authenticated)?;
+        Ok(true)
     }
 
     /// The authenticated payload as plaintext, decrypted into the store's scratch directory

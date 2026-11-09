@@ -89,7 +89,11 @@ pub(crate) fn run(config: Config, command: BackupCommand, json: bool) -> Result<
                 print_inspect(&record);
             }
         }
-        BackupCommand::Verify { id, level } => {
+        BackupCommand::Verify {
+            id,
+            level,
+            read_only,
+        } => {
             let store = open_store(&config)?;
             let service = VerifyService::new(PostgresAdapter, store);
             let level_name = match level {
@@ -97,7 +101,11 @@ pub(crate) fn run(config: Config, command: BackupCommand, json: bool) -> Result<
                 VerifyLevel::Checksum => VERIFY_CHECKSUM,
                 VerifyLevel::Archive => VERIFY_ARCHIVE,
             };
-            let report = service.verify(&config, id, level_name)?;
+            let report = if read_only {
+                service.verify_read_only(&config, id, level_name)?
+            } else {
+                service.verify(&config, id, level_name)?
+            };
             if json {
                 println!(
                     "{}",
@@ -108,6 +116,7 @@ pub(crate) fn run(config: Config, command: BackupCommand, json: bool) -> Result<
                         "payload_sha256": report.payload_sha256,
                         "globals_size_bytes": report.globals_size_bytes,
                         "globals_sha256": report.globals_sha256,
+                        "audit_recorded": report.audit_recorded,
                         "origin": report.origin.as_ref().map(|origin| serde_json::json!({
                             "signer_id": origin.signer_id,
                             "recipient_id": origin.recipient_id,

@@ -66,14 +66,35 @@ impl LocalInventory {
 }
 
 impl backup_application::InventoryReader for LocalInventory {
+    fn verification_events(
+        &self,
+        id: uuid::Uuid,
+    ) -> Result<Vec<backup_application::VerificationEvent>> {
+        Ok(self
+            .0
+            .verification_events(id)?
+            .into_iter()
+            .map(|e| backup_application::VerificationEvent {
+                backup_id: e.backup_id,
+                at_utc: e.at_utc,
+                level: e.level,
+                outcome: e.outcome,
+                payload_sha256: e.payload_sha256,
+                manifest_sha256: e.manifest_sha256,
+                current: e.current,
+            })
+            .collect())
+    }
     fn jobs(&self) -> Result<Vec<backup_application::JobInfo>> {
         self.0
-            .jobs()
-            .map(|jobs| jobs.into_iter().map(job_info).collect())
+            .jobs()?
+            .into_iter()
+            .map(|job| self.job_info(job))
+            .collect()
     }
 
     fn job(&self, id: uuid::Uuid) -> Result<Option<backup_application::JobInfo>> {
-        self.0.job(id).map(|job| job.map(job_info))
+        self.0.job(id)?.map(|job| self.job_info(job)).transpose()
     }
 
     fn check(&self) -> Result<backup_application::InventoryCheck> {
@@ -85,14 +106,23 @@ impl backup_application::InventoryReader for LocalInventory {
     }
 }
 
-fn job_info(job: backup_inventory::JobRow) -> backup_application::JobInfo {
-    backup_application::JobInfo {
-        job_id: job.job_id,
-        backup_id: job.backup_id,
-        source_fingerprint: job.source_fingerprint,
-        profile_fingerprint: job.profile_fingerprint,
-        state: job.state.as_str().to_owned(),
-        started_at_utc: job.started_at_utc,
-        updated_at_utc: job.updated_at_utc,
+impl LocalInventory {
+    fn job_info(&self, job: backup_inventory::JobRow) -> Result<backup_application::JobInfo> {
+        let association = self.0.job_operation(job.job_id)?;
+        let operation = association.as_ref().map(|(kind, _)| kind.clone());
+        let target_fingerprint = association.and_then(|(_, target)| target);
+        let profile_fingerprint =
+            (operation.as_deref() != Some("restore")).then_some(job.profile_fingerprint);
+        Ok(backup_application::JobInfo {
+            job_id: job.job_id,
+            backup_id: job.backup_id,
+            source_fingerprint: job.source_fingerprint,
+            profile_fingerprint,
+            operation,
+            target_fingerprint,
+            state: job.state.as_str().to_owned(),
+            started_at_utc: job.started_at_utc,
+            updated_at_utc: job.updated_at_utc,
+        })
     }
 }

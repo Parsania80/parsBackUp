@@ -1,12 +1,14 @@
 use anyhow::{Context, Result, bail};
 use uuid::Uuid;
 
-/// Key-free facts recorded for a job. Schema v2 does not record its operation.
+/// Key-free facts recorded for a job; older schema versions do not record its operation.
 pub struct JobInfo {
     pub job_id: Uuid,
     pub backup_id: Option<Uuid>,
     pub source_fingerprint: String,
-    pub profile_fingerprint: String,
+    pub profile_fingerprint: Option<String>,
+    pub operation: Option<String>,
+    pub target_fingerprint: Option<String>,
     pub state: String,
     pub started_at_utc: String,
     pub updated_at_utc: String,
@@ -18,10 +20,21 @@ pub struct InventoryCheck {
     pub problems: Vec<String>,
 }
 
+pub struct VerificationEvent {
+    pub backup_id: Uuid,
+    pub at_utc: String,
+    pub level: String,
+    pub outcome: String,
+    pub payload_sha256: Option<String>,
+    pub manifest_sha256: Option<String>,
+    pub current: bool,
+}
+
 pub trait InventoryReader {
     fn jobs(&self) -> Result<Vec<JobInfo>>;
     fn job(&self, id: Uuid) -> Result<Option<JobInfo>>;
     fn check(&self) -> Result<InventoryCheck>;
+    fn verification_events(&self, id: Uuid) -> Result<Vec<VerificationEvent>>;
 }
 
 pub struct InventoryService<R> {
@@ -51,6 +64,13 @@ impl<R: InventoryReader> InventoryService<R> {
 
     pub fn check(&self) -> Result<InventoryCheck> {
         self.reader.check().context("INVENTORY_READ_FAILED")
+    }
+
+    pub fn verification_events(&self, id: Uuid) -> Result<Vec<VerificationEvent>> {
+        self.ensure_healthy()?;
+        self.reader
+            .verification_events(id)
+            .context("INVENTORY_READ_FAILED")
     }
 
     fn ensure_healthy(&self) -> Result<()> {

@@ -285,6 +285,95 @@ fn cli_adopts_a_development_artifact_as_unconfirmed() {
             .status
             .success()
     );
+    fs::write(scene.0.join("config.toml"), format!(
+        "[source]\nhost = \"127.0.0.1\"\nport = 5432\nuser = \"postgres\"\ndatabase = \"backupctl_fixture_a01\"\nclient_bin_dir = \"/nonexistent\"\n[storage]\nroot = \"{}\"\n", scene.root().display()
+    )).unwrap();
+    let readonly = json(scene.run(&[
+        "backup",
+        "verify",
+        &id.to_string(),
+        "--level",
+        "checksum",
+        "--read-only",
+    ]));
+    assert_eq!(readonly["audit_recorded"], false);
+    assert_eq!(
+        json(scene.run(&["inventory", "verification", &id.to_string()]))["events"]
+            .as_array()
+            .unwrap()
+            .len(),
+        0
+    );
+    let writable = json(scene.run(&["backup", "verify", &id.to_string(), "--level", "checksum"]));
+    assert_eq!(writable["audit_recorded"], true);
+    assert_eq!(
+        json(scene.run(&["inventory", "verification", &id.to_string()]))["events"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn cli_reads_verification_events_without_writing() {
+    let scene = Scene::new();
+    fs::create_dir_all(scene.root()).unwrap();
+    let inventory =
+        Inventory::open(&scene.inventory(), &Estate::new(SOURCE.into()).unwrap()).unwrap();
+    let id = Uuid::new_v4();
+    let row = ArtifactRow {
+        backup_id: id,
+        source_fingerprint: SOURCE.into(),
+        profile_fingerprint: None,
+        shape: Shape::PlaintextDev,
+        signer_id: None,
+        recipient_id: None,
+        payload_sha256: None,
+        manifest_sha256: None,
+        recipient_suite: None,
+        signature_suite: None,
+        payload_bytes: None,
+        manifest_bytes: None,
+        completed_at_utc: None,
+        state: State::Registered,
+    };
+    inventory.adopt(&row).unwrap();
+    let digest = "a".repeat(64);
+    inventory
+        .record_verification(id, "checksum", true, Some((&digest, None)), None)
+        .unwrap();
+    drop(inventory);
+    let before = fs::read(scene.inventory()).unwrap();
+    let report = json(scene.run(&["inventory", "verification", &id.to_string()]));
+    assert_eq!(report["audit_recorded"], false);
+    assert_eq!(report["events"][0]["outcome"], "success");
+    assert_eq!(report["events"][0]["payload_sha256"], digest);
+    assert_eq!(report["events"][0]["manifest_sha256"], Value::Null);
+    assert_eq!(fs::read(scene.inventory()).unwrap(), before);
+}
+
+#[test]
+fn job_list_reports_restore_associations_without_private_names() {
+    let scene = Scene::new();
+    fs::create_dir_all(scene.root()).unwrap();
+    let artifact = Uuid::new_v4();
+    drop(Inventory::open(&scene.inventory(), &Estate::new(SOURCE.into()).unwrap()).unwrap());
+    let guard =
+        backup_inventory::RestoreGuard::begin(&scene.root(), "0123456789abcdef", artifact).unwrap();
+    let result = json(scene.run(&["job", "list"]));
+    let job = &result["jobs"][0];
+    assert_eq!(job["operation"], "restore");
+    assert_eq!(job["target_fingerprint"], "0123456789abcdef");
+    assert_eq!(job["profile_fingerprint"], Value::Null);
+    assert_eq!(job["backup_id"], artifact.to_string());
+    assert_eq!(job["state"], "running");
+    guard.complete().unwrap();
+    drop(guard);
+    assert_eq!(
+        json(scene.run(&["job", "list"]))["jobs"][0]["state"],
+        "complete"
+    );
 }
 
 #[test]
@@ -410,7 +499,8 @@ fn reads_jobs_and_integrity_without_keys_writes_or_sweeping() {
     assert_eq!(current["audit_recorded"], false);
     assert_eq!(current["job"]["state"], "running");
     assert_eq!(current["job"]["backup_id"], backup_id.to_string());
-    assert_eq!(current["job"]["operation"], Value::Null);
+    assert_eq!(current["job"]["operation"], "backup");
+    assert_eq!(current["job"]["target_fingerprint"], Value::Null);
     assert_eq!(current["job"]["source_fingerprint"], SOURCE);
     let check = json(scene.run(&["inventory", "check"]));
     assert_eq!(check["valid"], true);

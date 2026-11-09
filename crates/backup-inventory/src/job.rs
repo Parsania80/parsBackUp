@@ -199,6 +199,15 @@ pub(super) fn record(
 /// The pair is written together because a row with no event would leave the audit trail starting
 /// mid-story, and an event with no row would name a job that never existed.
 pub(super) fn start(conn: &Connection, row: &JobRow) -> Result<()> {
+    start_operation(conn, row, "backup", None)
+}
+
+pub(super) fn start_operation(
+    conn: &Connection,
+    row: &JobRow,
+    operation: &str,
+    target: Option<&str>,
+) -> Result<()> {
     debug_assert_eq!(row.state, JobState::Running);
     crate::in_transaction(conn, |conn| {
         conn.execute(
@@ -212,6 +221,10 @@ pub(super) fn start(conn: &Connection, row: &JobRow) -> Result<()> {
                 row.started_at_utc,
                 row.updated_at_utc
             ],
+        )?;
+        conn.execute(
+            "INSERT INTO job_operation (job_id, operation, target_fingerprint) VALUES (?1, ?2, ?3)",
+            params![row.job_id.to_string(), operation, target],
         )?;
         record(
             conn,
@@ -549,5 +562,82 @@ impl Drop for JobGuard {
         let _ = self
             .inventory
             .set_job_state(self.job_id, JobState::Failed, AuditAction::JobFailed);
+    }
+}
+
+/// Owns the target, artifact and activity claims until the restore job terminates.
+pub struct RestoreGuard {
+    inventory: Inventory,
+    job_id: Uuid,
+    open: Cell<bool>,
+    _artifact: crate::ResourceLock,
+    _target: crate::ResourceLock,
+    _activity: crate::ActivityLock,
+}
+
+impl RestoreGuard {
+    pub fn begin(root: &Path, target: &str, artifact: Uuid) -> Result<Self> {
+        let activity = crate::ActivityLock::hold(root)?;
+        let target_lock =
+            crate::ResourceLock::target(root, target)?.context("RESTORE_BUSY: target is in use")?;
+        let artifact_lock = crate::ResourceLock::artifact(root, artifact, false)?
+            .context("RESTORE_BUSY: artifact is in exclusive use")?;
+        activity.inherit_in_children()?;
+        target_lock.inherit_in_children()?;
+        artifact_lock.inherit_in_children()?;
+        let path = root.join(INVENTORY_FILE);
+        let inventory = match std::fs::symlink_metadata(&path) {
+            Ok(_) => {
+                let existing = Inventory::open_read_only_bound(&path)?;
+                let estate = existing.estate().clone();
+                drop(existing);
+                Inventory::open_existing_upgrade(&path, &estate)?
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => anyhow::bail!(
+                "INVENTORY_OPEN_FAILED: restore requires an existing inventory; rebuild it explicitly before restoring"
+            ),
+            Err(e) => return Err(e.into()),
+        };
+        let started = now_utc()?;
+        let job_id = Uuid::new_v4();
+        let row = JobRow {
+            job_id,
+            backup_id: Some(artifact),
+            source_fingerprint: inventory.estate().source_fingerprint.clone(),
+            profile_fingerprint: "0000000000000000".to_string(),
+            state: JobState::Running,
+            started_at_utc: started.clone(),
+            updated_at_utc: started,
+        };
+        start_operation(&inventory.conn, &row, "restore", Some(target))?;
+        Ok(Self {
+            inventory,
+            job_id,
+            open: Cell::new(true),
+            _artifact: artifact_lock,
+            _target: target_lock,
+            _activity: activity,
+        })
+    }
+
+    pub fn complete(&self) -> Result<()> {
+        ensure!(self.open.get(), "restore job is already complete");
+        let result = self.inventory.set_job_state(
+            self.job_id,
+            JobState::Complete,
+            AuditAction::JobCompleted,
+        );
+        self.open.set(false);
+        result
+    }
+}
+
+impl Drop for RestoreGuard {
+    fn drop(&mut self) {
+        if self.open.get() {
+            let _ =
+                self.inventory
+                    .set_job_state(self.job_id, JobState::Failed, AuditAction::JobFailed);
+        }
     }
 }

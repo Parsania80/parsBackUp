@@ -25,12 +25,14 @@ mod activity;
 mod artifact;
 mod job;
 mod job_lock;
+mod resource_lock;
 mod schema;
 
 pub use activity::{ACTIVITY_FILE, ActivityLock};
 pub use artifact::{ArtifactRow, Shape, State};
-pub use job::{AuditAction, AuditEvent, JobGuard, JobRow, JobScope, JobState};
+pub use job::{AuditAction, AuditEvent, JobGuard, JobRow, JobScope, JobState, RestoreGuard};
 pub use job_lock::{JobLock, LOCK_DIR};
+pub use resource_lock::ResourceLock;
 pub use schema::SCHEMA_VERSION;
 
 use anyhow::{Context, Result, ensure};
@@ -135,6 +137,17 @@ impl Estate {
 pub struct Inventory {
     conn: Connection,
     estate: Estate,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct VerificationEvent {
+    pub backup_id: Uuid,
+    pub at_utc: String,
+    pub level: String,
+    pub outcome: String,
+    pub payload_sha256: Option<String>,
+    pub manifest_sha256: Option<String>,
+    pub current: bool,
 }
 
 impl Inventory {
@@ -547,6 +560,152 @@ impl Inventory {
         })
     }
 
+    /// Append one verification observation and enrich a matching signed row atomically.
+    pub fn record_verification(
+        &self,
+        id: Uuid,
+        level: &str,
+        success: bool,
+        digests: Option<(&str, Option<&str>)>,
+        authenticated: Option<(&str, &str, &str)>,
+    ) -> Result<()> {
+        ensure!(
+            matches!(level, "signature" | "checksum" | "archive"),
+            "invalid verification level"
+        );
+        ensure!(
+            !success || digests.is_some(),
+            "successful verification requires a payload digest"
+        );
+        ensure!(
+            authenticated.is_none() || (success && level != "signature"),
+            "invalid authenticated enrichment"
+        );
+        if let Some((payload, manifest)) = digests {
+            ensure!(
+                is_hex(payload, backup_domain::DIGEST_HEX_LEN)
+                    && manifest.is_none_or(|value| is_hex(value, backup_domain::DIGEST_HEX_LEN)),
+                "invalid verification digests"
+            );
+        }
+        let conflict = std::cell::Cell::new(false);
+        in_transaction(&self.conn, |conn| {
+            let row = self.artifact(id)?.context("artifact is not registered")?;
+            row.validate(&self.estate)?;
+            if let Some((payload, manifest)) = digests {
+                if row.shape == Shape::V1Signed
+                    && row.state == State::Registered
+                    && (row.payload_sha256.as_deref() != Some(payload)
+                        || row.manifest_sha256.as_deref() != manifest)
+                {
+                    conn.execute(
+                        "UPDATE verification_event SET current = 0 WHERE backup_id = ?1",
+                        [id.to_string()],
+                    )?;
+                    conn.execute(
+                        "UPDATE artifact SET state = 'conflict' WHERE backup_id = ?1",
+                        [id.to_string()],
+                    )?;
+                    job::record(conn, AuditAction::ArtifactConflict, None, Some(id))?;
+                    conn.execute("INSERT INTO verification_event (backup_id, at_utc, level, outcome, payload_sha256, manifest_sha256) VALUES (?1, ?2, ?3, 'failure', ?4, ?5)", rusqlite::params![id.to_string(), now_utc()?, level, payload, manifest])?;
+                    conflict.set(true);
+                    return Ok(());
+                }
+                ensure!(
+                    row.state == State::Registered
+                        && ((row.shape == Shape::V1Signed
+                            && row.payload_sha256.as_deref() == Some(payload)
+                            && row.manifest_sha256.as_deref() == manifest
+                            && manifest.is_some())
+                            || (row.shape != Shape::V1Signed && manifest.is_none())),
+                    "verified bytes conflict with inventory"
+                );
+            }
+            if let Some((source, profile, completed)) = authenticated {
+                ensure!(
+                    row.shape == Shape::V1Signed,
+                    "unsigned artifacts cannot be enriched as authenticated"
+                );
+                ensure!(
+                    source == self.estate.source_fingerprint,
+                    "authenticated source conflicts with inventory estate"
+                );
+                ensure!(
+                    is_hex_id(profile) && backup_domain::is_utc_timestamp(completed),
+                    "invalid authenticated facts"
+                );
+                ensure!(
+                    row.profile_fingerprint
+                        .as_deref()
+                        .is_none_or(|known| known == profile)
+                        && row
+                            .completed_at_utc
+                            .as_deref()
+                            .is_none_or(|known| known == completed),
+                    "authenticated facts conflict with inventory"
+                );
+                conn.execute("UPDATE artifact SET profile_fingerprint = COALESCE(profile_fingerprint, ?1), completed_at_utc = COALESCE(completed_at_utc, ?2) WHERE backup_id = ?3", rusqlite::params![profile, completed, id.to_string()])?;
+                conn.execute(
+                    "DELETE FROM provisional_artifact WHERE backup_id = ?1",
+                    [id.to_string()],
+                )?;
+            }
+            if !success {
+                conn.execute(
+                    "UPDATE verification_event SET current = 0 WHERE backup_id = ?1",
+                    [id.to_string()],
+                )?;
+            }
+            let (payload, manifest) = digests.map_or((None, None), |(p, m)| (Some(p), m));
+            conn.execute("INSERT INTO verification_event (backup_id, at_utc, level, outcome, payload_sha256, manifest_sha256) VALUES (?1, ?2, ?3, ?4, ?5, ?6)", rusqlite::params![id.to_string(), now_utc()?, level, if success { "success" } else { "failure" }, payload, manifest])?;
+            Ok(())
+        })?;
+        ensure!(!conflict.get(), "verified bytes conflict with inventory");
+        Ok(())
+    }
+
+    pub fn verification_events(&self, id: Uuid) -> Result<Vec<VerificationEvent>> {
+        ensure!(
+            self.schema_version()? >= 4,
+            "inventory has no verification event table"
+        );
+        let mut stmt = self.conn.prepare("SELECT at_utc, level, outcome, payload_sha256, manifest_sha256, current FROM verification_event WHERE backup_id = ?1 ORDER BY event_id")?;
+        let rows = stmt.query_map([id.to_string()], |row| {
+            Ok(VerificationEvent {
+                backup_id: id,
+                at_utc: row.get(0)?,
+                level: row.get(1)?,
+                outcome: row.get(2)?,
+                payload_sha256: row.get(3)?,
+                manifest_sha256: row.get(4)?,
+                current: row.get(5)?,
+            })
+        })?;
+        let events = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        for event in &events {
+            ensure!(
+                backup_domain::is_utc_timestamp(&event.at_utc)
+                    && matches!(event.level.as_str(), "signature" | "checksum" | "archive")
+                    && matches!(event.outcome.as_str(), "success" | "failure"),
+                "invalid verification event"
+            );
+            for digest in [&event.payload_sha256, &event.manifest_sha256]
+                .into_iter()
+                .flatten()
+            {
+                ensure!(
+                    is_hex(digest, backup_domain::DIGEST_HEX_LEN),
+                    "invalid verification event digest"
+                );
+            }
+            ensure!(
+                event.outcome != "success" || event.payload_sha256.is_some(),
+                "successful verification event has no payload digest"
+            );
+        }
+        Ok(events)
+    }
+
     /// Every row, oldest completion first, with the never-completed ones last.
     ///
     /// `completed_at_utc` orders this, and only it: `backup_id` is a random UUIDv4 and orders
@@ -581,6 +740,12 @@ impl Inventory {
                     rusqlite::params![to.as_str(), id.to_string(), from.as_str()],
                 )?;
                 ensure!(count == 1, "inventory changed during reconciliation");
+                if to != State::Registered && self.schema_version()? >= 4 {
+                    conn.execute(
+                        "UPDATE verification_event SET current = 0 WHERE backup_id = ?1",
+                        [id.to_string()],
+                    )?;
+                }
                 let action = match to {
                     State::Registered => AuditAction::ArtifactObserved,
                     State::Missing => AuditAction::ArtifactMissing,
@@ -653,6 +818,39 @@ impl Inventory {
         Ok(job)
     }
 
+    pub fn job_operation(&self, id: Uuid) -> Result<Option<(String, Option<String>)>> {
+        if self.schema_version()? < 5 {
+            return Ok(None);
+        }
+        let operation: Option<(String, Option<String>)> = self
+            .conn
+            .query_row(
+                "SELECT operation, target_fingerprint FROM job_operation WHERE job_id = ?1",
+                [id.to_string()],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        if let Some((kind, target)) = &operation {
+            ensure!(
+                matches!(kind.as_str(), "backup" | "restore"),
+                "invalid job operation"
+            );
+            ensure!(
+                (kind == "restore") == target.is_some()
+                    && target.as_ref().is_none_or(|value| is_hex_id(value)),
+                "invalid job target fingerprint"
+            );
+            if kind == "restore" {
+                let row = self.job(id)?.context("restore association has no job")?;
+                ensure!(
+                    row.backup_id.is_some() && row.profile_fingerprint == "0000000000000000",
+                    "invalid restore job association"
+                );
+            }
+        }
+        Ok(operation)
+    }
+
     /// The whole audit trail, in the order it was written.
     pub fn audit_events(&self) -> Result<Vec<AuditEvent>> {
         job::events(&self.conn)
@@ -686,9 +884,13 @@ impl Inventory {
             // Probed per row rather than once for the file, because the scope is per lock: one
             // dead `running` row must not stand in for a live row of a different profile, which is
             // exactly how a sweep would kill a job that is running right now.
-            if JobLock::is_free(root, &row.source_fingerprint, &row.profile_fingerprint)?
-                && job::mark_interrupted(&self.conn, row.job_id)?
-            {
+            let free = match self.job_operation(row.job_id)? {
+                Some((kind, Some(target))) if kind == "restore" => {
+                    ResourceLock::target(root, &target)?.is_some()
+                }
+                _ => JobLock::is_free(root, &row.source_fingerprint, &row.profile_fingerprint)?,
+            };
+            if free && job::mark_interrupted(&self.conn, row.job_id)? {
                 swept.push(row.job_id);
             }
         }
@@ -789,8 +991,10 @@ mod tests {
                 "artifact",
                 "audit_event",
                 "job",
+                "job_operation",
                 "meta",
-                "provisional_artifact"
+                "provisional_artifact",
+                "verification_event"
             ]
         );
         assert_eq!(
@@ -799,8 +1003,10 @@ mod tests {
                 "artifact".to_string(),
                 "audit_event".to_string(),
                 "job".to_string(),
+                "job_operation".to_string(),
                 "meta".to_string(),
-                "provisional_artifact".to_string()
+                "provisional_artifact".to_string(),
+                "verification_event".to_string()
             ]
         );
         // And with it the jobs the sweep reads.
@@ -865,6 +1071,134 @@ mod tests {
     }
 
     #[test]
+    fn verification_enrichment_is_digest_bound_and_atomic() {
+        let (dir, path) = created("verify-observation");
+        let inventory = Inventory::open(&path, &estate()).unwrap();
+        let mut row = signed_row("00000000-0000-4000-8000-000000000001");
+        row.profile_fingerprint = None;
+        row.completed_at_utc = None;
+        inventory.adopt(&row).unwrap();
+        let payload = row.payload_sha256.as_deref().unwrap();
+        let manifest = row.manifest_sha256.as_deref().unwrap();
+        let facts = Some((SOURCE, "651dd7a74505b176", "2026-09-28T06:15:00Z"));
+        assert!(
+            inventory
+                .record_verification(
+                    row.backup_id,
+                    "checksum",
+                    true,
+                    Some((payload, Some(manifest))),
+                    Some((OTHER_SOURCE, "651dd7a74505b176", "2026-09-28T06:15:00Z"))
+                )
+                .is_err()
+        );
+        assert!(inventory.is_provisional(row.backup_id).unwrap());
+        assert!(
+            inventory
+                .verification_events(row.backup_id)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            inventory
+                .record_verification(
+                    row.backup_id,
+                    "checksum",
+                    true,
+                    Some((&"e".repeat(64), Some(manifest))),
+                    facts
+                )
+                .is_err()
+        );
+        assert!(inventory.is_provisional(row.backup_id).unwrap());
+        assert_eq!(
+            inventory.artifact(row.backup_id).unwrap().unwrap().state,
+            State::Conflict
+        );
+        let snapshot = inventory.artifacts().unwrap();
+        inventory
+            .reconcile_states(
+                &snapshot,
+                &[(row.backup_id, State::Conflict, State::Registered)],
+            )
+            .unwrap();
+        inventory.conn.execute_batch("CREATE TRIGGER reject_verification BEFORE INSERT ON verification_event BEGIN SELECT RAISE(FAIL, 'injected'); END;").unwrap();
+        assert!(
+            inventory
+                .record_verification(
+                    row.backup_id,
+                    "checksum",
+                    true,
+                    Some((payload, Some(manifest))),
+                    facts
+                )
+                .is_err()
+        );
+        assert_eq!(
+            inventory
+                .artifact(row.backup_id)
+                .unwrap()
+                .unwrap()
+                .profile_fingerprint,
+            None
+        );
+        assert!(inventory.is_provisional(row.backup_id).unwrap());
+        inventory
+            .conn
+            .execute_batch("DROP TRIGGER reject_verification")
+            .unwrap();
+        inventory
+            .record_verification(
+                row.backup_id,
+                "checksum",
+                true,
+                Some((payload, Some(manifest))),
+                facts,
+            )
+            .unwrap();
+        assert!(!inventory.is_provisional(row.backup_id).unwrap());
+        assert_eq!(
+            inventory
+                .artifact(row.backup_id)
+                .unwrap()
+                .unwrap()
+                .profile_fingerprint
+                .as_deref(),
+            Some("651dd7a74505b176")
+        );
+        let count: i64 = inventory
+            .conn
+            .query_row("SELECT COUNT(*) FROM verification_event", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 2);
+        let snapshot = inventory.artifacts().unwrap();
+        inventory
+            .reconcile_states(
+                &snapshot,
+                &[(row.backup_id, State::Registered, State::Missing)],
+            )
+            .unwrap();
+        let events = inventory.verification_events(row.backup_id).unwrap();
+        assert!(events.iter().all(|event| !event.current));
+        let snapshot = inventory.artifacts().unwrap();
+        inventory
+            .reconcile_states(
+                &snapshot,
+                &[(row.backup_id, State::Missing, State::Registered)],
+            )
+            .unwrap();
+        assert!(
+            inventory
+                .verification_events(row.backup_id)
+                .unwrap()
+                .iter()
+                .all(|event| !event.current)
+        );
+        drop(inventory);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn adoption_rolls_back_row_and_provenance_when_audit_fails() {
         let (dir, path) = created("adopt-rollback");
         let inventory = Inventory::open(&path, &estate()).unwrap();
@@ -878,6 +1212,95 @@ mod tests {
         assert!(inventory.audit_events().unwrap().is_empty());
         drop(inventory);
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn restore_guard_tracks_associations_and_does_not_sweep_live_work() {
+        let (root, path) = created("restore-ownership");
+        drop(Inventory::open(&path, &estate()).unwrap());
+        let id = Uuid::new_v4();
+        let target = "0123456789abcdef";
+        let guard = RestoreGuard::begin(&root, target, id).unwrap();
+        assert!(RestoreGuard::begin(&root, target, id).is_err());
+        let other = RestoreGuard::begin(&root, "fedcba9876543210", id).unwrap();
+        assert!(ResourceLock::artifact(&root, id, true).unwrap().is_none());
+        let inventory = Inventory::open_read_only_bound(&path).unwrap();
+        let rows = inventory.jobs().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(
+            rows.iter()
+                .all(|row| row.backup_id == Some(id) && row.state == JobState::Running)
+        );
+        assert!(
+            rows.iter()
+                .all(|row| inventory.job_operation(row.job_id).unwrap().unwrap().0 == "restore")
+        );
+        assert!(inventory.sweep_interrupted(&root).unwrap().is_empty());
+        drop(inventory);
+        guard.complete().unwrap();
+        drop(guard);
+        drop(other);
+        let inventory = Inventory::open_read_only_bound(&path).unwrap();
+        let states = inventory
+            .jobs()
+            .unwrap()
+            .into_iter()
+            .map(|row| row.state)
+            .collect::<Vec<_>>();
+        assert!(states.contains(&JobState::Complete));
+        assert!(states.contains(&JobState::Failed));
+        assert!(inventory.sweep_interrupted(&root).unwrap().is_empty());
+        assert!(ResourceLock::artifact(&root, id, true).unwrap().is_some());
+        drop(inventory);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn restore_records_existing_inventory_estate_when_target_connection_differs() {
+        let (root, path) = created("restore-foreign-target");
+        drop(Inventory::open(&path, &estate()).unwrap());
+        let guard = RestoreGuard::begin(&root, "0123456789abcdef", Uuid::new_v4()).unwrap();
+        guard.complete().unwrap();
+        drop(guard);
+        let inventory = Inventory::open_read_only_bound(&path).unwrap();
+        assert_eq!(inventory.jobs().unwrap()[0].source_fingerprint, SOURCE);
+        drop(inventory);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn restore_refuses_missing_inventory_without_guessing_an_estate() {
+        let (root, path) = created("restore-no-index");
+        let error = RestoreGuard::begin(&root, "0123456789abcdef", Uuid::new_v4())
+            .err()
+            .unwrap();
+        assert!(format!("{error:#}").contains("rebuild it explicitly"));
+        assert!(!path.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn failed_restore_completion_record_does_not_claim_the_restore_failed() {
+        let (root, path) = created("restore-completion-error");
+        drop(Inventory::open(&path, &estate()).unwrap());
+        let guard = RestoreGuard::begin(&root, "0123456789abcdef", Uuid::new_v4()).unwrap();
+        let inventory = Inventory::open(&path, &estate()).unwrap();
+        let id = inventory.jobs().unwrap()[0].job_id;
+        inventory.conn.execute_batch("CREATE TRIGGER reject_finish BEFORE UPDATE ON job WHEN NEW.state = 'complete' BEGIN SELECT RAISE(FAIL, 'injected'); END;").unwrap();
+        assert!(guard.complete().is_err());
+        drop(guard);
+        assert_eq!(inventory.job(id).unwrap().unwrap().state, JobState::Running);
+        inventory
+            .conn
+            .execute_batch("DROP TRIGGER reject_finish")
+            .unwrap();
+        assert_eq!(inventory.sweep_interrupted(&root).unwrap(), vec![id]);
+        assert_eq!(
+            inventory.job(id).unwrap().unwrap().state,
+            JobState::Interrupted
+        );
+        drop(inventory);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

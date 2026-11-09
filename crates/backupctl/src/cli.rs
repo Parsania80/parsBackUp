@@ -73,6 +73,9 @@ pub(crate) enum JobCommand {
 pub(crate) enum InventoryCommand {
     Check,
     List,
+    Verification {
+        id: Uuid,
+    },
     Reconcile,
     Adopt {
         id: Uuid,
@@ -172,6 +175,9 @@ pub(crate) enum BackupCommand {
         id: Uuid,
         #[arg(long, value_enum, default_value_t = VerifyLevel::Archive)]
         level: VerifyLevel,
+        /// Verify without writing an inventory observation.
+        #[arg(long)]
+        read_only: bool,
     },
 }
 

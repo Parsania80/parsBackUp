@@ -2,7 +2,7 @@ mod inventory;
 
 pub use inventory::{
     DiscoveryEntry, InventoryCheck, InventoryReader, InventoryService, JobInfo, ReconcileReport,
-    Reconciler, discover, reconcile,
+    Reconciler, VerificationEvent, discover, reconcile,
 };
 
 use anyhow::{Context, Result, bail};
@@ -117,6 +117,12 @@ pub struct JobRequest {
     pub backup_id: Uuid,
 }
 
+pub struct RestoreJobRequest<'a> {
+    pub target_database: &'a str,
+    pub target_port: u16,
+    pub artifact_id: Uuid,
+}
+
 /// One operation the store is recording, seen from the caller's side.
 ///
 /// Two moves and no reads, because the service has no business knowing the rest of the state
@@ -228,6 +234,7 @@ pub trait ArtifactStore {
     /// not run at once" is not a feature of the inventory, and the inventory is only where the
     /// refusal becomes visible afterwards. Dropping the handle ends the claim.
     fn begin_job(&self, request: &JobRequest) -> Result<Box<dyn JobHandle>>;
+    fn begin_restore_job(&self, request: &RestoreJobRequest<'_>) -> Result<Box<dyn JobHandle>>;
     /// The writer for the staged payload file.
     ///
     /// `'a` is shared between the store and the stage: sealing a stream also marks the
@@ -305,6 +312,16 @@ pub trait ArtifactStore {
 
     /// An authenticated globals file as plaintext.
     fn globals_plaintext(&self, artifact: &Self::Signed) -> Result<Self::Plaintext>;
+
+    /// Persist an observation when the store has a writable registered inventory.
+    fn record_verification(
+        &self,
+        _id: Uuid,
+        _level: &str,
+        _report: Option<&VerifyReport>,
+    ) -> Result<bool> {
+        Ok(false)
+    }
 }
 
 /// One artifact, open, in whichever shape its store keeps it.
@@ -804,6 +821,9 @@ pub struct VerifyReport {
     pub globals_size_bytes: Option<u64>,
     pub globals_sha256: Option<String>,
     pub origin: Option<OriginFacts>,
+    pub manifest_sha256: Option<String>,
+    pub authenticated_facts: Option<(String, String, String)>,
+    pub audit_recorded: bool,
 }
 
 pub struct VerifyService<E, S> {
@@ -817,9 +837,56 @@ impl<E: DatabaseAdapter, S: ArtifactStore> VerifyService<E, S> {
     }
 
     pub fn verify(&self, config: &Config, id: Uuid, level: &str) -> Result<VerifyReport> {
+        self.verify_with_mode(config, id, level, false)
+    }
+
+    pub fn verify_read_only(&self, config: &Config, id: Uuid, level: &str) -> Result<VerifyReport> {
+        self.verify_with_mode(config, id, level, true)
+    }
+
+    fn verify_with_mode(
+        &self,
+        config: &Config,
+        id: Uuid,
+        level: &str,
+        read_only: bool,
+    ) -> Result<VerifyReport> {
         if !matches!(level, VERIFY_SIGNATURE | VERIFY_CHECKSUM | VERIFY_ARCHIVE) {
             bail!("verification level must be signature, checksum or archive");
         }
+        let result = self.verify_inner(config, id, level);
+        match result {
+            Ok(mut report) => {
+                if !read_only {
+                    report.audit_recorded = self
+                        .store
+                        .record_verification(id, level, Some(&report))
+                        .context("verification succeeded but recording its observation failed")?;
+                }
+                Ok(report)
+            }
+            Err(error) => {
+                if read_only {
+                    return Err(
+                        error.context("verification failed; audit not recorded (read-only)")
+                    );
+                }
+                match self.store.record_verification(id, level, None) {
+                    Ok(true) => {
+                        Err(error.context("verification failed; failure observation recorded"))
+                    }
+                    Ok(false) => {
+                        Err(error.context("verification failed; no inventory observation recorded"))
+                    }
+                    Err(record_error) => Err(error.context(format!(
+                        "verification failed; recording its failure also failed: {record_error:#}"
+                    ))),
+                }
+            }
+        }
+    }
+
+    fn verify_inner(&self, config: &Config, id: Uuid, level: &str) -> Result<VerifyReport> {
         if self.store.is_signed() {
             return self.verify_v1(config, id, level);
         }
@@ -859,6 +926,9 @@ impl<E: DatabaseAdapter, S: ArtifactStore> VerifyService<E, S> {
             globals_size_bytes: manifest.globals_size_bytes,
             globals_sha256: manifest.globals_sha256.clone(),
             origin: None,
+            manifest_sha256: None,
+            authenticated_facts: None,
+            audit_recorded: false,
         })
     }
 
@@ -880,6 +950,9 @@ impl<E: DatabaseAdapter, S: ArtifactStore> VerifyService<E, S> {
                 globals_size_bytes: None,
                 globals_sha256: None,
                 origin: Some(OriginFacts::from_header(&header)),
+                manifest_sha256: Some(header.manifest_sha256.clone()),
+                authenticated_facts: None,
+                audit_recorded: false,
             });
         }
         // Opening does the signature check again from the top and only then decrypts the
@@ -917,6 +990,13 @@ impl<E: DatabaseAdapter, S: ArtifactStore> VerifyService<E, S> {
             globals_size_bytes: manifest.globals_ciphertext_bytes,
             globals_sha256: manifest.globals_sha256.clone(),
             origin: Some(OriginFacts::from_manifest(manifest)),
+            manifest_sha256: Some(artifact.header().manifest_sha256.clone()),
+            authenticated_facts: Some((
+                manifest.source_fingerprint.clone(),
+                backup_domain::profile_fingerprint(&manifest.profile_snapshot.name),
+                manifest.completed_at_utc.clone(),
+            )),
+            audit_recorded: false,
         })
     }
 }
@@ -1054,6 +1134,11 @@ impl<E: DatabaseAdapter, S: ArtifactStore> RestoreService<E, S> {
         if info.source_major != plan.source_major {
             bail!("client or server major changed since the plan was created");
         }
+        let job = self.store.begin_restore_job(&RestoreJobRequest {
+            target_database: &plan.target_database,
+            target_port: config.source.port,
+            artifact_id: plan.artifact_id,
+        })?;
         let artifact = Opened::open(&self.store, plan.artifact_id)?;
         let facts = artifact.facts();
         if facts.database != plan.artifact_database {
@@ -1098,7 +1183,7 @@ impl<E: DatabaseAdapter, S: ArtifactStore> RestoreService<E, S> {
         }
         self.engine
             .create_database(&config.source, &plan.target_database, timeout)
-            .context("target database creation failed")?;
+            .context("target database creation failed; the target may exist and was left for operator inspection")?;
         // A table-selected archive restores its relations but never creates
         // their namespaces; prepare them so the restore targets an otherwise
         // empty database, matching the schema-selection behavior.
@@ -1110,7 +1195,7 @@ impl<E: DatabaseAdapter, S: ArtifactStore> RestoreService<E, S> {
                     &facts.required_schemas,
                     timeout,
                 )
-                .context("target schema preparation failed")?;
+                .context("target schema preparation failed; the target may be partially modified and was left for operator inspection")?;
         }
         // Steps 4-6: schema/data, then ownership and privileges from the
         // archive's own ALTER OWNER/GRANT entries (skipped per policy). The view is
@@ -1138,6 +1223,8 @@ impl<E: DatabaseAdapter, S: ArtifactStore> RestoreService<E, S> {
             // but the fact cannot be added to a signed manifest: that would need the signing
             // key, which a disaster-recovery host does not hold, and re-signing an artifact
             // this host produced nothing about would attribute it to one that did.
+            job.complete()
+                .context("restore succeeded but recording job completion failed")?;
             return Ok(RestoreOutcome {
                 plan,
                 verification_level: recorded,
@@ -1147,6 +1234,8 @@ impl<E: DatabaseAdapter, S: ArtifactStore> RestoreService<E, S> {
         if !plan.sections.is_full() {
             // A section-limited restore proves nothing about the rest of the
             // archive, so the artifact keeps its recorded verification level.
+            job.complete()
+                .context("restore succeeded but recording job completion failed")?;
             return Ok(RestoreOutcome {
                 plan,
                 verification_level: recorded,
@@ -1163,6 +1252,8 @@ impl<E: DatabaseAdapter, S: ArtifactStore> RestoreService<E, S> {
         self.store
             .rewrite_manifest(unsigned, &updated)
             .context("restore succeeded but verification marking failed")?;
+        job.complete()
+            .context("restore succeeded but recording job completion failed")?;
         Ok(RestoreOutcome {
             plan,
             verification_level: VERIFY_RESTORE_TESTED.to_string(),

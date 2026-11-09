@@ -674,7 +674,15 @@ PY
         "does not verify|signature check failed"
 
     # 6.5 one byte of the signature itself.
-    printf '\x01' | dd of="$dir_a/signature.hybrid" bs=1 seek=100 conv=notrunc status=none
+    python3 - "$dir_a/signature.hybrid" <<'PY'
+import sys
+with open(sys.argv[1], "r+b") as signature:
+    signature.seek(100)
+    original = signature.read(1)
+    assert len(original) == 1
+    signature.seek(100)
+    signature.write(bytes([original[0] ^ 1]))
+PY
     refuses_everywhere "a mutated signature" "$dir_a" "does not verify|signature check failed"
 
     # 6.6 a signature one byte short: the hybrid signature is a fixed 3373-byte type, so a

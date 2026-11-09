@@ -150,6 +150,185 @@ fn snapshot(dir: &Path) -> Vec<(String, Vec<u8>)> {
 }
 
 #[test]
+fn verification_events_enrich_only_after_authenticated_manifest_and_can_be_read_only() {
+    let capture = Capture::default();
+    let fixture = write_signed(&capture);
+    let scanner = backup_local::LocalReconciler(fixture.store_root.clone());
+    let (plan, _) = scanner
+        .prepare_rebuild(&fixture.manifest.source_fingerprint)
+        .unwrap();
+    scanner
+        .rebuild(&fixture.manifest.source_fingerprint, plan)
+        .unwrap();
+    let path = fixture.store_root.join(INVENTORY_FILE);
+    let inventory = backup_inventory::Inventory::open_read_only_bound(&path).unwrap();
+    assert!(inventory.is_provisional(fixture.id).unwrap());
+    assert_eq!(
+        inventory
+            .artifact(fixture.id)
+            .unwrap()
+            .unwrap()
+            .profile_fingerprint,
+        None
+    );
+    drop(inventory);
+    let service = VerifyService::new(StubEngine { capture: &capture }, fixture.reader());
+    assert!(
+        service
+            .verify(&fixture.config, fixture.id, VERIFY_SIGNATURE)
+            .unwrap()
+            .audit_recorded
+    );
+    let inventory = backup_inventory::Inventory::open_read_only_bound(&path).unwrap();
+    assert!(inventory.is_provisional(fixture.id).unwrap());
+    assert_eq!(inventory.verification_events(fixture.id).unwrap().len(), 1);
+    drop(inventory);
+    assert!(
+        !service
+            .verify_read_only(&fixture.config, fixture.id, VERIFY_CHECKSUM)
+            .unwrap()
+            .audit_recorded
+    );
+    let inventory = backup_inventory::Inventory::open_read_only_bound(&path).unwrap();
+    assert!(inventory.is_provisional(fixture.id).unwrap());
+    assert_eq!(inventory.verification_events(fixture.id).unwrap().len(), 1);
+    drop(inventory);
+    assert!(
+        service
+            .verify(&fixture.config, fixture.id, VERIFY_CHECKSUM)
+            .unwrap()
+            .audit_recorded
+    );
+    let inventory = backup_inventory::Inventory::open_read_only_bound(&path).unwrap();
+    assert!(!inventory.is_provisional(fixture.id).unwrap());
+    assert_eq!(
+        inventory
+            .artifact(fixture.id)
+            .unwrap()
+            .unwrap()
+            .profile_fingerprint
+            .as_deref(),
+        Some(profile_fingerprint(&fixture.manifest.profile_snapshot.name).as_str())
+    );
+    let events = inventory.verification_events(fixture.id).unwrap();
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0].level, VERIFY_SIGNATURE);
+    assert_eq!(events[1].level, VERIFY_CHECKSUM);
+    assert_eq!(
+        events[1].manifest_sha256.as_deref(),
+        Some(fixture.header.manifest_sha256.as_str())
+    );
+    drop(inventory);
+    let path = fixture.artifact_dir().join("signature.hybrid");
+    let mut bytes = fs::read(&path).unwrap();
+    bytes[0] ^= 1;
+    fs::write(path, bytes).unwrap();
+    assert!(
+        service
+            .verify_read_only(&fixture.config, fixture.id, VERIFY_SIGNATURE)
+            .is_err()
+    );
+    let inventory =
+        backup_inventory::Inventory::open_read_only_bound(&fixture.store_root.join(INVENTORY_FILE))
+            .unwrap();
+    assert!(
+        inventory
+            .verification_events(fixture.id)
+            .unwrap()
+            .iter()
+            .all(|event| event.current)
+    );
+    drop(inventory);
+    assert!(
+        service
+            .verify(&fixture.config, fixture.id, VERIFY_SIGNATURE)
+            .is_err()
+    );
+    let inventory =
+        backup_inventory::Inventory::open_read_only_bound(&fixture.store_root.join(INVENTORY_FILE))
+            .unwrap();
+    let events = inventory.verification_events(fixture.id).unwrap();
+    assert_eq!(events.len(), 3);
+    assert_eq!(events[2].outcome, "failure");
+    assert!(!events[0].current);
+    assert!(!events[1].current);
+    assert!(events[2].current);
+    assert_eq!(events[2].payload_sha256, None);
+    drop(inventory);
+    drop(service);
+    fixture.remove();
+}
+
+#[test]
+fn completed_restore_records_safe_resource_associations() {
+    let capture = Capture::default();
+    let fixture = write_signed(&capture);
+    let restore = RestoreService::new(StubEngine { capture: &capture }, fixture.reader());
+    let plan = restore
+        .plan(
+            &fixture.config,
+            fixture.id,
+            DR_TARGET,
+            RestoreSecurityPolicy::portable(),
+            RestoreSections::full(),
+        )
+        .unwrap();
+    restore.run(&fixture.config, plan.id, DR_TARGET).unwrap();
+    let path = fixture.store_root.join(INVENTORY_FILE);
+    let inventory = backup_inventory::Inventory::open_read_only_bound(&path).unwrap();
+    let job = inventory
+        .jobs()
+        .unwrap()
+        .into_iter()
+        .find(|row| {
+            inventory
+                .job_operation(row.job_id)
+                .unwrap()
+                .is_some_and(|(kind, _)| kind == "restore")
+        })
+        .unwrap();
+    assert_eq!(job.state, JobState::Complete);
+    assert_eq!(job.backup_id, Some(fixture.id));
+    let (_, target) = inventory.job_operation(job.job_id).unwrap().unwrap();
+    assert_eq!(target.unwrap().len(), ID_HEX_LEN);
+    drop(inventory);
+    assert!(
+        !fs::read(&path)
+            .unwrap()
+            .windows(DR_TARGET.len())
+            .any(|bytes| bytes == DR_TARGET.as_bytes())
+    );
+    drop(restore);
+    fixture.remove();
+}
+
+#[test]
+fn restore_refuses_missing_inventory_before_mutating_the_target() {
+    let capture = Capture::default();
+    let fixture = write_signed(&capture);
+    let restore = RestoreService::new(StubEngine { capture: &capture }, fixture.reader());
+    let plan = restore
+        .plan(
+            &fixture.config,
+            fixture.id,
+            DR_TARGET,
+            RestoreSecurityPolicy::portable(),
+            RestoreSections::full(),
+        )
+        .unwrap();
+    let inventory = fixture.store_root.join(INVENTORY_FILE);
+    fs::remove_file(&inventory).unwrap();
+    let error = restore
+        .run(&fixture.config, plan.id, DR_TARGET)
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("rebuild it explicitly"));
+    assert!(capture.created().is_empty());
+    assert!(!inventory.exists());
+    drop(restore);
+    fixture.remove();
+}
+
+#[test]
 fn a_signed_backup_writes_the_v1_files_and_signs_a_record_a_reader_cannot_forge() {
     let capture = Capture::default();
     let fixture = write_signed(&capture);

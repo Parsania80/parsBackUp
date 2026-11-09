@@ -9,7 +9,7 @@
 //! runs — so there is one code path that produces a schema and one test that exercises it.
 
 /// The schema version this build writes, and the maximum it will open.
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 5;
 
 /// One step up the schema. `MIGRATIONS` must stay dense and ordered: a gap would be a version
 /// no build can reach, and an out-of-order pair would run a later step against an earlier shape.
@@ -37,6 +37,20 @@ static MIGRATIONS: &[Migration] = &[
         from: 2,
         to: 3,
         sql: "CREATE TABLE provisional_artifact (backup_id TEXT PRIMARY KEY) WITHOUT ROWID;",
+    },
+    Migration {
+        from: 3,
+        to: 4,
+        sql: "CREATE TABLE verification_event (\
+            event_id INTEGER PRIMARY KEY, backup_id TEXT NOT NULL, at_utc TEXT NOT NULL, \
+            level TEXT NOT NULL, outcome TEXT NOT NULL, payload_sha256 TEXT, manifest_sha256 TEXT, \
+            current INTEGER NOT NULL DEFAULT 1 CHECK (current IN (0,1)));\
+            CREATE INDEX verification_artifact ON verification_event (backup_id, event_id);",
+    },
+    Migration {
+        from: 4,
+        to: 5,
+        sql: "CREATE TABLE job_operation (job_id TEXT PRIMARY KEY, operation TEXT NOT NULL, target_fingerprint TEXT) WITHOUT ROWID;",
     },
 ];
 
@@ -315,6 +329,59 @@ mod tests {
         let inventory = crate::Inventory::open_existing_upgrade(&path, &estate()).unwrap();
         assert_eq!(inventory.artifacts().unwrap(), vec![row.clone()]);
         assert!(!inventory.is_provisional(row.backup_id).unwrap());
+        drop(inventory);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn version_three_upgrades_and_preserves_provisional_rows() {
+        let (dir, path) = fresh("upgrade-v3");
+        let row = as_v1(&path);
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(SCHEMA_V2).unwrap();
+        conn.execute_batch(MIGRATIONS.iter().find(|m| m.from == 2).unwrap().sql)
+            .unwrap();
+        conn.execute(
+            "INSERT INTO provisional_artifact (backup_id) VALUES (?1)",
+            [row.backup_id.to_string()],
+        )
+        .unwrap();
+        set_user_version(&conn, 3).unwrap();
+        drop(conn);
+        let inventory = crate::Inventory::open_existing_upgrade(&path, &estate()).unwrap();
+        assert_eq!(inventory.artifacts().unwrap(), vec![row.clone()]);
+        assert!(inventory.is_provisional(row.backup_id).unwrap());
+        assert!(
+            inventory
+                .verification_events(row.backup_id)
+                .unwrap()
+                .is_empty()
+        );
+        drop(inventory);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn version_four_jobs_upgrade_without_inventing_an_operation() {
+        let (dir, path) = fresh("upgrade-v4");
+        as_v1(&path);
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(SCHEMA_V2).unwrap();
+        for version in 2..4 {
+            conn.execute_batch(MIGRATIONS.iter().find(|m| m.from == version).unwrap().sql)
+                .unwrap();
+        }
+        let id = uuid::Uuid::new_v4();
+        conn.execute("INSERT INTO job (job_id, backup_id, source_fingerprint, profile_fingerprint, state, started_at_utc, updated_at_utc) VALUES (?1, NULL, ?2, '0123456789abcdef', 'complete', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')", rusqlite::params![id.to_string(), SOURCE]).unwrap();
+        set_user_version(&conn, 4).unwrap();
+        drop(conn);
+        let readonly = crate::Inventory::open_read_only_bound(&path).unwrap();
+        assert!(readonly.job(id).unwrap().is_some());
+        assert_eq!(readonly.job_operation(id).unwrap(), None);
+        drop(readonly);
+        let inventory = crate::Inventory::open_existing_upgrade(&path, &estate()).unwrap();
+        assert!(inventory.job(id).unwrap().is_some());
+        assert_eq!(inventory.job_operation(id).unwrap(), None);
         drop(inventory);
         fs::remove_dir_all(dir).unwrap();
     }

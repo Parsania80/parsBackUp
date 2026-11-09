@@ -14,6 +14,7 @@ backupctl --config /absolute/path/to/m3.toml job inspect JOB_UUID
 backupctl --config /absolute/path/to/m3.toml inventory check
 backupctl --config /absolute/path/to/m3.toml inventory list
 backupctl --config /absolute/path/to/m3.toml inventory reconcile
+backupctl --config /absolute/path/to/m3.toml inventory verification BACKUP_UUID
 backupctl --config /absolute/path/to/m3.toml inventory rebuild --source-fingerprint FINGERPRINT --dry-run
 backupctl --config /absolute/path/to/m3.toml inventory adopt BACKUP_UUID --source-fingerprint FINGERPRINT
 backupctl --config /absolute/path/to/m3.toml inventory rebuild --source-fingerprint FINGERPRINT --prepare-rebuild
@@ -26,6 +27,7 @@ backupctl --config /absolute/path/to/m3.toml backup create --profile PROFILE_NAM
 backupctl --config /absolute/path/to/m3.toml backup list
 backupctl --config /absolute/path/to/m4b.toml backup inspect BACKUP_UUID
 backupctl --config /absolute/path/to/m4b.toml backup verify BACKUP_UUID --level signature
+backupctl --config /absolute/path/to/m4b.toml backup verify BACKUP_UUID --level signature --read-only
 backupctl --config /absolute/path/to/m3.toml backup verify BACKUP_UUID --level archive
 backupctl --config /absolute/path/to/m3.toml restore plan BACKUP_UUID --target backupctl_fixture_dr --security dr
 backupctl --config /absolute/path/to/m3.toml restore plan BACKUP_UUID --target backupctl_fixture_sel --security portable --section pre-data
@@ -70,7 +72,7 @@ C03 inspection (2026-11-02): the shared restore and inventory paths already pres
 
 C1 acceptance (2026-11-02): the cleanup review, 185 workspace tests, reconstructed CLI comparisons and all six PostgreSQL 16/17/18 matrices pass. Inventory and job command work is next; the separate job-lock permission and symlink hardening remains required before that phase is accepted.
 
-A01: `job list`, `job inspect` and `inventory check` read the existing inventory without loading keys, contacting PostgreSQL, migrating the database or changing job state. Operation type is reported as unknown because the existing schema does not record it. See the [inventory read contract](docs/development/m5a-inventory.md) for JSON, errors and limitations.
+A01: `job list`, `job inspect` and `inventory check` read the existing inventory without loading keys, contacting PostgreSQL, migrating the database or changing job state. Jobs created before schema v5 report their operation as unknown. See the [inventory read contract](docs/development/m5a-inventory.md) for JSON, errors and limitations.
 
 The next implementation step is A02: discovery and reconciliation of inventory entries.
 
@@ -89,3 +91,17 @@ A03 now supports explicit adoption and a saved-plan rebuild. Both record discove
 A03 verification: 201 workspace tests, formatting, strict Clippy, and all six PostgreSQL 16–18 smoke and key-drill matrices passed. Authenticated enrichment and verification events are next.
 
 The A02 and A03 inventory changes are being committed together; A04 is the next implementation step.
+
+A04 adds verification history and fills unknown inventory facts only after a signed manifest is authenticated. Use `inventory verification` to read the history, or `backup verify --read-only` to verify without recording it. UI/UX exploration can begin before the CLI is released; the planned production UI follows the validated CLI and stable API.
+
+A04 verification passed 205 workspace tests and all six PostgreSQL 16–18 smoke and key-drill matrices. Restore job ownership is next. The CLI still needs inventory completion, retention, hardening and release validation before it is production-ready.
+
+A05 records restore jobs and holds target, artifact-use and store-activity claims throughout a restore. `job list` and `job inspect` show the operation and a target fingerprint; failures leave partial targets for operator inspection. Restore execution requires an existing inventory; rebuild a missing one explicitly before restoring. See the [restore ownership contract](docs/development/m5a-inventory.md#a05-restore-ownership-contract) for recovery and coordination limits.
+
+A05 verification passed 216 workspace tests and all six PostgreSQL 16–18 smoke and key-drill matrices. The next step is the M5a recovery and integrity drill.
+
+Run `bash tests/m5a_docker_smoke.sh` for the M5a PostgreSQL 16–18 recovery and integrity drill. It uses isolated synthetic databases to check interrupted backups/restores, inventory replacement crashes, rebuilds, migrations, corruption and keyless reads. Run as a non-root user with Docker access, Python 3 and Linux `strace`; see the [A06 drill notes](docs/development/m5a-inventory.md#a06-recovery-and-integrity-drill) for scope and limits.
+
+A06 passed on PostgreSQL 16, 17 and 18, including 18 inventory-replacement crash checkpoints. All 216 workspace tests, formatting and strict Clippy pass. A07's metadata leakage and audit checks are next; M5a acceptance and the production CLI remain unfinished, and the production UI follows the stable API milestone.
+
+The A04–A06 changes are being committed together: authenticated verification history, restore job ownership and the PostgreSQL recovery/integrity drill. A07 remains next.

@@ -53,6 +53,22 @@ pub struct ActivityLock {
 }
 
 impl ActivityLock {
+    /// Keep restore ownership in native children if their parent is killed.
+    pub fn inherit_in_children(&self) -> Result<()> {
+        let flags = unsafe { libc::fcntl(self.file.as_raw_fd(), libc::F_GETFD) };
+        ensure!(
+            flags >= 0
+                && unsafe {
+                    libc::fcntl(
+                        self.file.as_raw_fd(),
+                        libc::F_SETFD,
+                        flags & !libc::FD_CLOEXEC,
+                    )
+                } == 0,
+            "cannot retain activity claim in native subprocesses"
+        );
+        Ok(())
+    }
     /// Claims the store for an operation that is about to use a working directory.
     ///
     /// Shared, so it does not serialize anything that shares it: two backups of different profiles,

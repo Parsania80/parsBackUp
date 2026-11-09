@@ -381,6 +381,148 @@ fn reconciliation_refuses_while_a_backup_is_publishing() {
     assert!(backup.wait().unwrap().success());
 }
 
+#[test]
+fn restore_claims_survive_parent_death_while_native_restore_runs() {
+    let scene = Scene::new("restore-ownership", false, false);
+    let backup = scene.run(&["backup", "create", "--confirm-synthetic"]);
+    assert!(backup.status.success(), "{}", text(&backup));
+    let artifact = one_entry(&scene.artifacts(), "backup")
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let bin = scene.base.join("bin");
+    write_tool(
+        &bin,
+        "psql",
+        "if [ \"$1\" = \"--version\" ]; then echo 'psql (PostgreSQL) 16.4'; exit 0; fi\nfor argument in \"$@\"; do case \"$argument\" in --command=*) query=${argument#--command=} ;; esac; done\ncase \"$query\" in 'SHOW server_version_num') echo 160004; exit 0 ;; *pg_largeobject_metadata*) echo 0; exit 0 ;; *pg_database*) exit 0 ;; esac\nexit 1\n",
+    );
+    write_tool(
+        &bin,
+        "createdb",
+        &format!(
+            "if [ \"$1\" = \"--version\" ]; then echo 'createdb (PostgreSQL) 16.4'; exit 0; fi\nprintf x >> '{}'; exit 0\n",
+            scene.marker("createdb-calls").display()
+        ),
+    );
+    write_tool(
+        &bin,
+        "pg_restore",
+        &format!(
+            "if [ \"$1\" = \"--version\" ]; then echo 'pg_restore (PostgreSQL) 16.4'; exit 0; fi\nif [ \"$1\" = \"--list\" ]; then echo 'Table public.accounts'; exit 0; fi\nRELEASE='{}'\n: > '{}'\n{}",
+            scene.marker("release").display(),
+            scene.marker("restore-started").display(),
+            release_loop()
+        ),
+    );
+    let target = "backupctl_fixture_restore_a05";
+    let plan = scene.run(&[
+        "restore",
+        "plan",
+        &artifact,
+        "--target",
+        target,
+        "--security",
+        "portable",
+    ]);
+    assert!(plan.status.success(), "{}", text(&plan));
+    let plan = one_entry(&scene.root.join("plans"), "restore plan")
+        .file_stem()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    let mut first = scene.spawn(&["restore", "run", &plan, "--confirm-target", target]);
+    wait_for(
+        &scene.marker("restore-started"),
+        "native restore never started",
+    );
+    let id = Uuid::parse_str(&artifact).unwrap();
+    assert!(
+        backup_inventory::ResourceLock::artifact(&scene.root, id, true)
+            .unwrap()
+            .is_none()
+    );
+    let duplicate = scene.run(&["restore", "run", &plan, "--confirm-target", target]);
+    assert!(
+        !duplicate.status.success() && text(&duplicate).contains("RESTORE_BUSY"),
+        "{}",
+        text(&duplicate)
+    );
+    assert_eq!(fs::read(scene.marker("createdb-calls")).unwrap(), b"x");
+    let rows = job_rows(&scene);
+    let restore_job = rows
+        .iter()
+        .find(|row| row.state == JobState::Running && row.backup_id == Some(id))
+        .unwrap()
+        .job_id;
+    first.kill().unwrap();
+    first.wait().unwrap();
+    assert!(
+        backup_inventory::ActivityLock::hold_maintenance(&scene.root)
+            .unwrap()
+            .is_none()
+    );
+    let duplicate = scene.run(&["restore", "run", &plan, "--confirm-target", target]);
+    assert!(
+        !duplicate.status.success() && text(&duplicate).contains("RESTORE_BUSY"),
+        "{}",
+        text(&duplicate)
+    );
+    assert_eq!(fs::read(scene.marker("createdb-calls")).unwrap(), b"x");
+    assert!(
+        backup_inventory::ResourceLock::artifact(&scene.root, id, true)
+            .unwrap()
+            .is_none()
+    );
+    let inventory = Inventory::open_bound(&scene.root.join(INVENTORY_FILE))
+        .unwrap()
+        .unwrap();
+    assert!(inventory.sweep_interrupted(&scene.root).unwrap().is_empty());
+    drop(inventory);
+    scene.release();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if backup_inventory::ResourceLock::artifact(&scene.root, id, true)
+            .unwrap()
+            .is_some()
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "native child retained artifact claim after exit"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let recovery = scene.run(&["backup", "create", "--confirm-synthetic"]);
+    assert!(recovery.status.success(), "{}", text(&recovery));
+    assert_eq!(
+        job_rows(&scene)
+            .iter()
+            .find(|row| row.job_id == restore_job)
+            .unwrap()
+            .state,
+        JobState::Interrupted
+    );
+    write_tool(
+        &bin,
+        "pg_restore",
+        "if [ \"$1\" = \"--version\" ]; then echo 'pg_restore (PostgreSQL) 16.4'; exit 0; fi\nif [ \"$1\" = \"--list\" ]; then echo 'Table public.accounts'; exit 0; fi\nexit 1\n",
+    );
+    let failed = scene.run(&["restore", "run", &plan, "--confirm-target", target]);
+    assert!(
+        !failed.status.success() && text(&failed).contains("partially modified"),
+        "{}",
+        text(&failed)
+    );
+    assert_eq!(fs::read(scene.marker("createdb-calls")).unwrap(), b"xx");
+    assert!(
+        job_rows(&scene)
+            .iter()
+            .any(|row| row.backup_id == Some(id) && row.state == JobState::Failed)
+    );
+}
+
 /// The duplicate backup is refused by the scope lock, and that refusal is the point of ADR 0003's
 /// gate 9. The lock is still taken after the store opens, which is exactly where the startup purge
 /// used to destroy the dump its own refusal protected: the duplicate ran its recovery pass before

@@ -368,6 +368,7 @@ pub(crate) fn print_verify(report: &VerifyReport) {
     if report.level == backup_domain::VERIFY_SIGNATURE {
         println!("nothing was decrypted to produce this report");
     }
+    println!("inventory observation recorded: {}", report.audit_recorded);
 }
 
 pub(crate) fn print_plan(plan: &RestorePlan) {
