@@ -89,18 +89,18 @@ pub(crate) fn now_utc() -> Result<String> {
 /// not fine for a transition, which is an `UPDATE` and an `INSERT`: half of a job's state change
 /// would leave the audit trail contradicting the status column it describes. `IMMEDIATE` because
 /// the second statement must not be the one that discovers another writer holds the database.
-pub(crate) fn in_transaction(
+pub(crate) fn in_transaction<T>(
     conn: &Connection,
-    write: impl FnOnce(&Connection) -> Result<()>,
-) -> Result<()> {
+    write: impl FnOnce(&Connection) -> Result<T>,
+) -> Result<T> {
     conn.execute_batch("BEGIN IMMEDIATE")?;
     // Shaped like `schema::migrate` on purpose, including rolling back a failed `COMMIT`: a
     // connection left inside a transaction still holds the write lock, so a refusal here would
     // make every later command on this host wait out the busy timeout.
-    let outcome = (|| -> Result<()> {
-        write(conn)?;
+    let outcome = (|| -> Result<T> {
+        let result = write(conn)?;
         conn.execute_batch("COMMIT")?;
-        Ok(())
+        Ok(result)
     })();
     if outcome.is_err() {
         let _ = conn.execute_batch("ROLLBACK");
@@ -494,13 +494,65 @@ impl Inventory {
         row.validate(&self.estate)
             .with_context(|| format!("cannot register backup {}", row.backup_id))?;
         in_transaction(&self.conn, |conn| {
+            let present: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM artifact WHERE backup_id = ?1)",
+                [row.backup_id.to_string()],
+                |r| r.get(0),
+            )?;
             artifact::write(conn, row)?;
+            // Only a new publication establishes false; refresh never repairs lost knowledge.
+            if !present && row.shape == Shape::V1Signed {
+                conn.execute(
+                    "UPDATE artifact SET protected = 0 WHERE backup_id = ?1",
+                    [row.backup_id.to_string()],
+                )?;
+            }
             job::record(
                 conn,
                 AuditAction::ArtifactRegistered,
                 None,
                 Some(row.backup_id),
             )
+        })
+    }
+
+    /// Unknown is distinct from false, including every row read from a pre-protection schema.
+    pub fn protection(&self, id: Uuid) -> Result<Option<bool>> {
+        let row = self.artifact(id)?.context("artifact is not registered")?;
+        row.validate(&self.estate)?;
+        if self.schema_version()? < 6 {
+            return Ok(None);
+        }
+        let value: Option<i64> = self.conn.query_row(
+            "SELECT protected FROM artifact WHERE backup_id = ?1",
+            [id.to_string()],
+            |r| r.get(0),
+        )?;
+        ensure!(
+            matches!(value, None | Some(0 | 1)),
+            "invalid artifact protection"
+        );
+        Ok(value.map(|value| value == 1))
+    }
+
+    /// Establish protection knowledge and its audit event together; return the previous value.
+    pub fn set_protection(&self, id: Uuid, protected: bool) -> Result<(Option<bool>, bool)> {
+        in_transaction(&self.conn, |conn| {
+            let previous = self.protection(id)?;
+            if previous == Some(protected) {
+                return Ok((previous, false));
+            }
+            conn.execute(
+                "UPDATE artifact SET protected = ?1 WHERE backup_id = ?2",
+                rusqlite::params![protected, id.to_string()],
+            )?;
+            let action = if protected {
+                AuditAction::ArtifactProtected
+            } else {
+                AuditAction::ArtifactUnprotected
+            };
+            job::record(conn, action, None, Some(id))?;
+            Ok((previous, true))
         })
     }
 
@@ -1206,6 +1258,112 @@ mod tests {
     }
 
     #[test]
+    fn protection_is_idempotent_atomic_and_survives_registration() {
+        let (root, path) = created("protection");
+        let inventory = Inventory::open(&path, &estate()).unwrap();
+        let row = signed_row("00000000-0000-4000-8000-000000000001");
+        inventory.register(&row).unwrap();
+        inventory
+            .record_verification(
+                row.backup_id,
+                "archive",
+                true,
+                Some((
+                    row.payload_sha256.as_deref().unwrap(),
+                    row.manifest_sha256.as_deref(),
+                )),
+                None,
+            )
+            .unwrap();
+        let guard = JobGuard::begin(
+            &root,
+            &JobScope {
+                source_fingerprint: SOURCE.into(),
+                profile_fingerprint: "651dd7a74505b176".into(),
+                backup_id: row.backup_id,
+            },
+        )
+        .unwrap();
+        guard.complete().unwrap();
+        drop(guard);
+        let jobs = inventory.jobs().unwrap();
+        let observations = inventory.verification_events(row.backup_id).unwrap();
+        assert!(!jobs.is_empty() && !observations.is_empty());
+        assert_eq!(inventory.protection(row.backup_id).unwrap(), Some(false));
+        assert_eq!(
+            inventory.set_protection(row.backup_id, true).unwrap(),
+            (Some(false), true)
+        );
+        let events = inventory.audit_events().unwrap();
+        assert_eq!(
+            events.last().unwrap().action,
+            AuditAction::ArtifactProtected
+        );
+        assert_eq!(
+            inventory.set_protection(row.backup_id, true).unwrap(),
+            (Some(true), false)
+        );
+        assert_eq!(inventory.audit_events().unwrap(), events);
+        inventory.register(&row).unwrap();
+        assert_eq!(inventory.protection(row.backup_id).unwrap(), Some(true));
+        let events = inventory.audit_events().unwrap();
+        inventory.conn.execute_batch("CREATE TRIGGER reject_protection BEFORE INSERT ON audit_event BEGIN SELECT RAISE(ABORT, 'injected'); END;").unwrap();
+        assert!(inventory.set_protection(row.backup_id, false).is_err());
+        assert_eq!(inventory.protection(row.backup_id).unwrap(), Some(true));
+        assert_eq!(
+            inventory.artifact(row.backup_id).unwrap(),
+            Some(row.clone())
+        );
+        assert_eq!(inventory.audit_events().unwrap(), events);
+        inventory
+            .conn
+            .execute_batch("DROP TRIGGER reject_protection")
+            .unwrap();
+        assert_eq!(
+            inventory.set_protection(row.backup_id, false).unwrap(),
+            (Some(true), true)
+        );
+        assert_eq!(
+            inventory.audit_events().unwrap().last().unwrap().action,
+            AuditAction::ArtifactUnprotected
+        );
+        let mut adopted = signed_row("00000000-0000-4000-8000-000000000002");
+        adopted.profile_fingerprint = None;
+        adopted.completed_at_utc = None;
+        inventory.adopt(&adopted).unwrap();
+        inventory.register(&adopted).unwrap();
+        assert_eq!(inventory.protection(adopted.backup_id).unwrap(), None);
+        let events = inventory.audit_events().unwrap();
+        inventory.conn.execute_batch("CREATE TRIGGER reject_unknown BEFORE INSERT ON audit_event BEGIN SELECT RAISE(ABORT, 'injected'); END;").unwrap();
+        assert!(inventory.set_protection(adopted.backup_id, false).is_err());
+        assert_eq!(inventory.protection(adopted.backup_id).unwrap(), None);
+        assert_eq!(inventory.audit_events().unwrap(), events);
+        inventory
+            .conn
+            .execute_batch("DROP TRIGGER reject_unknown")
+            .unwrap();
+        assert_eq!(
+            inventory.set_protection(adopted.backup_id, false).unwrap(),
+            (None, true)
+        );
+        assert!(inventory.set_protection(Uuid::new_v4(), true).is_err());
+        assert_eq!(inventory.jobs().unwrap(), jobs);
+        assert_eq!(
+            inventory.verification_events(row.backup_id).unwrap(),
+            observations
+        );
+        assert!(inventory.is_provisional(adopted.backup_id).unwrap());
+        assert!(
+            inventory
+                .conn
+                .execute("UPDATE artifact SET protected = 2", [])
+                .is_err()
+        );
+        drop(inventory);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn verification_enrichment_is_digest_bound_and_atomic() {
         let (dir, path) = created("verify-observation");
         let inventory = Inventory::open(&path, &estate()).unwrap();
@@ -1296,6 +1454,18 @@ mod tests {
             )
             .unwrap();
         assert!(!inventory.is_provisional(row.backup_id).unwrap());
+        assert_eq!(inventory.protection(row.backup_id).unwrap(), None);
+        inventory.set_protection(row.backup_id, true).unwrap();
+        inventory
+            .record_verification(
+                row.backup_id,
+                "archive",
+                true,
+                Some((payload, Some(manifest))),
+                facts,
+            )
+            .unwrap();
+        assert_eq!(inventory.protection(row.backup_id).unwrap(), Some(true));
         assert_eq!(
             inventory
                 .artifact(row.backup_id)
@@ -1309,7 +1479,7 @@ mod tests {
             .conn
             .query_row("SELECT COUNT(*) FROM verification_event", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(count, 2);
+        assert_eq!(count, 3);
         let snapshot = inventory.artifacts().unwrap();
         inventory
             .reconcile_states(
@@ -1333,6 +1503,7 @@ mod tests {
                 .iter()
                 .all(|event| !event.current)
         );
+        assert_eq!(inventory.protection(row.backup_id).unwrap(), Some(true));
         drop(inventory);
         fs::remove_dir_all(dir).unwrap();
     }

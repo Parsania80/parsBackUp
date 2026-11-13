@@ -12,6 +12,8 @@ backupctl --config /absolute/path/to/m3.toml config check
 backupctl --config /absolute/path/to/m3.toml job list
 backupctl --config /absolute/path/to/m3.toml job inspect JOB_UUID
 backupctl --config /absolute/path/to/m3.toml inventory check
+backupctl --config /absolute/path/to/m3.toml backup protect BACKUP_UUID
+backupctl --config /absolute/path/to/m3.toml backup unprotect BACKUP_UUID
 backupctl --config /absolute/path/to/m3.toml inventory list
 backupctl --config /absolute/path/to/m3.toml inventory reconcile
 backupctl --config /absolute/path/to/m3.toml inventory verification BACKUP_UUID
@@ -113,3 +115,13 @@ A08 / M5a accepted (2026-11-13): the operating guide, separate JobLock permissio
 The [M5a operating guide](docs/development/m5a-operations.md) explains keyless inspection, adoption, saved-plan rebuild, verification, DR restore and interrupted jobs, including unknown facts, lost history and writable-storage limits. Its [acceptance map](docs/development/m5a-inventory.md#a08-operating-guide-and-acceptance-map) distinguishes the delivered inventory CLI from legacy backup-reader behavior and later retention/service work.
 
 The verified A07–A08 changes are being committed together. The remaining production CLI roadmap has 14 tasks: B01–B06 retention/protection/deletion, H01–H05 hardening/deployment, and V01–V03 validation/release. The full platform then adds 11 API, UI and platform-release tasks; these counts describe scope, not equal effort or a delivery date.
+
+B01 contract defined (2026-11-13): the [retention/deletion specification](docs/development/m5b-retention.md) describes per-profile keep-last rules, unknown protection after rebuild, exact confirmed plans and partial-deletion recovery. It adds no commands or deletion behavior. B02 implements protection and preservation next; 13 planned production CLI tasks remain, followed by the API/UI/platform-release work.
+
+
+B02 adds keyless `backup protect` / `backup unprotect` with atomic audit and idempotent repeated state. Schema v6 preserves unknown protection for migrated, adopted and rebuilt entries; authentication never guesses it. A new signed publication alone starts unprotected. These commands record inventory intent without reading artifacts, loading keys or contacting PostgreSQL. Retention planning and deletion remain future work; see the [B01/B02 contract](docs/development/m5b-retention.md) and [operating guide](docs/development/m5a-operations.md#establish-protection-knowledge).
+
+
+B02 verification passed 227 workspace tests, strict Clippy/formatting and all seven PostgreSQL 16–18 regression matrices, including live protection-journal checks. B03 retention previews and saved plans are next; 12 planned production CLI tasks remain. Prune/delete execution and production-source enablement are still gated.
+
+The verified B01–B02 changes are being committed together: the retention/deletion specification and keyless protection with migration, audit and preservation coverage. B03 retention previews and saved plans remain next.

@@ -113,6 +113,8 @@ pub enum AuditAction {
     ArtifactObserved,
     ArtifactAdopted,
     InventoryRebuilt,
+    ArtifactProtected,
+    ArtifactUnprotected,
 }
 
 impl AuditAction {
@@ -129,6 +131,8 @@ impl AuditAction {
             AuditAction::ArtifactObserved => "artifact_observed",
             AuditAction::ArtifactAdopted => "artifact_adopted",
             AuditAction::InventoryRebuilt => "inventory_rebuilt",
+            AuditAction::ArtifactProtected => "artifact_protected",
+            AuditAction::ArtifactUnprotected => "artifact_unprotected",
         }
     }
 
@@ -145,6 +149,8 @@ impl AuditAction {
             "artifact_observed" => Ok(AuditAction::ArtifactObserved),
             "artifact_adopted" => Ok(AuditAction::ArtifactAdopted),
             "inventory_rebuilt" => Ok(AuditAction::InventoryRebuilt),
+            "artifact_protected" => Ok(AuditAction::ArtifactProtected),
+            "artifact_unprotected" => Ok(AuditAction::ArtifactUnprotected),
             other => bail!("inventory holds audit action {other:?}, which this build cannot write"),
         }
     }

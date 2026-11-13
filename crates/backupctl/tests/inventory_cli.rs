@@ -32,12 +32,15 @@ impl Scene {
         self.root().join(INVENTORY_FILE)
     }
     fn run(&self, args: &[&str]) -> Output {
+        self.run_output(args, "json")
+    }
+    fn run_output(&self, args: &[&str], mode: &str) -> Output {
         Command::new(env!("CARGO_BIN_EXE_backupctl"))
             .args([
                 "--config",
                 self.0.join("config.toml").to_str().unwrap(),
                 "--output",
-                "json",
+                mode,
             ])
             .args(args)
             .output()
@@ -682,4 +685,222 @@ fn damaged_job_and_newer_schema_are_refused() {
         .unwrap();
     drop(conn);
     error(scene.run(&["inventory", "check"]), "INVENTORY_OPEN_FAILED");
+}
+
+fn protection_scene() -> (Scene, Uuid) {
+    let scene = Scene::new();
+    fs::create_dir_all(scene.root()).unwrap();
+    let inventory =
+        Inventory::open(&scene.inventory(), &Estate::new(SOURCE.into()).unwrap()).unwrap();
+    let id = Uuid::new_v4();
+    inventory
+        .adopt(&ArtifactRow {
+            backup_id: id,
+            source_fingerprint: SOURCE.into(),
+            profile_fingerprint: None,
+            shape: Shape::PlaintextDev,
+            signer_id: None,
+            recipient_id: None,
+            payload_sha256: None,
+            manifest_sha256: None,
+            recipient_suite: None,
+            signature_suite: None,
+            payload_bytes: None,
+            manifest_bytes: None,
+            completed_at_utc: None,
+            state: State::Registered,
+        })
+        .unwrap();
+    (scene, id)
+}
+
+#[test]
+fn protection_commands_are_keyless_idempotent_and_report_unknown_transitions() {
+    let (scene, id) = protection_scene();
+    let before = Inventory::open_read_only_bound(&scene.inventory()).unwrap();
+    let artifact = before.artifact(id).unwrap();
+    let jobs = before.jobs().unwrap();
+    let observations = before.verification_events(id).unwrap();
+    drop(before);
+    let first = scene.run(&["backup", "unprotect", &id.to_string()]);
+    assert!(String::from_utf8_lossy(&first.stderr).contains("prior protection was unknown"));
+    assert_eq!(
+        json(first),
+        serde_json::json!({"backup_id": id, "protection": "unprotected", "changed": true, "audit_recorded": true})
+    );
+    let report = json(scene.run(&["backup", "protect", &id.to_string()]));
+    assert_eq!(
+        report,
+        serde_json::json!({"backup_id": id, "protection": "protected", "changed": true, "audit_recorded": true})
+    );
+    let contents = fs::read(scene.inventory()).unwrap();
+    let repeated = json(scene.run(&["backup", "protect", &id.to_string()]));
+    assert_eq!(repeated["changed"], false);
+    assert_eq!(repeated["audit_recorded"], false);
+    assert_eq!(fs::read(scene.inventory()).unwrap(), contents);
+    let human = scene.run_output(&["backup", "unprotect", &id.to_string()], "human");
+    assert!(human.status.success());
+    assert!(String::from_utf8_lossy(&human.stdout).contains("protected -> unprotected"));
+    let inventory = Inventory::open_read_only_bound(&scene.inventory()).unwrap();
+    assert_eq!(inventory.artifact(id).unwrap(), artifact);
+    assert_eq!(inventory.jobs().unwrap(), jobs);
+    assert_eq!(inventory.verification_events(id).unwrap(), observations);
+    assert_eq!(inventory.protection(id).unwrap(), Some(false));
+    assert_eq!(
+        inventory
+            .audit_events()
+            .unwrap()
+            .iter()
+            .filter(|e| matches!(
+                e.action,
+                backup_inventory::AuditAction::ArtifactProtected
+                    | backup_inventory::AuditAction::ArtifactUnprotected
+            ))
+            .count(),
+        3
+    );
+    assert!(!scene.root().join("artifacts").exists());
+    assert!(!scene.root().join("staging").exists());
+    assert!(!scene.root().join("scratch").exists());
+    let raw = fs::read(scene.inventory()).unwrap();
+    for token in [
+        b"backupctl_fixture_a01".as_slice(),
+        b"missing-identity",
+        b"missing-recipient",
+    ] {
+        assert!(!raw.windows(token.len()).any(|w| w == token));
+    }
+}
+
+#[test]
+fn protection_refusals_leave_inventory_history_and_binding_unchanged() {
+    let missing = Scene::new();
+    error(
+        missing.run(&["backup", "protect", &Uuid::new_v4().to_string()]),
+        "RETENTION_INVENTORY_INVALID",
+    );
+    assert!(!missing.root().exists());
+    fs::create_dir_all(missing.root()).unwrap();
+    error(
+        missing.run(&["backup", "protect", &Uuid::new_v4().to_string()]),
+        "RETENTION_INVENTORY_INVALID",
+    );
+    assert!(!missing.inventory().exists());
+    let (scene, id) = protection_scene();
+    let original = fs::read(scene.inventory()).unwrap();
+    let activity = ActivityLock::hold(&scene.root()).unwrap();
+    error(
+        scene.run(&["backup", "protect", &id.to_string()]),
+        "RETENTION_BUSY",
+    );
+    assert_eq!(fs::read(scene.inventory()).unwrap(), original);
+    drop(activity);
+    let activity_path = scene.root().join("locks/activity.lock");
+    let saved_activity = scene.root().join("saved-activity.lock");
+    fs::rename(&activity_path, &saved_activity).unwrap();
+    std::os::unix::fs::symlink(&saved_activity, &activity_path).unwrap();
+    error(
+        scene.run(&["backup", "protect", &id.to_string()]),
+        "RETENTION_INVENTORY_INVALID",
+    );
+    assert_eq!(fs::read(scene.inventory()).unwrap(), original);
+    fs::remove_file(&activity_path).unwrap();
+    fs::rename(&saved_activity, &activity_path).unwrap();
+    error(
+        scene.run(&["backup", "protect", &Uuid::new_v4().to_string()]),
+        "RETENTION_ARTIFACT_INVALID",
+    );
+    assert_eq!(fs::read(scene.inventory()).unwrap(), original);
+    for suffix in ["-journal", "-wal", "-shm"] {
+        let sidecar = scene.root().join(format!("{INVENTORY_FILE}{suffix}"));
+        fs::write(&sidecar, b"do not remove").unwrap();
+        error(
+            scene.run(&["backup", "unprotect", &id.to_string()]),
+            "RETENTION_INVENTORY_INVALID",
+        );
+        assert_eq!(fs::read(scene.inventory()).unwrap(), original);
+        assert_eq!(fs::read(&sidecar).unwrap(), b"do not remove");
+        fs::remove_file(sidecar).unwrap();
+    }
+    let saved = scene.root().join("saved.db");
+    fs::rename(scene.inventory(), &saved).unwrap();
+    std::os::unix::fs::symlink(&saved, scene.inventory()).unwrap();
+    error(
+        scene.run(&["backup", "protect", &id.to_string()]),
+        "RETENTION_INVENTORY_INVALID",
+    );
+    assert_eq!(fs::read(&saved).unwrap(), original);
+    fs::remove_file(scene.inventory()).unwrap();
+    fs::rename(&saved, scene.inventory()).unwrap();
+    let conn = rusqlite::Connection::open(scene.inventory()).unwrap();
+    conn.pragma_update(None, "user_version", backup_inventory::SCHEMA_VERSION + 1)
+        .unwrap();
+    drop(conn);
+    let newer = fs::read(scene.inventory()).unwrap();
+    error(
+        scene.run(&["backup", "protect", &id.to_string()]),
+        "RETENTION_INVENTORY_INVALID",
+    );
+    assert_eq!(fs::read(scene.inventory()).unwrap(), newer);
+}
+
+#[test]
+fn protection_refuses_malformed_inventory_rows_before_changing_anything() {
+    let (scene, id) = protection_scene();
+    let conn = rusqlite::Connection::open(scene.inventory()).unwrap();
+    conn.execute(
+        "UPDATE artifact SET source_fingerprint = '0000000000000000'",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+    let bad = fs::read(scene.inventory()).unwrap();
+    error(
+        scene.run(&["backup", "protect", &id.to_string()]),
+        "RETENTION_INVENTORY_INVALID",
+    );
+    assert_eq!(fs::read(scene.inventory()).unwrap(), bad);
+}
+
+#[test]
+fn protection_upgrades_v5_only_for_a_valid_request_and_rolls_back_failed_audit() {
+    let (scene, id) = protection_scene();
+    let conn = rusqlite::Connection::open(scene.inventory()).unwrap();
+    conn.execute_batch("ALTER TABLE artifact DROP COLUMN protected; PRAGMA user_version=5;")
+        .unwrap();
+    drop(conn);
+    let old = fs::read(scene.inventory()).unwrap();
+    assert_eq!(
+        json(scene.run(&["inventory", "check"]))["schema_version"],
+        5
+    );
+    error(
+        scene.run(&["backup", "protect", &Uuid::new_v4().to_string()]),
+        "RETENTION_ARTIFACT_INVALID",
+    );
+    assert_eq!(fs::read(scene.inventory()).unwrap(), old);
+    let human = scene.run_output(&["backup", "unprotect", &id.to_string()], "human");
+    assert!(
+        human.status.success(),
+        "{}",
+        String::from_utf8_lossy(&human.stderr)
+    );
+    assert!(String::from_utf8_lossy(&human.stdout).contains("unknown -> unprotected"));
+    let inventory = Inventory::open_read_only_bound(&scene.inventory()).unwrap();
+    assert_eq!(inventory.schema_version().unwrap(), 6);
+    assert_eq!(inventory.protection(id).unwrap(), Some(false));
+    let events = inventory.audit_events().unwrap();
+    let artifact = inventory.artifact(id).unwrap();
+    drop(inventory);
+    let conn = rusqlite::Connection::open(scene.inventory()).unwrap();
+    conn.execute_batch("CREATE TRIGGER refuse_protection BEFORE INSERT ON audit_event BEGIN SELECT RAISE(ABORT, 'injected'); END;").unwrap();
+    drop(conn);
+    error(
+        scene.run(&["backup", "protect", &id.to_string()]),
+        "RETENTION_INVENTORY_INVALID",
+    );
+    let inventory = Inventory::open_read_only_bound(&scene.inventory()).unwrap();
+    assert_eq!(inventory.protection(id).unwrap(), Some(false));
+    assert_eq!(inventory.audit_events().unwrap(), events);
+    assert_eq!(inventory.artifact(id).unwrap(), artifact);
 }

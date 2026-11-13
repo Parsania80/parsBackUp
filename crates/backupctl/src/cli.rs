@@ -157,6 +157,14 @@ pub(crate) enum Section {
 
 #[derive(Subcommand)]
 pub(crate) enum BackupCommand {
+    /// Establish inventory protection without reading keys or artifact contents.
+    Protect {
+        id: Uuid,
+    },
+    /// Explicitly establish that an inventory artifact is unprotected.
+    Unprotect {
+        id: Uuid,
+    },
     Create {
         #[arg(long)]
         confirm_synthetic: bool,

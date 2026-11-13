@@ -9,7 +9,7 @@
 //! runs — so there is one code path that produces a schema and one test that exercises it.
 
 /// The schema version this build writes, and the maximum it will open.
-pub const SCHEMA_VERSION: i64 = 5;
+pub const SCHEMA_VERSION: i64 = 6;
 
 /// One step up the schema. `MIGRATIONS` must stay dense and ordered: a gap would be a version
 /// no build can reach, and an out-of-order pair would run a later step against an earlier shape.
@@ -51,6 +51,11 @@ static MIGRATIONS: &[Migration] = &[
         from: 4,
         to: 5,
         sql: "CREATE TABLE job_operation (job_id TEXT PRIMARY KEY, operation TEXT NOT NULL, target_fingerprint TEXT) WITHOUT ROWID;",
+    },
+    Migration {
+        from: 5,
+        to: 6,
+        sql: "ALTER TABLE artifact ADD COLUMN protected INTEGER CHECK (protected IN (0,1));",
     },
 ];
 
@@ -383,6 +388,76 @@ mod tests {
         assert!(inventory.job(id).unwrap().is_some());
         assert_eq!(inventory.job_operation(id).unwrap(), None);
         drop(inventory);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn version_five_protection_migration_preserves_facts_and_unknown_knowledge() {
+        let (dir, path) = fresh("upgrade-v5");
+        let row = as_v1(&path);
+        let conn = Connection::open(&path).unwrap();
+        for version in 1..5 {
+            conn.execute_batch(MIGRATIONS.iter().find(|m| m.from == version).unwrap().sql)
+                .unwrap();
+        }
+        set_user_version(&conn, 5).unwrap();
+        conn.execute(
+            "INSERT INTO provisional_artifact VALUES (?1)",
+            [row.backup_id.to_string()],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO verification_event (backup_id, at_utc, level, outcome, payload_sha256, manifest_sha256) VALUES (?1, '2026-09-28T06:15:00Z', 'archive', 'success', ?2, ?3)", rusqlite::params![row.backup_id.to_string(), row.payload_sha256, row.manifest_sha256]).unwrap();
+        let job_id = Uuid::new_v4();
+        conn.execute("INSERT INTO job (job_id, backup_id, source_fingerprint, profile_fingerprint, state, started_at_utc, updated_at_utc) VALUES (?1, ?2, ?3, '651dd7a74505b176', 'complete', '2026-09-28T06:15:00Z', '2026-09-28T06:15:00Z')", rusqlite::params![job_id.to_string(), row.backup_id.to_string(), SOURCE]).unwrap();
+        conn.execute(
+            "INSERT INTO job_operation VALUES (?1, 'backup', NULL)",
+            [job_id.to_string()],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO audit_event (at_utc, action, job_id, backup_id) VALUES ('2026-09-28T06:15:00Z', 'job_completed', ?1, ?2)", rusqlite::params![job_id.to_string(), row.backup_id.to_string()]).unwrap();
+        drop(conn);
+        let readonly = crate::Inventory::open_read_only_bound(&path).unwrap();
+        let observations = readonly.verification_events(row.backup_id).unwrap();
+        let jobs = readonly.jobs().unwrap();
+        let operation = readonly.job_operation(job_id).unwrap();
+        let audit = readonly.audit_events().unwrap();
+        assert_eq!(readonly.schema_version().unwrap(), 5);
+        assert_eq!(readonly.protection(row.backup_id).unwrap(), None);
+        drop(readonly);
+        let inventory = crate::Inventory::open_existing_upgrade(&path, &estate()).unwrap();
+        assert_eq!(inventory.schema_version().unwrap(), SCHEMA_VERSION);
+        assert_eq!(inventory.artifacts().unwrap(), vec![row.clone()]);
+        assert_eq!(inventory.protection(row.backup_id).unwrap(), None);
+        assert!(inventory.is_provisional(row.backup_id).unwrap());
+        assert_eq!(
+            inventory.verification_events(row.backup_id).unwrap(),
+            observations
+        );
+        assert_eq!(inventory.jobs().unwrap(), jobs);
+        assert_eq!(inventory.job_operation(job_id).unwrap(), operation);
+        assert_eq!(inventory.audit_events().unwrap(), audit);
+        inventory.register(&row).unwrap();
+        assert_eq!(inventory.protection(row.backup_id).unwrap(), None);
+        drop(inventory);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn failed_protection_migration_keeps_the_old_version_and_facts() {
+        let (dir, path) = fresh("failed-v6");
+        let row = as_v1(&path);
+        let conn = Connection::open(&path).unwrap();
+        for version in 1..5 {
+            conn.execute_batch(MIGRATIONS.iter().find(|m| m.from == version).unwrap().sql)
+                .unwrap();
+        }
+        set_user_version(&conn, 5).unwrap();
+        conn.execute_batch("ALTER TABLE artifact ADD COLUMN protected INTEGER")
+            .unwrap();
+        assert!(migrate(&conn).is_err());
+        assert_eq!(user_version(&conn).unwrap(), 5);
+        assert_eq!(rows(&conn), vec![row]);
+        drop(conn);
         fs::remove_dir_all(dir).unwrap();
     }
 

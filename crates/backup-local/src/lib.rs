@@ -36,7 +36,7 @@ use backup_domain::{
     GLOBALS_POLICY_SKIPPED, MAX_PUBLIC_JSON_BYTES, PublicHeader, RestorePlan, profile_fingerprint,
 };
 use backup_inventory::ActivityLock;
-pub use inventory::LocalInventory;
+pub use inventory::{LocalInventory, LocalProtection};
 pub use keys::{
     generate_key_pair, generate_signing_pair, key_status, publish_recipient, publish_verifying,
     signing_key_status,

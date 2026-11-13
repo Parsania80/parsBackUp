@@ -12,24 +12,62 @@ use backup_domain::{Config, VERIFY_ARCHIVE, VERIFY_CHECKSUM, VERIFY_SIGNATURE};
 use backup_postgres::PostgresAdapter;
 
 pub(crate) fn run(config: Config, command: BackupCommand, json: bool) -> Result<()> {
-    let store = open_store(&config)?;
-    // ADR 0004: this is the command that clears abandoned working directories, and it does
-    // so before any scope is claimed — afterwards the dead job's row and the new one are
-    // indistinguishable to the lock probe. A dry run writes nothing, so it removes nothing
-    // either.
-    if matches!(command, BackupCommand::Create { dry_run: false, .. }) {
-        let recovery = store.recover()?;
-        if !json {
-            print_recovery(&recovery);
-        }
-    }
-    let service = BackupService::new(PostgresAdapter, store);
     match command {
+        BackupCommand::Protect { id } | BackupCommand::Unprotect { id } => {
+            let protected = matches!(command, BackupCommand::Protect { .. });
+            let report = backup_application::InventoryService::new(backup_local::LocalProtection(
+                config.storage.root.clone(),
+            ))
+            .set_protection(id, protected)?;
+            let state = if report.protected {
+                "protected"
+            } else {
+                "unprotected"
+            };
+            if json {
+                if report.previous.is_none() && !report.protected {
+                    eprintln!(
+                        "prior protection was unknown; explicit unprotect establishes unprotected and cannot recover lost protection history"
+                    );
+                }
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "backup_id": report.backup_id,
+                        "protection": state,
+                        "changed": report.changed,
+                        "audit_recorded": report.changed,
+                    }))?
+                );
+            } else {
+                println!(
+                    "{}: {} -> {} (changed={}, audit_recorded={})",
+                    report.backup_id,
+                    match report.previous {
+                        None => "unknown",
+                        Some(true) => "protected",
+                        Some(false) => "unprotected",
+                    },
+                    state,
+                    report.changed,
+                    report.changed
+                );
+            }
+        }
         BackupCommand::Create {
             confirm_synthetic,
             profile,
             dry_run,
         } => {
+            let store = open_store(&config)?;
+            // Recovery precedes the new scope claim and only runs for a real create.
+            if !dry_run {
+                let recovery = store.recover()?;
+                if !json {
+                    print_recovery(&recovery);
+                }
+            }
+            let service = BackupService::new(PostgresAdapter, store);
             if dry_run {
                 let (info, selection) = service.resolve(&config, profile.as_deref())?;
                 if json {
@@ -72,7 +110,7 @@ pub(crate) fn run(config: Config, command: BackupCommand, json: bool) -> Result<
             }
         }
         BackupCommand::List => {
-            let inventory = service.list()?;
+            let inventory = BackupService::new(PostgresAdapter, open_store(&config)?).list()?;
             if json {
                 let report = json_inventory(&inventory)?;
                 println!("{}", serde_json::to_string_pretty(&report)?);
@@ -81,7 +119,7 @@ pub(crate) fn run(config: Config, command: BackupCommand, json: bool) -> Result<
             }
         }
         BackupCommand::Inspect { id } => {
-            let record = service.inspect(id)?;
+            let record = BackupService::new(PostgresAdapter, open_store(&config)?).inspect(id)?;
             if json {
                 let report = json_record(&record)?;
                 println!("{}", serde_json::to_string_pretty(&report)?);

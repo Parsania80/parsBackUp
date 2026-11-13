@@ -301,6 +301,15 @@ fi
             (base / "native-secret").write_bytes(b"\n".join([*secrets.values(), *metadata.values()]))
             artifact = create()
             estate = ctl("inventory", "check", cfg=keyless)["source_fingerprint"]
+            assert sql_file(index, "SELECT protected FROM artifact WHERE backup_id=?", (artifact,)) == [(0,)]
+            protected_files = digest_tree(root / "artifacts")
+            protection = trace_write("backup", "protect", artifact, cfg=keyless)
+            assert protection == {"backup_id": artifact, "protection": "protected", "changed": True, "audit_recorded": True}
+            before = history()
+            assert ctl("backup", "protect", artifact, cfg=keyless)["changed"] is False
+            assert history() == before
+            assert trace_write("backup", "unprotect", artifact, cfg=keyless)["protection"] == "unprotected"
+            assert digest_tree(root / "artifacts") == protected_files
             scan_inventory()
             # A populated SQLite copy proves every sentinel is detectable by the byte scan.
             control = base / "positive-control.db"
@@ -357,6 +366,8 @@ fi
             before = history()
             rejects("backup", "create", "--confirm-synthetic", contains="already running")
             assert history() == before, "duplicate startup invented history"
+            rejects("backup", "protect", artifact, cfg=keyless, contains="RETENTION_BUSY")
+            assert history() == before, "busy protection invented history"
             assert job(interrupted_backup["job_id"])["state"] == "running"
             ctl("backup", "inspect", artifact)
             ctl("inventory", "list", cfg=keyless)
@@ -493,9 +504,11 @@ fi
             assert jobs() == []
             rows = sql_file(index, "SELECT profile_fingerprint,completed_at_utc FROM artifact")
             assert len(rows) == len(entries) and all(row == (None, None) for row in rows)
+            assert all(row == (None,) for row in sql_file(index, "SELECT protected FROM artifact"))
             assert sql_file(index, "SELECT count(*) FROM provisional_artifact")[0][0] == len(rows)
             ctl("backup", "verify", artifact, "--level", "archive")
             assert sql_file(index, "SELECT profile_fingerprint FROM artifact WHERE backup_id=?", (artifact,))[0][0]
+            assert sql_file(index, "SELECT protected FROM artifact WHERE backup_id=?", (artifact,)) == [(None,)]
             check_reports(artifact)
             print(f"PostgreSQL {major}: mixed shapes, malformed header, wrong estate and keyless rebuild passed", flush=True)
 

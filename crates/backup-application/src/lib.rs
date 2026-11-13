@@ -1,8 +1,8 @@
 mod inventory;
 
 pub use inventory::{
-    DiscoveryEntry, InventoryCheck, InventoryReader, InventoryService, JobInfo, ReconcileReport,
-    Reconciler, VerificationEvent, discover, reconcile,
+    DiscoveryEntry, InventoryCheck, InventoryReader, InventoryService, JobInfo, ProtectionChange,
+    ProtectionWriter, ReconcileReport, Reconciler, VerificationEvent, discover, reconcile,
 };
 
 use anyhow::{Context, Result, bail};

@@ -1,0 +1,171 @@
+# B01 retention policy and deletion-plan contract
+
+Status: B01 defined 2026-11-13 against commit `216042e`; B02 protection is now implemented with schema v6. Prune, deletion plans and execution remain **not implemented**. This is the specification for B02–B06, not an operating flow or permission to delete artifacts. The inspection table records the v5 baseline; frozen v1 bytes are unchanged. Authority: [roadmap B tasks](../../project.md#b--m5b-protection-retention-and-deletion), [ADR 0003 choice 5](../architecture/adr-0003-backup-inventory-jobs-retention.md#choice-5--retention-and-the-shape-of-a-deletion), [ownership ADR](../architecture/adr-0004-working-directory-ownership.md), and the delivered [M5a contract](m5a-inventory.md).
+
+## Inspected implementation and required reach
+
+| Existing boundary | Finding and implementation consequence |
+|---|---|
+| `backup-inventory/src/artifact.rs` and `schema.rs` | Schema v5 has registered/missing/conflict, nullable profile/time and no protection/deleting/deleted writer. Registration coalesces unknown private facts without replacing known facts. B02 must preserve that merge; B04 must prevent reconciliation, registration, adoption and verification from reviving tombstones. |
+| `Inventory::record_verification`, `verification_events`, `is_provisional` | Events carry level/outcome/current and ciphertext digests. Multiple successful observations can be current; a failure invalidates earlier ones. The public event projection omits its SQL `event_id`. A policy snapshot must retain that identity internally; do not change the existing CLI projection just to obtain it. |
+| `JobGuard`, `RestoreGuard`, `job_operation` | Only backup/restore operation writers exist. Running/staged jobs and inherited native-child claims are real dependencies; terminal jobs do not pin artifacts forever. B04 needs an exact job-to-artifact set for multi-artifact operations, not guessed associations from a nullable single ID. |
+| `ActivityLock`, `ResourceLock` | Shared activity precedes scope/target/artifact claims in current guards. Exclusive maintenance is nonblocking; artifact locks already support shared/exclusive claims. Reuse these names/inodes and never unlink them. |
+| `LocalStore::open_signed`, `verify_signed` and `record_verification` | `open_signed` and observation recording acquire shared activity internally; signature-only `verify_signed` does not hold a whole-operation use claim. Calling either shared-claim helper unchanged while holding exclusive maintenance would contend with the caller's own lock. B03/B04 need an internal read path that borrows the caller's existing claim, preserving every authentication check; no lock downgrade or nested acquisition. Before B04 enables deletion, authenticated file-consuming readers must hold shared artifact-use claims for their file-consumption lifetime; unlocked discovery remains observational and may report concurrent disappearance. |
+| `RestorePlan`, `save_plan`, `load_plan` | Reuse UUIDs, fixed-field JSON digesting, 900-second expiry, private create-new files and file/directory sync. Use a distinct deletion format/path. The current metadata-check-then-open reader is not sufficient for new destructive plans: final descriptor opens must be no-follow, regular, private and bounded. |
+| Local reconciliation/rebuild and CLI dispatch/reporting | Keep ordinary reads observational. Rebuild/adoption cannot invent protection knowledge, restore lost deletion history or automatically resurrect rows. B02 adds protection; B03 adds previews; B04 adds execution/recovery and lifecycle-aware readers; B06 adds native/race/crash/privacy coverage. |
+
+These are future changes to existing owners: pure policy/plan types in `backup-domain`; orchestration in `backup-application`; SQL/migrations/associations in `backup-inventory`; authentication, files, claims and deletion in `backup-local`; argument/report mapping in `backupctl`. Reuse existing fixtures. B01 adds no Rust module, export, dependency, configuration field or test harness.
+
+## Scope, inputs and access
+
+One policy applies to exactly `(source_fingerprint, profile_fingerprint)`, never globally across the store or across profiles. Source comes from the existing bound inventory and must agree with freshly authenticated manifests. Neither a public header nor a configured connection string proves estate. The report and plan show both fingerprints for review; execution must match the same inventory/root. A plan can be used on an identical trusted copy of that store, not merely another index with the same estate.
+
+Command surface: B02 implements `protect` and `unprotect`; prune/delete and their run commands below remain planned.
+
+```text
+backupctl --config CONFIG backup protect BACKUP_UUID
+backupctl --config CONFIG backup unprotect BACKUP_UUID
+backupctl --config CONFIG backup prune --keep-last N [--profile PROFILE_NAME]
+backupctl --config CONFIG backup prune run PLAN_UUID --confirm-digest SHA256
+backupctl --config CONFIG backup delete BACKUP_UUID
+backupctl --config CONFIG backup delete run PLAN_UUID --confirm-digest SHA256
+```
+
+`N` is a positive unsigned integer; zero, negatives and overflow are usage errors. `--profile` selects a configured profile by its existing name fingerprint without resolving its contents against PostgreSQL. Omission selects the reserved `whole-database` snapshot fingerprint, not all profiles. Reusing a profile name continues to group its historical selections; a content-hash scope is not introduced here. Delete derives the one artifact's authenticated, known source/profile scope and has no profile override. Execution uses the saved scope, not a newly selected profile.
+
+Planning/execution require signed-reader custody: the recovery identity and independently trusted verifier, never the signing secret. They authenticate manifests and current file bytes; they do not contact PostgreSQL, run a new archive check or alter verification history. The stored matching archive observation is required below. Writable private locks/plans are required; this does not add keyless retention or true read-only-mount support. Existing keyless inventory/job commands remain available. Missing/old/foreign/newer/corrupt inventories fail closed; planning never creates, rebuilds or migrates one. B02's explicit writers perform supported upgrades. Synthetic-only configuration guards remain.
+
+Age/bucket policies, automatic scheduling, force/yes overrides, arbitrary paths, unsigned deletion, deleting an invalid artifact as repair, cross-scope fallback and remote execution are excluded.
+
+## Known valid and protected facts
+
+An artifact is **known valid for this policy** only if all of these hold at preview and again at execution:
+
+1. It is a registered `v1-signed` row in this estate, not provisional, missing, conflicting, deleting, deleted or unregistered.
+2. Profile fingerprint and completion time are known. A fresh authenticated manifest agrees with those facts, estate, ID, suites and inventory ciphertext digests/sizes. Signature-only/header claims cannot supply them.
+3. The directory and exact allowed v1 file set are complete, regular and no-follow, with no unexpected/symlink components. Recomputed ciphertext digests/sizes and the trusted signature match; optional globals agree with their authenticated manifest. The marker alone proves none of this.
+4. A persisted `archive` success has `current=true` and the exact matching non-null payload and encrypted-manifest digests. Select the greatest SQL `event_id` satisfying those predicates. Signature/checksum success, a native restore's `complete` job, and a development manifest's `restore-tested` label do not substitute. There is no stronger persisted validated-restore event in v5; adding one requires a real validator/writer and separate contract revision.
+5. Protection knowledge is established, as described next. A protected valid artifact can count as a retained valid copy, but can never be a candidate.
+
+A persisted observation is a statement about particular bytes, not a fresh filesystem check. Rehashing/authenticating those bytes does not insert a new observation. An artifact published before registration failed is not eligible until explicit adoption, authenticated enrichment, a new recorded archive check and protection establishment have completed. No cross-generation keyring is implied; inability to authenticate a needed signed artifact with the configured reader keys is a refusal.
+
+B02 must represent protection as three public values: `unknown`, `unprotected`, `protected` (a nullable boolean inventory column suffices). Only a genuinely new signed publication starts known-unprotected. Upgraded legacy rows, adopted rows and rebuilt rows start unknown; authentication/enrichment never turns unknown into false. A keyless rebuild loses protection/deletion/audit history even if later verification recovers source/profile/time. An established tombstone remains terminal while its inventory survives; a replaced inventory cannot recover that lost intent.
+
+These two protection commands are keyless inventory operations: they require an existing valid bound index, no PostgreSQL connection or key loading. Explicit `protect ID` or `unprotect ID` establishes the requested value under exclusive maintenance and records `artifact_protected` or `artifact_unprotected` atomically. Applying the already-known value is idempotent, with no event. Unknown-to-unprotected is an explicit operator decision to discard any unrecoverable prior protection claim; output must state that transition. These commands do not authenticate bytes, change verification, revive deleting/deleted rows or modify v1. For any known member of the requested scope with unknown protection, planning refuses the whole scope until the operator establishes that fact. Unknown profile/time never counts or becomes a candidate; unknown profile is not guessed into another scope.
+
+## Selection and hard exclusions
+
+Let `V` be the known valid artifacts in the requested scope. Sort by authenticated `completed_at_utc` descending; for equal seconds, sort canonical lowercase UUID text ascending. The UUID tie-break is deterministic, not evidence of age. Do not use directory time, job time, public-header time, event time or UUID order as the primary age.
+
+For prune, retain the first `min(N, len(V))` unconditionally. Candidates are only the remaining members of `V` after removing all hard exclusions. Protected older copies are retained **in addition** to the newest N; they do not replace newer entries in that quota. If `V` is nonempty and no candidates remain, return an empty successful preview with no saved plan. If no valid member establishes the requested scope, refuse rather than claiming retention is safe.
+
+For explicit delete, start with exactly the requested valid ID. It may be the newest copy, but at least one other known valid artifact in the same scope must remain. It does not borrow a backup from another scope or apply an implicit prune. The same exclusions, plan format and executor apply.
+
+Always exclude: protected artifacts; held/in-use artifacts; artifacts referenced by running/staged jobs; and deletion of the last known valid artifact of that scope. A stale non-terminal row still excludes its dependencies until the existing explicit recovery path resolves it; preview/run never sweep it. Any open job whose dependencies cannot be established safely blocks planning. Persisted unexecuted restore/deletion plans are not jobs and do not pin artifacts indefinitely. Invalid, unknown, development, unregistered, missing, conflicting and terminal-deleted entries cannot satisfy N and are never deletion candidates.
+
+The conservative first implementation takes exclusive store maintenance for both preview and execution. Any live shared activity refuses the whole operation, including unrelated profiles; it does not queue behind a dump or quietly plan around it. This is stricter than a per-artifact exclusion and avoids changing the accepted ownership model. Shared/exclusive artifact claims still enforce use exclusion. Every complete scan must succeed; an I/O failure cannot be interpreted as absence. A fresh authentication/file mismatch for a supposedly valid scoped row refuses the operation rather than silently expanding candidates. Missing/conflicting rows already diagnosed as such are reported as excluded.
+
+| Worked case | Required result |
+|---|---|
+| Valid A/B/C newest to oldest; N=2 | Retain A/B, candidate C. |
+| Valid A/B/C; N=1; C protected | Retain A/C, candidate B. |
+| A/B have equal time, IDs ending 001/002; N=1 | Retain 001, candidate 002. |
+| One valid A plus newer unsigned/unknown/unregistered entries; N=1 | Retain A; empty plan. The other entries do not count. |
+| No valid artifact in requested scope | `RETENTION_SCOPE_UNKNOWN`; no plan. |
+| Delete A, with only B in another profile | `RETENTION_LAST_VALID`; no plan. |
+| Delete newest A, with valid B in the same scope | Candidate A, retain B, provided exclusions are clear. |
+| Rebuild followed by authenticated archive verification, protection still unknown | `RETENTION_PROTECTION_UNKNOWN`; no plan. |
+| Any active shared activity or needed artifact claim unavailable | `RETENTION_BUSY`; no plan/job/artifact mutation. |
+| New verification event/protection change/new registered backup after preview | Stale plan; no deletion starts, even if the old candidate set could still look safe. |
+| Retained copy missing/corrupt after preview | Refuse the whole unstarted plan; never compensate by deleting a different set. |
+
+## Saved plan bytes, digest and expiry
+
+B03 persists a nonempty plan as `plans/deletion-<plan_id>.json`, mode 0600, create-new/no-overwrite, synced before success with its containing directory synced. UUID input is a canonical UUIDv4, not a file path. Plan loading uses a real private plans directory, `O_NOFOLLOW | O_NONBLOCK`, descriptor regular-file/private-mode checks and the existing **64 KiB** plan bound. Reject unknown/duplicate fields, unknown format/operation, wrong ID, duplicate/unsorted IDs or filenames, overlapping sets and inconsistent values. If the complete envelope exceeds the bound, refuse `RETENTION_PLAN_TOO_LARGE`; never truncate or silently split its exact set. A failed/incomplete save is not an executable plan.
+
+The saved envelope has exactly `plan` and `digest`. The typed `plan` fields are serialized in this order:
+
+| Field | Contract |
+|---|---|
+| `format` | Literal `backupctl-deletion-plan-v1`. |
+| `plan_id` | Canonical UUIDv4, matching the filename. |
+| `operation` | `prune` or `delete`; the run subcommand must match it. |
+| `source_fingerprint`, `profile_fingerprint` | Two 16-character lowercase hexadecimal scope labels. |
+| `keep_last` | Positive unsigned integer for prune; JSON null for delete. |
+| `created_unix_ms`, `expires_unix_ms` | Unsigned epoch milliseconds; expiry is exactly creation + 900000, checked for overflow. Refuse before creation or at/after expiry; no clock-rollback bypass. |
+| `inventory_sha256` | SHA-256 of the quiet, validated single inventory file before saving the plan or recording execution. No journal/WAL/SHM is allowed. |
+| `candidates`, `retained` | Disjoint nonempty arrays of the artifact snapshots below, each sorted by canonical UUID ascending. Retained includes every known valid noncandidate in this scope, not only a convenient witness. Delete has exactly one candidate. Prune's retained count is at least min(N, number of known valid entries). |
+
+Each artifact snapshot has fields in this order: `backup_id`, `completed_at_utc`, `signer_id`, `protection`, `verification_event_id`, `files`. IDs and UTC follow the existing validated encodings; signer ID is 16 lowercase hex characters; protection is known `protected` or `unprotected` (candidates require unprotected); event ID is a positive SQLite integer. The selected archive event and row facts are frozen by `inventory_sha256`. Each file record has ordered fields `name`, `bytes`, `sha256`: exact fixed v1 filename, nonnegative integer byte count and 64 lowercase hex digest. Record every allowed file, including marker/public record/signature and optional globals, sorted by filename ascending. No paths, decrypted metadata, credentials, seeds, arbitrary errors or SQL enter the plan.
+
+`digest = lowercase_hex(SHA256(UTF8(compact JSON of the typed plan)))`, with the fixed field orders above, decimal integers, no whitespace, no trailing newline and no maps. The envelope's `digest` is excluded from hashing. Pretty file formatting is permitted; parsing must reconstruct the typed canonical body. Format/version is part of the body. Candidate selection is time-ordered; canonical arrays and execution are UUID-ordered. Changing any field, file snapshot, retained witness, policy, scope or expiry changes the digest. `--confirm-digest` must exactly match both the recomputed digest and envelope digest; prefixes/case variants do not authorize execution. This is a local intent checksum, not a signature or protection against the storage owner.
+
+The v1 choice is a whole-file inventory digest, reusing the conservative rebuild pattern. It invalidates on unrelated inventory changes too. A semantic per-scope snapshot could allow more concurrency but needs more canonicalization and merge rules; it is deferred. Do not introduce an inventory revision framework just for this plan.
+
+Example canonical body (synthetic file hashes illustrate encoding, not a valid artifact or authorization):
+
+```json
+{"format":"backupctl-deletion-plan-v1","plan_id":"10000000-0000-4000-8000-000000000001","operation":"delete","source_fingerprint":"c1cb425f097b6522","profile_fingerprint":"651dd7a74505b176","keep_last":null,"created_unix_ms":1000000,"expires_unix_ms":1900000,"inventory_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","candidates":[{"backup_id":"20000000-0000-4000-8000-000000000001","completed_at_utc":"2026-11-12T00:00:00Z","signer_id":"1111111111111111","protection":"unprotected","verification_event_id":1,"files":[{"name":"complete","bytes":0,"sha256":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"},{"name":"manifest.age","bytes":1,"sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},{"name":"payload.age","bytes":1,"sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"},{"name":"public.json","bytes":1,"sha256":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"},{"name":"signature.hybrid","bytes":3373,"sha256":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"}]}],"retained":[{"backup_id":"20000000-0000-4000-8000-000000000002","completed_at_utc":"2026-11-13T00:00:00Z","signer_id":"1111111111111111","protection":"protected","verification_event_id":2,"files":[{"name":"complete","bytes":0,"sha256":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"},{"name":"manifest.age","bytes":1,"sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},{"name":"payload.age","bytes":1,"sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"},{"name":"public.json","bytes":1,"sha256":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"},{"name":"signature.hybrid","bytes":3373,"sha256":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"}]}]}
+```
+
+This body's SHA-256 is `b5198a0748f35d01db177f4af9f31890203755278185ef341c2bb8749c4b370a`. Implementations must pin this canonical-encoding vector before shipping B03; it does not bypass semantic/file validation.
+
+## Reports, errors and ordering
+
+`--output json` uses these exact successful preview fields, in either operation: `operation`, `source_fingerprint`, `profile_fingerprint`, `keep_last`, `candidates` (UUIDs), `retained` (UUIDs), `excluded`, `plan_id`, `digest`, `expires_unix_ms`, `audit_recorded`. Arrays of UUIDs sort ascending. Each exclusion is `{"backup_id": UUID-or-null, "reasons": [code,...]}`; reasons are sorted unique strings. Entries sort by ID, null IDs last, then reasons. Invalid directory names are never echoed. Exclusions may also describe retained IDs (for example protected/keep-last). Codes are `active`, `conflict`, `deleted`, `deleting`, `incomplete`, `invalid`, `job_dependency`, `keep_last`, `missing`, `outside_scope`, `protected`, `unconfirmed`, `unknown_profile`, `unknown_time`, `unregistered`, `unsigned`, `verification_required`.
+
+An empty successful prune writes no plan: its last three plan fields are null and candidates is empty. Nonempty previews save only the plan, never change jobs/rows/verification/audit, and report `audit_recorded: false`. No implicit migration/reconcile/recovery or fresh verification event is hidden in preview. Human output shows the same scope, N, exact candidate/retained/excluded IDs and reasons, expiry and full confirmation digest, including the local-history/rebuild limits.
+
+```json
+{"operation":"prune","source_fingerprint":"c1cb425f097b6522","profile_fingerprint":"651dd7a74505b176","keep_last":2,"candidates":[],"retained":["20000000-0000-4000-8000-000000000001"],"excluded":[{"backup_id":"20000000-0000-4000-8000-000000000001","reasons":["keep_last"]}],"plan_id":null,"digest":null,"expires_unix_ms":null,"audit_recorded":false}
+```
+
+Protection success fields are `backup_id`, `protection`, `changed`, `audit_recorded`; repeated known state reports both booleans false. Human output explicitly names unknown-to-known transitions. Protection changes do not imply an authenticated artifact.
+
+Execution result fields are `operation`, `plan_id`, `digest`, `job_id`, `outcome` (`complete` or `partial`), `completed`, `deleting`, `pending`, `audit_recorded`. All ID arrays are sorted/disjoint and their union is the original exact candidate set. Completed means files/directory removal and its tombstone/event are durable; deleting means a per-ID durable intent exists but completion is not yet established; pending means never started. Once a job starts, any handled partial failure prints this result even in JSON mode and exits 1. A crash cannot print a result; the persisted job/intent is the recovery evidence. Pre-job refusals emit no successful JSON, no job/event and no artifact mutation. They use bounded `error: CODE: ...` stderr and exit 1 in the existing CLI style. Clap usage remains exit 2. No global error/exit-code redesign is introduced.
+
+| Runtime code | Meaning |
+|---|---|
+| `RETENTION_INVENTORY_INVALID` | Missing, unsupported, foreign, structurally corrupt, sidecar-bearing or inconsistent inventory; use existing inspection/recovery deliberately. |
+| `RETENTION_SCOPE_UNKNOWN` | Requested scope has no established valid copy or target has unknown scope/time/provenance. |
+| `RETENTION_PROTECTION_UNKNOWN` | Protection in the requested known scope has not been established. |
+| `RETENTION_VERIFICATION_REQUIRED` | Requested delete target lacks a current matching archive observation; prune reports such noncandidates as excluded. |
+| `RETENTION_PROTECTED`, `RETENTION_LAST_VALID`, `RETENTION_JOB_DEPENDENCY` | An explicit delete violates that exclusion, or job dependencies cannot be established. |
+| `RETENTION_BUSY` | Required activity/artifact claim unavailable; no waiting/unlink workaround. |
+| `RETENTION_ARTIFACT_INVALID` | Needed current files/authentication disagree or are unsafe; key loading errors are safely wrapped here without private file contents. |
+| `RETENTION_PLAN_INVALID`, `RETENTION_PLAN_TOO_LARGE` | Missing/malformed/unsafe/wrong-operation/version/oversized plan or failed save. |
+| `RETENTION_CONFIRMATION_MISMATCH`, `RETENTION_PLAN_EXPIRED` | Wrong digest, future-created or expired plan. |
+| `RETENTION_PLAN_STALE` | Initial inventory/file/fact/selection snapshot changed; prepare and review a new plan. |
+| `DELETION_PARTIAL`, `DELETION_RECOVERY_REQUIRED` | Started work is incomplete; report durable progress and do not reinterpret/restart the old plan. |
+
+## Ownership, execution and recovery obligations
+
+B03/B04 acquisition order is **exclusive maintenance → artifact claims in ascending UUID order → short SQL transactions**. Candidates take exclusive artifact claims, retained witnesses shared claims; any refusal releases all claims before returning. No scope/target lock is acquired by retention and no activity lock is upgraded/downgraded. Retain all claims through terminal recording or handled failure; native-child inherited restore claims remain authoritative. Authentication/file hashing occurs outside SQL transactions. Private helpers must use the existing claim rather than reacquire shared activity under exclusive ownership. This extends the existing lock purposes without changing any accepted lock name or reversing another operation's order.
+
+Before an unstarted execution: load/check the plan, acquire claims, then validate digest/operation/scope/expiry, exact inventory hash, current files and every candidate/retained observation/protection/dependency fact. Recompute policy and require exactly the saved candidate and retained sets. No changed set, added candidate, weaker verification level or alternate witness can be substituted. Final snapshot checks precede the first job/intent write, so execution's own writes do not invalidate its starting inventory hash. All cooperating metadata writers must hold activity/maintenance for their complete write lifetime; B02–B04 must audit callers for that invariant. Ordinary index inspection remains read-only.
+
+B04 must first persist one prune/delete job, its plan ID/digest and exact artifact dependencies transactionally with `job_started`. For each candidate, in saved UUID order: commit a durable `deleting` intent and `artifact_deleting` event; remove `complete` and sync the artifact directory **before removing any content**; remove only validated fixed artifact files, then the directory and sync its parent; record durable `deleted`, invalidate observations and append `artifact_deleted` atomically. Finally record `job_completed`. A handled failure records `job_failed` where possible and reports the exact partition above. No SQL transaction spans hashing/file removal. No success event describes work that has not durably finished, and an event-write failure is reported honestly.
+
+A crash between intent and marker removal can leave a complete directory whose lifecycle is deleting. Lifecycle-aware readers must refuse it, and discovery must report that fact rather than re-register it. A crash after marker removal never yields a valid backup. B04 recovery under the same claims may finish **only IDs with durable previously confirmed deleting intent**, even if that original plan has since expired; it cannot start pending IDs, promote leftover files or restore a marker. It requires intact matching plan/intent evidence; missing/corrupt evidence fails closed. This is completion of an already-started action, not a new expired authorization. Reads/opening never recover automatically. Integrate with explicit maintenance recovery while preserving ADR 0004's nonmutating ordinary opens; do not add an unrelated cleanup command.
+
+Re-running a fully completed plan with the exact digest returns its durable completed receipt without new work/events, including after expiry. Check the envelope, confirmation, operation and bound receipt before applying unstarted-plan expiry/snapshot checks; already removed files cannot be revalidated as intact. A receipt-only response has `audit_recorded: false`. A failed/interrupted/partial plan returns `DELETION_RECOVERY_REQUIRED` and its progress; it never resumes pending IDs under the old hash/expiry. Recovery records finalization without rewriting an original terminal failed/interrupted job to complete. After recovering started IDs, pending intact artifacts require a newly computed, unexpired preview/confirmation. No old execution is treated as atomic rollback. Tombstones/digests/audit remain; reconciliation/adoption/registration cannot revive them. A fresh lost-history rebuild must preserve unknown protection and advertise that old tombstones/history cannot be recovered. It does not itself authorize deletion of what files remain.
+
+## Implementation and verification handoff
+
+B01 acceptance is this inspected contract, worked cases, mechanically checked examples/digest and documented reach; it is not a passing deletion implementation. Next **B02** implements tri-state protection, explicit idempotent protect/unprotect, migration, merge/rebuild preservation and rollback/privacy tests before a planner is exposed. B03 then implements pure selection and bounded saved plans using this format. B04 supplies real execution/receipts/recovery, resource associations and lifecycle-aware readers, with refusal before damage. B05's local rollback-warning ledger remains separate from retention validity and is not adversarial replay protection. B06 is the native destructive acceptance drill.
+
+Required future checks: all worked cases; N=0/overflow and equal-time ordering; changed profile contents with same name; unsigned/signature/checksum/restore-job non-substitution; unknown/rebuilt protection never defaulting false; matching event identity/digests and failure invalidation; stale inventory including unrelated writes; missing/corrupt retained files and globals; plan mutation/expiry/duplicate fields/no-follow/private modes/size limit; exact confirmation and repeated-run receipts; active native children, competing deleters and restore/delete races; each per-ID intent/marker/sync/content/event crash window; disjoint exact progress, no recovery of unstarted IDs, terminal tombstone non-resurrection; failed audit transactions and raw SQLite/journal/plan/output privacy positive controls. Gate B06 on all supported PostgreSQL majors and rerun M5a plus M1–M4b/key drill and fast workspace checks. No production or independent security-audit claim follows merely from these checks.
+
+
+## B02 delivered protection
+
+`backup protect ID` and `backup unprotect ID` are keyless inventory writers through the application protection port and local inventory adapter. They take exclusive nonblocking store maintenance, inspect the existing bound inventory and all artifact row invariants, reject SQLite sidecars, and check the target before upgrading an older supported schema. They never construct the key-loading backup store, open artifacts, contact PostgreSQL, clean abandoned work or start a job. A missing/invalid target is refused before migration. A corrupt/foreign-row/newer/symlinked index is refused rather than repaired. A database's own estate remains a local claim; these commands do not authenticate it.
+
+The v5-to-v6 migration appends nullable `artifact.protected` with a 0/1 check. Existing rows become unknown without invented events; older binaries refuse v6. Only registration of a genuinely new signed publication initializes false, in the same transaction as registration/audit. Repeat registration leaves any existing true/false/null unchanged. Adoption and staged rebuild omit the column and therefore remain unknown. Authenticated enrichment and lifecycle reconciliation do not write it. Rebuild retains the old inventory recoverably, including its protection history, while the active replacement loses that knowledge.
+
+A changed protection value and `artifact_protected`/`artifact_unprotected` commit atomically; repeating a known value adds no event and reports `changed: false`, `audit_recorded: false`. The successful JSON fields remain exactly `backup_id`, `protection`, `changed`, `audit_recorded`. Human output shows the previous state and next state. An unknown-to-unprotected JSON call also emits a bounded stderr notice that the action establishes false and cannot recover lost history. Artifact discovery/private facts, jobs, verification observations, provenance and immutable files are preserved. An explicit upgrade can remain committed if a subsequent protection/audit transaction fails; the flag and event themselves still roll back together.
+
+Preservation coverage includes actual v5 migration and failed migration, true/false/null updates and idempotence, audit-insert rollback, repeated registration, authenticated enrichment, conflict/recovery reconciliation, and protected old-index preservation versus unknown rebuild rows. Real CLI tests use absent keys/tools/artifacts and cover JSON/human transitions, busy work, absent targets, malformed/foreign rows, missing/newer/symlinked indexes, sidecars and pre-migration refusal. The PostgreSQL M5a drill now scans live protection rollback journals and checks busy protection refusal without history changes. No prune/delete command, deleting/deleted writer or unused lifecycle variant is introduced by B02.
+
+
+B02 acceptance (2026-11-13): all 227 workspace tests, strict locked/offline Clippy, formatting/diff and documentation/shell/Python checks pass. All seven native regression matrices passed PostgreSQL 16/17/18, including protection live-journal scans/refusal scenes and the existing 18 rebuild crash boundaries; no native retry or remaining test container. The canonical plan encoding vector is unchanged. Evidence is `/tmp/parsbackup-b02-*.log` (ephemeral), with detailed scope in [project §36](../../project.md#36-b02-protection-and-preservation--2026-11-13). B03 previews/plans are next; prune/delete execution is unavailable.

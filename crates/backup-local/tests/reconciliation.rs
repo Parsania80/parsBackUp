@@ -40,6 +40,12 @@ fn adoption_and_rebuild_preserve_history_and_refuse_foreign_authenticated_source
     let expected = &manifest.source_fingerprint;
     let scanner = LocalReconciler(root.clone());
     let db = root.join(INVENTORY_FILE);
+    let published = Inventory::open_read_only_bound(&db).unwrap();
+    assert_eq!(published.protection(id).unwrap(), Some(false));
+    drop(published);
+    backup_application::InventoryService::new(backup_local::LocalProtection(root.clone()))
+        .set_protection(id, true)
+        .unwrap();
     let original = fs::read(&db).unwrap();
     let (wrong_plan, _) = scanner.prepare_rebuild("0000000000000000").unwrap();
     assert!(scanner.rebuild("0000000000000000", wrong_plan).is_err());
@@ -65,10 +71,12 @@ fn adoption_and_rebuild_preserve_history_and_refuse_foreign_authenticated_source
         ))
     );
     assert!(!recovered.is_provisional(id).unwrap());
+    assert_eq!(recovered.protection(id).unwrap(), Some(true));
     drop(recovered);
     let inventory = Inventory::open_read_only_bound(&db).unwrap();
     let row = inventory.artifact(id).unwrap().unwrap();
     assert!(inventory.is_provisional(id).unwrap());
+    assert_eq!(inventory.protection(id).unwrap(), None);
     assert_eq!(row.profile_fingerprint, None);
     assert_eq!(row.completed_at_utc, None);
     drop(inventory);
@@ -81,6 +89,13 @@ fn adoption_and_rebuild_preserve_history_and_refuse_foreign_authenticated_source
     fs::rename(base.join("offline-keys"), base.join("keys")).unwrap();
     let reader = LocalStore::for_reading(root.clone(), &keys.identity, &keys.verifying).unwrap();
     assert!(reader.open_signed(id).is_ok());
+    assert_eq!(
+        Inventory::open_read_only_bound(&db)
+            .unwrap()
+            .protection(id)
+            .unwrap(),
+        None
+    );
     assert!(scanner.adopt(id, expected).is_err());
     fs::remove_file(&db).unwrap();
     let foreign = Estate::new("0000000000000000".into()).unwrap();
@@ -156,6 +171,9 @@ fn mixed_store_reconciles_without_adoption_or_losing_facts() {
         panic!()
     };
     let id = manifest.backup_id;
+    backup_application::InventoryService::new(backup_local::LocalProtection(root.clone()))
+        .set_protection(id, true)
+        .unwrap();
     let inventory = Inventory::open_read_only_bound(&root.join(INVENTORY_FILE)).unwrap();
     let original = inventory.artifact(id).unwrap().unwrap();
     let events = inventory.audit_events().unwrap().len();
@@ -223,6 +241,7 @@ fn mixed_store_reconciles_without_adoption_or_losing_facts() {
     let inventory = Inventory::open_read_only_bound(&root.join(INVENTORY_FILE)).unwrap();
     let conflict = inventory.artifact(id).unwrap().unwrap();
     assert_eq!(conflict.state, State::Conflict);
+    assert_eq!(inventory.protection(id).unwrap(), Some(true));
     assert_eq!(conflict.profile_fingerprint, original.profile_fingerprint);
     assert_eq!(conflict.completed_at_utc, original.completed_at_utc);
     assert_eq!(inventory.audit_events().unwrap().len(), events + 1);

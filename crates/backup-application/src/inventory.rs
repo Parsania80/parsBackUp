@@ -41,11 +41,13 @@ pub struct InventoryService<R> {
     reader: R,
 }
 
-impl<R: InventoryReader> InventoryService<R> {
+impl<R> InventoryService<R> {
     pub fn new(reader: R) -> Self {
         Self { reader }
     }
+}
 
+impl<R: InventoryReader> InventoryService<R> {
     pub fn jobs(&self) -> Result<Vec<JobInfo>> {
         self.ensure_healthy()?;
         self.reader.jobs().context("INVENTORY_READ_FAILED")
@@ -78,6 +80,23 @@ impl<R: InventoryReader> InventoryService<R> {
             bail!("INVENTORY_READ_FAILED: inventory failed structural integrity check");
         }
         Ok(())
+    }
+}
+
+pub struct ProtectionChange {
+    pub backup_id: Uuid,
+    pub previous: Option<bool>,
+    pub protected: bool,
+    pub changed: bool,
+}
+
+pub trait ProtectionWriter {
+    fn set_protection(&self, id: Uuid, protected: bool) -> Result<ProtectionChange>;
+}
+
+impl<W: ProtectionWriter> InventoryService<W> {
+    pub fn set_protection(&self, id: Uuid, protected: bool) -> Result<ProtectionChange> {
+        self.reader.set_protection(id, protected)
     }
 }
 

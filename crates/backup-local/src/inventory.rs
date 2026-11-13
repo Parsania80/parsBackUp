@@ -126,3 +126,58 @@ impl LocalInventory {
         })
     }
 }
+
+/// A key-free explicit protection writer; it never opens artifacts or creates an inventory.
+pub struct LocalProtection(pub std::path::PathBuf);
+
+impl backup_application::ProtectionWriter for LocalProtection {
+    fn set_protection(
+        &self,
+        id: uuid::Uuid,
+        protected: bool,
+    ) -> Result<backup_application::ProtectionChange> {
+        let root = &self.0;
+        crate::ensure_real_dir(root).context("RETENTION_INVENTORY_INVALID")?;
+        let _claim = backup_inventory::ActivityLock::hold_maintenance(root)
+            .context("RETENTION_INVENTORY_INVALID: cannot claim store maintenance")?
+            .context("RETENTION_BUSY: store has active work")?;
+        let path = root.join(INVENTORY_FILE);
+        for suffix in ["-journal", "-wal", "-shm"] {
+            match std::fs::symlink_metadata(root.join(format!("{INVENTORY_FILE}{suffix}"))) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Ok(_) => anyhow::bail!(
+                    "RETENTION_INVENTORY_INVALID: recover SQLite sidecars before changing protection"
+                ),
+                Err(error) => return Err(error).context("RETENTION_INVENTORY_INVALID"),
+            }
+        }
+        let inventory = backup_inventory::Inventory::open_read_only_bound(&path)
+            .context("RETENTION_INVENTORY_INVALID")?;
+        anyhow::ensure!(
+            inventory
+                .integrity_problems()
+                .context("RETENTION_INVENTORY_INVALID")?
+                .is_empty(),
+            "RETENTION_INVENTORY_INVALID: inventory is corrupt"
+        );
+        inventory
+            .artifacts()
+            .context("RETENTION_INVENTORY_INVALID")?;
+        inventory
+            .protection(id)
+            .context("RETENTION_ARTIFACT_INVALID")?;
+        let estate = inventory.estate().clone();
+        drop(inventory);
+        let inventory = backup_inventory::Inventory::open_existing_upgrade(&path, &estate)
+            .context("RETENTION_INVENTORY_INVALID")?;
+        let (previous, changed) = inventory
+            .set_protection(id, protected)
+            .context("RETENTION_INVENTORY_INVALID: protection transaction failed")?;
+        Ok(backup_application::ProtectionChange {
+            backup_id: id,
+            previous,
+            protected,
+            changed,
+        })
+    }
+}

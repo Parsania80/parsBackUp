@@ -12,6 +12,7 @@ Use absolute paths, source-major PostgreSQL clients, and a private operator-owne
 | `inventory list` | None | No | Existing index plus mixed-shape filesystem observations; no adoption or authentication. |
 | `inventory reconcile` | None | No | Current index lifecycle/audit updates under exclusive maintenance; no adoption or authentication. |
 | `inventory adopt` | None | No | Explicit provisional registration into an existing bound index; supported old schema may migrate. |
+| `backup protect`, `backup unprotect` | None | No | Explicit protection knowledge/audit under exclusive maintenance; supported old schema may migrate. |
 | `inventory rebuild --dry-run` | None | No | Filesystem preview; works with missing/corrupt index and changes nothing. |
 | `inventory rebuild --prepare-rebuild` / `--confirm-rebuild` | None | No | Saves a bound plan / installs a validated replacement and preserves any old index. |
 | `backup create` | Configured writer key files | Yes | Job and configured artifact shape; signed writes register inventory. Requires `--confirm-synthetic`. |
@@ -77,6 +78,19 @@ backupctl --config /absolute/path/to/dr.toml --output json backup verify BACKUP_
 
 For an existing registered signed row, matching authenticated source/digests allow profile fingerprint and completion time to be filled and provisional provenance to be cleared with the verification event. Signature-only success supplies none of those private facts. Known contradictory facts are refused. Verification never creates an index or adopts an unregistered artifact.
 
+## Establish protection knowledge
+
+B02 adds keyless inventory intent commands:
+
+```sh
+backupctl --config /absolute/path/to/keyless.toml --output json backup protect BACKUP_UUID
+backupctl --config /absolute/path/to/keyless.toml --output json backup unprotect BACKUP_UUID
+```
+
+Only a new signed publication starts known-unprotected. Migration, adoption and rebuild leave protection unknown; later authentication does not recover it. Explicit protect/unprotect establishes a known value, with one atomic audit event only when it changes. An unprotect of unknown knowledge is an operator decision to establish false, not evidence that the artifact was never protected. Human output shows the transition; the JSON mode adds a stderr notice for this loss-of-history case. Repeating a known value reports no change/event.
+
+These commands need an existing valid bound inventory and idle store, not keys, artifacts or PostgreSQL tools. They reject malformed/newer/symlinked inventories and SQLite sidecars rather than guessing or repairing. An absent target is refused before migration. Protection is recorded in schema v6; older binaries refuse that schema. Artifact contents, verification and jobs are unchanged. Protection remains local intent in a mutable index; B02 enables no deletion. See the [B01/B02 contract](m5b-retention.md) for exact reports and preservation rules.
+
 ## Rebuild after loss or corruption
 
 Preserve a quiet copy of the original store and any index/SQLite sidecars for investigation. An interrupted SQLite transaction and an incomplete single-file copy are different from a disposable missing index. Confirmation refuses `inventory.db-journal`, `-wal` or `-shm`; recover the original SQLite file set before rebuilding rather than deleting a sidecar to bypass the guard. Newer-schema indexes require a compatible binary, not replacement by this older build.
@@ -103,7 +117,7 @@ Confirmation holds exclusive maintenance, builds and checks a private replacemen
 | Verification history | Lost; run a new verification to establish a new observation. |
 | Jobs, old audit and protection history | Lost from the active replacement; an old readable index may retain historical evidence. |
 
-Rebuild is not an audit-history restore and does not confer protection or retention eligibility. This phase exposes no protect/delete/prune command. Local index and artifacts can both be rewritten by a storage editor; independent off-host/immutable recovery remains outside this guarantee.
+Rebuild is not an audit-history restore and does not confer protection or retention eligibility. B02 exposes explicit protection intent; delete/prune remain unavailable. Local index and artifacts can both be rewritten by a storage editor; independent off-host/immutable recovery remains outside this guarantee.
 
 ## Verification and writable versus read-only media
 
