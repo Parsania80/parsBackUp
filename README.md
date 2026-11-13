@@ -125,3 +125,15 @@ B02 adds keyless `backup protect` / `backup unprotect` with atomic audit and ide
 B02 verification passed 227 workspace tests, strict Clippy/formatting and all seven PostgreSQL 16–18 regression matrices, including live protection-journal checks. B03 retention previews and saved plans are next; 12 planned production CLI tasks remain. Prune/delete execution and production-source enablement are still gated.
 
 The verified B01–B02 changes are being committed together: the retention/deletion specification and keyless protection with migration, audit and preservation coverage. B03 retention previews and saved plans remain next.
+
+
+B03 adds preview-only `backup prune --keep-last N [--profile NAME]` and `backup delete ID`. They authenticate signed copies using the recovery identity and trusted verifier, require recorded archive evidence and known protection, and save nonempty exact plans privately for 15 minutes. Empty previews save nothing; no artifacts or inventory history change. The default scope is whole-database history. See [retention previews](docs/development/m5a-operations.md#preview-retention-and-review-saved-intent) for exclusions, busy/stale refusals and lost-history limits. Deletion execution remains B04.
+
+
+B03 verification passed 243 workspace tests, strict Clippy/formatting and all seven PostgreSQL 16–18 native matrices, including plan privacy and 18 rebuild crash checks. Unsupported WAL indexes now refuse before SQLite can create sidecars. B04 confirmed deletion and recovery is next; 11 production CLI roadmap tasks remain, followed by API and UI work. No deletion execution or production-source enablement is included.
+
+
+B04 adds explicitly digest-confirmed `backup prune run PLAN_UUID --confirm-digest FULL_SHA256` and `backup delete run PLAN_UUID --confirm-digest FULL_SHA256`. They recheck the saved exact set, remove the completion marker before contents and keep durable deletion history. `inventory recover` finishes only already-started confirmed IDs; pending IDs need a new preview. Interrupted/deleted copies cannot be revived by reconciliation. See [confirmed deletion and recovery](docs/development/m5a-operations.md#confirm-deletion-and-recover-started-work). B04 verification passed 256 workspace tests, strict Clippy/formatting and all seven PostgreSQL 16–18 native matrices. B05 rollback warnings and B06's full destructive acceptance remain before retention closes. Ten production CLI tasks remain before API/UI work.
+
+
+The verified B03–B04 changes are being committed together: retention previews, immutable plans, confirmed deletion, tombstones and started-only recovery. B05 local rollback warnings are next.

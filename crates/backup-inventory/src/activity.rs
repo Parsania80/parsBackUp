@@ -1,4 +1,4 @@
-//! Store-activity ownership: who may be using a working directory, and who may clear one.
+//! Store activity: who may use artifact files or working directories, and who may remove them.
 //!
 //! The scope lock in [`crate::JobLock`] answers a different question — "is someone dumping this
 //! source and profile right now" — and ADR 0004 keeps the two apart on purpose. A staging directory
@@ -8,10 +8,10 @@
 //!
 //! So this is one lock for the whole store, with two modes:
 //!
-//! - **shared**, taken by an operation that is about to create or read a working directory. Shared
+//! - **shared**, taken by an operation using artifact files or working directories. Shared
 //!   against shared is compatible, which is what lets two profiles back up at the same time while
 //!   still being proof that a cleanup pass cannot run.
-//! - **exclusive**, taken by the only pass that removes anything. It is refused — not queued — while
+//! - **exclusive**, taken by maintenance recovery or confirmed deletion. It is refused — not queued — while
 //!   any operation holds the store, because a housekeeping run that had to wait would be a housekeeping
 //!   run that delayed a backup for no safety.
 //!
@@ -53,7 +53,7 @@ pub struct ActivityLock {
 }
 
 impl ActivityLock {
-    /// Keep restore ownership in native children if their parent is killed.
+    /// Keep ownership in native children if their parent is killed.
     pub fn inherit_in_children(&self) -> Result<()> {
         let flags = unsafe { libc::fcntl(self.file.as_raw_fd(), libc::F_GETFD) };
         ensure!(

@@ -116,6 +116,17 @@ impl LocalInventory {
         Ok(backup_application::JobInfo {
             job_id: job.job_id,
             backup_id: job.backup_id,
+            artifact_ids: if matches!(operation.as_deref(), Some("prune" | "delete")) {
+                Some(
+                    self.0
+                        .deletion_dependencies(job.job_id)?
+                        .into_iter()
+                        .map(|d| d.backup_id)
+                        .collect(),
+                )
+            } else {
+                None
+            },
             source_fingerprint: job.source_fingerprint,
             profile_fingerprint,
             operation,

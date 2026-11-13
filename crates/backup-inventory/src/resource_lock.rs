@@ -1,4 +1,4 @@
-//! Target and artifact-use claims held for the duration of a restore.
+//! Target and artifact-use claims held for the lifetime of file consumers.
 use anyhow::{Context, Result, ensure};
 use std::fs::{DirBuilder, File, OpenOptions};
 use std::io;
@@ -13,7 +13,7 @@ use crate::{LOCK_DIR, is_hex_id};
 pub struct ResourceLock(File);
 
 impl ResourceLock {
-    pub(crate) fn inherit_in_children(&self) -> Result<()> {
+    pub fn inherit_in_children(&self) -> Result<()> {
         let flags = unsafe { libc::fcntl(self.0.as_raw_fd(), libc::F_GETFD) };
         ensure!(
             flags >= 0

@@ -352,6 +352,106 @@ fi
             (base / "fail-pg_dump").unlink()
             assert "output withheld" in report.stderr
             check_reports(profiled)
+
+            # B03 previews authenticate current bytes and bind existing archive observations.
+            whole = [artifact, create(), create()]
+            for known in [*whole, profiled]:
+                ctl("backup", "verify", known, "--level", "archive")
+            reader_cfg = config("retention-reader")
+            reader_cfg.write_text(reader_cfg.read_text().replace(
+                f'signing_key_file = "{keys}/signing.key"\n', "").replace(
+                str(bin_dir), str(base / "absent-tools")))
+            frozen_db = index.read_bytes()
+            frozen_files = digest_tree(root / "artifacts")
+            order = [r[0] for r in sql_file(index,
+                "SELECT backup_id FROM artifact WHERE backup_id IN (?,?,?) "
+                "ORDER BY completed_at_utc DESC, backup_id", whole)]
+            preview = ctl("backup", "prune", "--keep-last", "2", cfg=reader_cfg)
+            assert preview["candidates"] == [order[2]] and preview["retained"] == sorted(order[:2])
+            assert preview["audit_recorded"] is False
+            plan_path = root / "plans" / f'deletion-{preview["plan_id"]}.json'
+            envelope = json.loads(plan_path.read_text())
+            assert plan_path.stat().st_mode & 0o777 == 0o600
+            import hashlib
+            assert hashlib.sha256(json.dumps(envelope["plan"], separators=(",", ":")).encode()).hexdigest() == preview["digest"] == envelope["digest"]
+            assert envelope["plan"]["inventory_sha256"] == hashlib.sha256(frozen_db).hexdigest()
+            for member in envelope["plan"]["candidates"] + envelope["plan"]["retained"]:
+                assert member["verification_event_id"] == sql_file(index,
+                    "SELECT MAX(event_id) FROM verification_event WHERE backup_id=? AND level='archive' AND outcome='success' AND current=1", (member["backup_id"],))[0][0]
+            assert index.read_bytes() == frozen_db and digest_tree(root / "artifacts") == frozen_files
+            empty = ctl("backup", "prune", "--keep-last", "3", cfg=reader_cfg)
+            assert empty["candidates"] == [] and all(empty[k] is None for k in ("plan_id", "digest", "expires_unix_ms"))
+            ctl("backup", "protect", order[2], cfg=keyless)
+            protected = ctl("backup", "prune", "--keep-last", "1", cfg=reader_cfg)
+            assert protected["candidates"] == [order[1]] and protected["retained"] == sorted((order[0], order[2]))
+            ctl("backup", "unprotect", order[2], cfg=keyless)
+            explicit = ctl("backup", "delete", order[0], cfg=reader_cfg)
+            assert explicit["candidates"] == [order[0]] and explicit["retained"] == sorted(order[1:])
+            rejects("backup", "delete", profiled, cfg=reader_cfg, contains="RETENTION_LAST_VALID")
+            # Reusing the same profile name intentionally groups changed historical selections.
+            changed_cfg = config("changed-profile")
+            changed_cfg.write_text(changed_cfg.read_text().replace("large_objects = true", 'large_objects = true\nmode = "data-only"'))
+            changed = ctl("backup", "create", "--confirm-synthetic", "--profile", PRIVATE_PROFILE, cfg=changed_cfg)["manifest"]["backup_id"]
+            ctl("backup", "verify", changed, "--level", "archive", cfg=changed_cfg)
+            scoped = ctl("backup", "prune", "--keep-last", "1", "--profile", PRIVATE_PROFILE, cfg=reader_cfg)
+            assert set(scoped["candidates"] + scoped["retained"]) == {profiled, changed}
+            assert len(scoped["candidates"]) == len(scoped["retained"]) == 1
+            for path in (root / "plans").glob("deletion-*.json"):
+                assert not hits(path.read_bytes(), {**secrets, **metadata}), "private metadata in retention plan"
+            print(f"PostgreSQL {major}: retention preview, exact saved plan, profile boundary and plan privacy passed", flush=True)
+            # B04 runs on isolated copies; the later recovery drill keeps its original history.
+            deletion_root = base / "b04-complete-store"
+            shutil.copytree(root, deletion_root)
+            deletion_cfg = config("b04-complete", store=deletion_root)
+            deletion_plan = ctl("backup", "prune", "--keep-last", "2", cfg=deletion_cfg)
+            candidate = deletion_plan["candidates"][0]
+            result = trace_write("backup", "prune", "run", deletion_plan["plan_id"],
+                                 "--confirm-digest", deletion_plan["digest"], cfg=deletion_cfg)
+            assert result["completed"] == [candidate] and result["outcome"] == "complete"
+            deletion_index = deletion_root / "inventory.db"
+            assert not (deletion_root / "artifacts" / candidate).exists()
+            assert sql_file(deletion_index, "SELECT state FROM artifact WHERE backup_id=?", (candidate,)) == [("deleted",)]
+            assert sql_file(deletion_index, "SELECT DISTINCT current FROM verification_event WHERE backup_id=?", (candidate,)) == [(0,)]
+            before_receipt = deletion_index.read_bytes()
+            receipt = ctl("backup", "prune", "run", deletion_plan["plan_id"],
+                          "--confirm-digest", deletion_plan["digest"], cfg=deletion_cfg)
+            assert receipt["job_id"] == result["job_id"] and receipt["audit_recorded"] is False
+            assert deletion_index.read_bytes() == before_receipt
+            for retained in deletion_plan["retained"]:
+                ctl("backup", "verify", retained, "--level", "archive", "--read-only", cfg=deletion_cfg)
+            partial_root = base / "b04-partial-store"
+            shutil.copytree(root, partial_root)
+            partial_cfg = config("b04-partial", store=partial_root)
+            partial_keyless = config("b04-partial-keyless", store=partial_root, key_dir=base / "absent-keys")
+            partial_index = partial_root / "inventory.db"
+            with contextlib.closing(sqlite3.connect(partial_index)) as db:
+                db.execute("CREATE TRIGGER refuse_deleted BEFORE INSERT ON audit_event WHEN NEW.action='artifact_deleted' BEGIN SELECT RAISE(ABORT,'injected'); END")
+                db.commit()
+            partial_plan = ctl("backup", "prune", "--keep-last", "1", cfg=partial_cfg)
+            failed = rejects("backup", "prune", "run", partial_plan["plan_id"],
+                             "--confirm-digest", partial_plan["digest"], cfg=partial_cfg,
+                             contains="DELETION_RECOVERY_REQUIRED")
+            partition = json.loads(failed.stdout)
+            started, pending = partial_plan["candidates"]
+            assert partition["completed"] == [] and partition["deleting"] == [started] and partition["pending"] == [pending]
+            assert partition["outcome"] == "partial" and failed.returncode == 1
+            with contextlib.closing(sqlite3.connect(partial_index)) as db:
+                db.execute("DROP TRIGGER refuse_deleted")
+                db.commit()
+            recovered = ctl("inventory", "recover", cfg=partial_keyless)
+            assert recovered["deleted"] == [started]
+            assert (partial_root / "artifacts" / pending / "complete").is_file()
+            assert sql_file(partial_index, "SELECT state FROM job WHERE job_id=?", (partition["job_id"],)) == [("failed",)]
+            after = rejects("backup", "prune", "run", partial_plan["plan_id"],
+                            "--confirm-digest", partial_plan["digest"], cfg=partial_keyless,
+                            contains="DELETION_RECOVERY_REQUIRED")
+            after = json.loads(after.stdout)
+            assert after["completed"] == [started] and after["pending"] == [pending] and after["audit_recorded"] is False
+            for store in (deletion_root, partial_root):
+                for path in (store / "plans").glob("deletion-*.json"):
+                    assert not hits(path.read_bytes(), {**secrets, **metadata}), "private metadata in executed plan"
+            scan_inventory()
+            print(f"PostgreSQL {major}: exact confirmed deletion, live journal privacy, partial JSON and keyless started-only recovery passed", flush=True)
             artifacts_before = digest_tree(root / "artifacts")
             print(f"PostgreSQL {major}: native fixture backup registered", flush=True)
 
@@ -368,6 +468,9 @@ fi
             assert history() == before, "duplicate startup invented history"
             rejects("backup", "protect", artifact, cfg=keyless, contains="RETENTION_BUSY")
             assert history() == before, "busy protection invented history"
+            rejects("backup", "prune", "--keep-last", "1", contains="RETENTION_BUSY")
+            rejects("backup", "delete", artifact, contains="RETENTION_BUSY")
+            assert history() == before, "busy retention invented history"
             assert job(interrupted_backup["job_id"])["state"] == "running"
             ctl("backup", "inspect", artifact)
             ctl("inventory", "list", cfg=keyless)
@@ -509,6 +612,7 @@ fi
             ctl("backup", "verify", artifact, "--level", "archive")
             assert sql_file(index, "SELECT profile_fingerprint FROM artifact WHERE backup_id=?", (artifact,))[0][0]
             assert sql_file(index, "SELECT protected FROM artifact WHERE backup_id=?", (artifact,)) == [(None,)]
+            rejects("backup", "prune", "--keep-last", "1", contains="RETENTION_PROTECTION_UNKNOWN")
             check_reports(artifact)
             print(f"PostgreSQL {major}: mixed shapes, malformed header, wrong estate and keyless rebuild passed", flush=True)
 

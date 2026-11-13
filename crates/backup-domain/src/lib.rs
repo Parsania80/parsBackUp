@@ -13,6 +13,7 @@ mod artifact_v1;
 mod config;
 mod profile;
 mod restore;
+mod retention;
 mod selection;
 mod utc;
 
@@ -26,6 +27,12 @@ pub use artifact_v1::{
 pub use config::{Config, Encryption, Signing, Source, Storage};
 pub use profile::{Profile, SelectionMode, is_safe_created_schema_name};
 pub use restore::{RestorePlan, RestoreSections, RestoreSecurityPolicy};
+pub use retention::{
+    ArtifactSnapshot, DELETION_FILES, DELETION_PLAN_FORMAT, DELETION_PLAN_MAX_BYTES,
+    DELETION_PLAN_TTL_MS, DeletionPlan, FileSnapshot, Protection, RetentionExclusion,
+    RetentionMember, RetentionOperation, RetentionRequest, RetentionSelection, SavedDeletionPlan,
+    select_retention,
+};
 pub use selection::{DanglingReference, DumpOptions, ResolvedSelection};
 pub use utc::{format_utc, is_utc_timestamp};
 

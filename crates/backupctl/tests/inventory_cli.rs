@@ -866,7 +866,7 @@ fn protection_refuses_malformed_inventory_rows_before_changing_anything() {
 fn protection_upgrades_v5_only_for_a_valid_request_and_rolls_back_failed_audit() {
     let (scene, id) = protection_scene();
     let conn = rusqlite::Connection::open(scene.inventory()).unwrap();
-    conn.execute_batch("ALTER TABLE artifact DROP COLUMN protected; PRAGMA user_version=5;")
+    conn.execute_batch("ALTER TABLE artifact DROP COLUMN protected; DROP TABLE job_artifact; DROP TABLE deletion_job; PRAGMA user_version=5;")
         .unwrap();
     drop(conn);
     let old = fs::read(scene.inventory()).unwrap();
@@ -887,7 +887,10 @@ fn protection_upgrades_v5_only_for_a_valid_request_and_rolls_back_failed_audit()
     );
     assert!(String::from_utf8_lossy(&human.stdout).contains("unknown -> unprotected"));
     let inventory = Inventory::open_read_only_bound(&scene.inventory()).unwrap();
-    assert_eq!(inventory.schema_version().unwrap(), 6);
+    assert_eq!(
+        inventory.schema_version().unwrap(),
+        backup_inventory::SCHEMA_VERSION
+    );
     assert_eq!(inventory.protection(id).unwrap(), Some(false));
     let events = inventory.audit_events().unwrap();
     let artifact = inventory.artifact(id).unwrap();
@@ -903,4 +906,23 @@ fn protection_upgrades_v5_only_for_a_valid_request_and_rolls_back_failed_audit()
     assert_eq!(inventory.protection(id).unwrap(), Some(false));
     assert_eq!(inventory.audit_events().unwrap(), events);
     assert_eq!(inventory.artifact(id).unwrap(), artifact);
+}
+
+#[test]
+fn retention_refuses_wal_index_without_creating_sqlite_sidecars() {
+    let scene = Scene::new();
+    fs::create_dir_all(scene.root()).unwrap();
+    drop(Inventory::open(&scene.inventory(), &Estate::new(SOURCE.into()).unwrap()).unwrap());
+    let conn = rusqlite::Connection::open(scene.inventory()).unwrap();
+    conn.execute_batch("PRAGMA journal_mode=wal").unwrap();
+    drop(conn);
+    let before = fs::read(scene.inventory()).unwrap();
+    let result = scene.run(&["backup", "prune", "--keep-last", "1"]);
+    assert_eq!(result.status.code(), Some(1));
+    assert!(result.stdout.is_empty());
+    error(result, "RETENTION_INVENTORY_INVALID");
+    assert_eq!(fs::read(scene.inventory()).unwrap(), before);
+    for suffix in ["-journal", "-wal", "-shm"] {
+        assert!(!scene.root().join(format!("inventory.db{suffix}")).exists());
+    }
 }

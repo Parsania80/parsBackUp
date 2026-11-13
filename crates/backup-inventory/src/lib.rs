@@ -21,6 +21,9 @@
 //! There is no async here and no connection pool: this tool is a synchronous CLI, so an
 //! [`Inventory`] is one opened connection, held for the duration of one command.
 
+mod deletion;
+pub use deletion::{DeletionDependency, DeletionJob};
+
 mod activity;
 mod artifact;
 mod job;
@@ -37,6 +40,8 @@ pub use schema::SCHEMA_VERSION;
 
 use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OptionalExtension};
+use std::io::Read;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::time::Duration;
 use uuid::Uuid;
@@ -152,6 +157,7 @@ pub struct VerificationEvent {
 
 impl Inventory {
     pub fn probe_version(path: &Path) -> Result<i64> {
+        Self::check_read_header(path)?;
         let conn = Connection::open_with_flags(
             path,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
@@ -336,6 +342,27 @@ impl Inventory {
         })
     }
 
+    // SQLite READONLY can create WAL/SHM files while querying journal_mode.
+    fn check_read_header(path: &Path) -> Result<()> {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(path)?;
+        ensure!(
+            file.metadata()?.is_file(),
+            "inventory must be a regular file"
+        );
+        let mut header = Vec::with_capacity(20);
+        file.take(20).read_to_end(&mut header)?;
+        if header.len() == 20 && &header[..16] == b"SQLite format 3\0" {
+            ensure!(
+                header[18] == 1 && header[19] == 1,
+                "unsupported inventory journal format; a single delete-mode SQLite file is required"
+            );
+        }
+        Ok(())
+    }
+
     fn read_only_connection(path: &Path) -> Result<Connection> {
         ensure!(
             path.is_file(),
@@ -343,6 +370,7 @@ impl Inventory {
              the moment to create one",
             path.display()
         );
+        Self::check_read_header(path)?;
         let conn = Connection::open_with_flags(
             path,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
@@ -499,6 +527,7 @@ impl Inventory {
                 [row.backup_id.to_string()],
                 |r| r.get(0),
             )?;
+            self.ensure_readable(row.backup_id)?;
             artifact::write(conn, row)?;
             // Only a new publication establishes false; refresh never repairs lost knowledge.
             if !present && row.shape == Shape::V1Signed {
@@ -514,6 +543,16 @@ impl Inventory {
                 Some(row.backup_id),
             )
         })
+    }
+
+    /// A tombstone wins over restored files, even while the completion marker still exists.
+    pub fn ensure_readable(&self, id: Uuid) -> Result<()> {
+        ensure!(
+            self.artifact(id)?
+                .is_none_or(|row| !row.state.is_deletion()),
+            "DELETION_RECOVERY_REQUIRED: artifact is deleting or deleted"
+        );
+        Ok(())
     }
 
     /// Unknown is distinct from false, including every row read from a pre-protection schema.
@@ -538,6 +577,7 @@ impl Inventory {
     /// Establish protection knowledge and its audit event together; return the previous value.
     pub fn set_protection(&self, id: Uuid, protected: bool) -> Result<(Option<bool>, bool)> {
         in_transaction(&self.conn, |conn| {
+            self.ensure_readable(id)?;
             let previous = self.protection(id)?;
             if previous == Some(protected) {
                 return Ok((previous, false));
@@ -644,6 +684,7 @@ impl Inventory {
         in_transaction(&self.conn, |conn| {
             let row = self.artifact(id)?.context("artifact is not registered")?;
             row.validate(&self.estate)?;
+            self.ensure_readable(id)?;
             if let Some((payload, manifest)) = digests {
                 if row.shape == Shape::V1Signed
                     && row.state == State::Registered
@@ -758,6 +799,24 @@ impl Inventory {
         Ok(events)
     }
 
+    /// Internal policy evidence, retaining SQL identity without changing public event JSON.
+    pub fn current_archive_event(
+        &self,
+        id: Uuid,
+        payload: &str,
+        manifest: &str,
+    ) -> Result<Option<i64>> {
+        self.verification_events(id)?;
+        let event: Option<i64> = self.conn.query_row(
+            "SELECT MAX(event_id) FROM verification_event WHERE backup_id = ?1 AND level = 'archive' AND outcome = 'success' AND current = 1 AND payload_sha256 = ?2 AND manifest_sha256 = ?3",
+            rusqlite::params![id.to_string(), payload, manifest], |r| r.get(0))?;
+        ensure!(
+            event.is_none_or(|id| id > 0),
+            "invalid verification event identity"
+        );
+        Ok(event)
+    }
+
     /// Every row, oldest completion first, with the never-completed ones last.
     ///
     /// `completed_at_utc` orders this, and only it: `backup_id` is a random UUIDv4 and orders
@@ -787,6 +846,10 @@ impl Inventory {
                 "inventory changed during reconciliation"
             );
             for &(id, from, to) in changes {
+                ensure!(
+                    !from.is_deletion() && !to.is_deletion(),
+                    "cannot reconcile deletion lifecycle"
+                );
                 let count = conn.execute(
                     "UPDATE artifact SET state = ?1 WHERE backup_id = ?2 AND state = ?3",
                     rusqlite::params![to.as_str(), id.to_string(), from.as_str()],
@@ -802,6 +865,7 @@ impl Inventory {
                     State::Registered => AuditAction::ArtifactObserved,
                     State::Missing => AuditAction::ArtifactMissing,
                     State::Conflict => AuditAction::ArtifactConflict,
+                    State::Deleting | State::Deleted => unreachable!(),
                 };
                 job::record(conn, action, None, Some(id))?;
             }
@@ -884,7 +948,7 @@ impl Inventory {
             .optional()?;
         if let Some((kind, target)) = &operation {
             ensure!(
-                matches!(kind.as_str(), "backup" | "restore"),
+                matches!(kind.as_str(), "backup" | "restore" | "prune" | "delete"),
                 "invalid job operation"
             );
             ensure!(
@@ -892,6 +956,15 @@ impl Inventory {
                     && target.as_ref().is_none_or(|value| is_hex_id(value)),
                 "invalid job target fingerprint"
             );
+            if matches!(kind.as_str(), "prune" | "delete") {
+                ensure!(
+                    self.job(id)?
+                        .context("deletion association has no job")?
+                        .backup_id
+                        .is_none(),
+                    "invalid deletion job association"
+                );
+            }
             if kind == "restore" {
                 let row = self.job(id)?.context("restore association has no job")?;
                 ensure!(
@@ -940,6 +1013,7 @@ impl Inventory {
                 Some((kind, Some(target))) if kind == "restore" => {
                     ResourceLock::target(root, &target)?.is_some()
                 }
+                Some((kind, None)) if matches!(kind.as_str(), "prune" | "delete") => true,
                 _ => JobLock::is_free(root, &row.source_fingerprint, &row.profile_fingerprint)?,
             };
             if free && job::mark_interrupted(&self.conn, row.job_id)? {
@@ -1042,7 +1116,9 @@ mod tests {
             [
                 "artifact",
                 "audit_event",
+                "deletion_job",
                 "job",
+                "job_artifact",
                 "job_operation",
                 "meta",
                 "provisional_artifact",
@@ -1054,7 +1130,9 @@ mod tests {
             vec![
                 "artifact".to_string(),
                 "audit_event".to_string(),
+                "deletion_job".to_string(),
                 "job".to_string(),
+                "job_artifact".to_string(),
                 "job_operation".to_string(),
                 "meta".to_string(),
                 "provisional_artifact".to_string(),
@@ -1842,20 +1920,20 @@ mod tests {
         inventory
             .conn
             .execute(
-                "UPDATE artifact SET state = 'deleted' WHERE backup_id = ?1",
+                "UPDATE artifact SET state = 'erased' WHERE backup_id = ?1",
                 [row.backup_id.to_string()],
             )
             .unwrap();
         let error = inventory
             .artifacts()
-            .expect_err("M5b's vocabulary is not this build's")
+            .expect_err("unknown vocabulary must refuse")
             .to_string();
-        assert!(error.contains("deleted"), "{error}");
+        assert!(error.contains("erased"), "{error}");
         let error = inventory
             .artifact(row.backup_id)
             .expect_err("and the same refusal on the single-row read")
             .to_string();
-        assert!(error.contains("deleted"), "{error}");
+        assert!(error.contains("erased"), "{error}");
 
         drop(inventory);
         fs::remove_dir_all(&dir).unwrap();
@@ -2357,5 +2435,286 @@ mod tests {
 
         drop(inventory);
         fs::remove_dir_all(&dir).unwrap();
+    }
+    #[test]
+    fn retention_evidence_selects_latest_current_exact_archive_event() {
+        let (dir, path) = created("retention-event");
+        let inventory = Inventory::open(&path, &estate()).unwrap();
+        let row = signed_row("20000000-0000-4000-8000-000000000001");
+        inventory.register(&row).unwrap();
+        let payload = row.payload_sha256.as_deref().unwrap();
+        let manifest = row.manifest_sha256.as_deref().unwrap();
+        let evidence = || {
+            inventory
+                .current_archive_event(row.backup_id, payload, manifest)
+                .unwrap()
+        };
+        assert_eq!(evidence(), None);
+        for level in ["signature", "checksum"] {
+            inventory
+                .record_verification(
+                    row.backup_id,
+                    level,
+                    true,
+                    Some((payload, Some(manifest))),
+                    None,
+                )
+                .unwrap();
+            assert_eq!(evidence(), None);
+        }
+        inventory
+            .record_verification(
+                row.backup_id,
+                "archive",
+                true,
+                Some((payload, Some(manifest))),
+                None,
+            )
+            .unwrap();
+        let first = evidence().unwrap();
+        inventory
+            .record_verification(
+                row.backup_id,
+                "archive",
+                true,
+                Some((payload, Some(manifest))),
+                None,
+            )
+            .unwrap();
+        let second = evidence().unwrap();
+        assert!(second > first);
+        assert_eq!(
+            inventory
+                .current_archive_event(row.backup_id, &"e".repeat(64), manifest)
+                .unwrap(),
+            None
+        );
+        inventory
+            .conn
+            .execute(
+                "UPDATE verification_event SET manifest_sha256=NULL WHERE event_id=?1",
+                [second],
+            )
+            .unwrap();
+        assert_eq!(evidence(), Some(first));
+        inventory
+            .record_verification(row.backup_id, "signature", false, None, None)
+            .unwrap();
+        assert_eq!(evidence(), None);
+        drop(inventory);
+        fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn read_only_wal_refusal_never_creates_sqlite_sidecars() {
+        let (dir, path) = created("read-wal");
+        drop(Inventory::open(&path, &estate()).unwrap());
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("PRAGMA journal_mode=wal").unwrap();
+        drop(conn);
+        // Positive control: the same SQLite read without the header gate creates sidecars.
+        let raw =
+            Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        assert_eq!(
+            raw.query_row("PRAGMA journal_mode", [], |r| r.get::<_, String>(0))
+                .unwrap(),
+            "wal"
+        );
+        assert!(dir.join("inventory.db-wal").exists() && dir.join("inventory.db-shm").exists());
+        drop(raw);
+        for suffix in ["-wal", "-shm"] {
+            let path = dir.join(format!("inventory.db{suffix}"));
+            if path.exists() {
+                fs::remove_file(path).unwrap();
+            }
+        }
+        let before = fs::read(&path).unwrap();
+        assert!(
+            Inventory::open_read_only_bound(&path)
+                .unwrap_err()
+                .to_string()
+                .contains("journal")
+        );
+        assert!(
+            Inventory::open_read_only(&path, &estate())
+                .unwrap_err()
+                .to_string()
+                .contains("journal")
+        );
+        assert!(
+            Inventory::probe_version(&path)
+                .unwrap_err()
+                .to_string()
+                .contains("journal")
+        );
+        assert_eq!(fs::read(&path).unwrap(), before);
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
+        fs::remove_dir_all(dir).unwrap();
+    }
+    fn deletion_fixture() -> (
+        std::path::PathBuf,
+        Inventory,
+        backup_domain::SavedDeletionPlan,
+    ) {
+        let (dir, path) = created("deletion");
+        let inventory = Inventory::open(&path, &estate()).unwrap();
+        use backup_domain::{
+            ArtifactSnapshot, DELETION_PLAN_FORMAT, DELETION_PLAN_TTL_MS, DeletionPlan,
+            FileSnapshot, Protection, RetentionOperation,
+        };
+        let member = |n: u128| ArtifactSnapshot {
+            backup_id: Uuid::from_u128(0x20000000000040008000000000000000 + n),
+            completed_at_utc: "2026-09-28T06:15:00Z".into(),
+            signer_id: "a".repeat(16),
+            protection: Protection::Unprotected,
+            verification_event_id: 1,
+            files: backup_domain::DELETION_FILES
+                .iter()
+                .map(|name| FileSnapshot {
+                    name: name.to_string(),
+                    bytes: match *name {
+                        "complete" => 0,
+                        "signature.hybrid" => 3373,
+                        _ => 1,
+                    },
+                    sha256: if *name == "complete" {
+                        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".into()
+                    } else {
+                        "a".repeat(64)
+                    },
+                })
+                .collect(),
+        };
+        let plan = DeletionPlan {
+            format: DELETION_PLAN_FORMAT.into(),
+            plan_id: Uuid::new_v4(),
+            operation: RetentionOperation::Delete,
+            source_fingerprint: SOURCE.into(),
+            profile_fingerprint: "651dd7a74505b176".into(),
+            keep_last: None,
+            created_unix_ms: 0,
+            expires_unix_ms: DELETION_PLAN_TTL_MS,
+            inventory_sha256: "a".repeat(64),
+            candidates: vec![member(1)],
+            retained: vec![member(2)],
+        };
+        for a in plan.candidates.iter().chain(&plan.retained) {
+            let mut row = signed_row(&a.backup_id.to_string());
+            row.profile_fingerprint = Some(plan.profile_fingerprint.clone());
+            inventory.register(&row).unwrap();
+        }
+        let saved = backup_domain::SavedDeletionPlan {
+            digest: plan.digest().unwrap(),
+            plan,
+        };
+        (dir, inventory, saved)
+    }
+
+    #[test]
+    fn deletion_start_intent_completion_and_terminal_audits_are_atomic() {
+        for action in [
+            "job_started",
+            "artifact_deleting",
+            "artifact_deleted",
+            "job_completed",
+        ] {
+            let (dir, inventory, saved) = deletion_fixture();
+            let id = saved.plan.candidates[0].backup_id;
+            if action == "job_started" {
+                inventory.conn.execute_batch("CREATE TRIGGER reject_event BEFORE INSERT ON audit_event WHEN NEW.action='job_started' BEGIN SELECT RAISE(ABORT,'injected'); END;").unwrap();
+                let events = inventory.audit_events().unwrap();
+                assert!(inventory.begin_deletion(&saved).is_err());
+                assert!(inventory.jobs().unwrap().is_empty());
+                assert!(inventory.deletion_recovery_ids().unwrap().is_empty());
+                assert_eq!(
+                    inventory
+                        .conn
+                        .query_row("SELECT COUNT(*) FROM job_artifact", [], |r| r
+                            .get::<_, i64>(0))
+                        .unwrap(),
+                    0
+                );
+                assert_eq!(inventory.audit_events().unwrap(), events);
+            } else {
+                let job_id = inventory.begin_deletion(&saved).unwrap();
+                if action != "artifact_deleting" {
+                    inventory.mark_deleting(job_id, id).unwrap();
+                }
+                if action == "job_completed" {
+                    inventory.mark_deleted(job_id, id).unwrap();
+                }
+                inventory.conn.execute_batch(&format!("CREATE TRIGGER reject_event BEFORE INSERT ON audit_event WHEN NEW.action='{action}' BEGIN SELECT RAISE(ABORT,'injected'); END;")).unwrap();
+                let rows = inventory.artifacts().unwrap();
+                let events = inventory.audit_events().unwrap();
+                let before = inventory
+                    .deletion_dependencies(job_id)
+                    .unwrap()
+                    .into_iter()
+                    .map(|d| (d.backup_id, d.role, d.progress))
+                    .collect::<Vec<_>>();
+                let result = match action {
+                    "artifact_deleting" => inventory.mark_deleting(job_id, id),
+                    "artifact_deleted" => inventory.mark_deleted(job_id, id),
+                    _ => inventory.finish_deletion(job_id, true),
+                };
+                assert!(result.is_err());
+                assert_eq!(inventory.artifacts().unwrap(), rows);
+                assert_eq!(inventory.audit_events().unwrap(), events);
+                assert_eq!(
+                    inventory
+                        .deletion_dependencies(job_id)
+                        .unwrap()
+                        .into_iter()
+                        .map(|d| (d.backup_id, d.role, d.progress))
+                        .collect::<Vec<_>>(),
+                    before
+                );
+                assert_eq!(
+                    inventory.job(job_id).unwrap().unwrap().state,
+                    JobState::Running
+                );
+            }
+            drop(inventory);
+            fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn deletion_recovery_evidence_rejects_missing_dependencies_operation_and_audit() {
+        for mutation in [
+            "DELETE FROM job_artifact WHERE role='retained'",
+            "UPDATE job_operation SET operation='prune'",
+            "DELETE FROM audit_event WHERE action='artifact_deleting'",
+            "UPDATE artifact SET state='registered' WHERE state='deleting'",
+        ] {
+            let (dir, inventory, saved) = deletion_fixture();
+            let job_id = inventory.begin_deletion(&saved).unwrap();
+            inventory
+                .mark_deleting(job_id, saved.plan.candidates[0].backup_id)
+                .unwrap();
+            inventory.conn.execute_batch(mutation).unwrap();
+            let result = inventory
+                .deletion_job(saved.plan.plan_id)
+                .and_then(|j| j.unwrap().validate(&saved));
+            assert!(result.is_err(), "accepted {mutation}");
+            drop(inventory);
+            fs::remove_dir_all(dir).unwrap();
+        }
+    }
+    #[test]
+    fn registration_and_adoption_cannot_create_tombstones_without_intent() {
+        let (dir, path) = created("forged-tombstone");
+        let inventory = Inventory::open(&path, &estate()).unwrap();
+        let mut row = signed_row(&Uuid::new_v4().to_string());
+        row.profile_fingerprint = None;
+        row.completed_at_utc = None;
+        for state in [State::Deleting, State::Deleted] {
+            row.state = state;
+            assert!(inventory.register(&row).is_err());
+            assert!(inventory.adopt(&row).is_err());
+            assert!(inventory.artifacts().unwrap().is_empty());
+            assert!(inventory.audit_events().unwrap().is_empty());
+        }
+        drop(inventory);
+        fs::remove_dir_all(dir).unwrap();
     }
 }

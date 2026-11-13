@@ -1,6 +1,6 @@
 # M5a inventory and recovery operating guide
 
-This guide covers the delivered inventory, job, verification and recovery CLI. The exact reports and failure categories are in the [inventory contract](m5a-inventory.md); artifact bytes remain governed by [artifact v1](../backup-format/manifest-v1.md). Current operations are restricted to synthetic local fixture databases. Production-source enablement, retention, scheduling, packaging and API/UI release have later gates in [project.md](../../project.md).
+This guide covers the delivered inventory, job, verification and recovery CLI. The exact reports and failure categories are in the [inventory contract](m5a-inventory.md); artifact bytes remain governed by [artifact v1](../backup-format/manifest-v1.md). Current operations are restricted to synthetic local fixture databases. Production-source enablement, deletion execution, scheduling, packaging and API/UI release have later gates in [project.md](../../project.md).
 
 ## Choose a configuration and mode
 
@@ -13,6 +13,7 @@ Use absolute paths, source-major PostgreSQL clients, and a private operator-owne
 | `inventory reconcile` | None | No | Current index lifecycle/audit updates under exclusive maintenance; no adoption or authentication. |
 | `inventory adopt` | None | No | Explicit provisional registration into an existing bound index; supported old schema may migrate. |
 | `backup protect`, `backup unprotect` | None | No | Explicit protection knowledge/audit under exclusive maintenance; supported old schema may migrate. |
+| `backup prune`, `backup delete` | Recovery identity and trusted verifier only | No | Preview exact candidates/retained copies; save nonempty private intent only. Current healthy schema required, no migration/history write or deletion. |
 | `inventory rebuild --dry-run` | None | No | Filesystem preview; works with missing/corrupt index and changes nothing. |
 | `inventory rebuild --prepare-rebuild` / `--confirm-rebuild` | None | No | Saves a bound plan / installs a validated replacement and preserves any old index. |
 | `backup create` | Configured writer key files | Yes | Job and configured artifact shape; signed writes register inventory. Requires `--confirm-synthetic`. |
@@ -174,3 +175,37 @@ for matrix in m1_docker_smoke m2_docker_smoke m3_docker_smoke m4a_docker_smoke m
     bash "tests/${matrix}.sh"
 done
 ```
+
+
+## Preview retention and review saved intent
+
+B03 adds two preview commands:
+
+```sh
+backupctl --config /absolute/config.toml --output json backup prune --keep-last 3
+backupctl --config /absolute/config.toml --output json backup prune --keep-last 3 --profile app-only
+backupctl --config /absolute/config.toml --output json backup delete BACKUP_UUID
+```
+
+Prune counts only freshly authenticated signed copies with an existing current archive-success observation and established protection. The default scope is the reserved whole-database profile; `--profile` selects a configured name without contacting PostgreSQL. Newest N valid copies stay, and older protected/job-dependent copies stay in addition. Delete may select the newest valid copy but must leave another valid copy in that same scope. Unknown protection blocks planning; explicitly establish it after reviewing the lost-history limits above. Missing/conflicting/unsigned/unregistered/unconfirmed/unknown entries never satisfy the quota.
+
+JSON and human output show exact candidates, all valid retained copies, exclusions, scope, quota and `audit_recorded: false`. A nonempty preview returns a plan UUID, full SHA-256 digest and expiry, and saves `plans/deletion-UUID.json` privately. An empty prune returns null plan fields and writes no plan. Plans expire after 15 minutes and bind every relevant file and the whole inventory: even unrelated inventory writes require a fresh preview. Keep plan directories private; unsafe paths or envelopes over 64 KiB refuse. Busy store activity refuses immediately, including unrelated profiles. Preview never performs implicit migration, recovery or a new archive verification.
+
+Saved intent is not an executed action and does not pin resources after preview returns. B04 adds separately confirmed execution below. Checksums are local intent checks, not signatures or off-host rollback protection; rebuild cannot restore lost protection, audit or deletion history. The [retention contract](m5b-retention.md) defines these boundaries.
+
+
+## Confirm deletion and recover started work
+
+Review the exact candidate/retained IDs, source/profile fingerprints and full digest from a fresh preview. Execution consumes that saved plan; it accepts no quota/profile override and refuses stale inventory or files before starting work.
+
+```sh
+backupctl --config /absolute/config.toml --output json backup prune run PLAN_UUID --confirm-digest FULL_SHA256
+backupctl --config /absolute/config.toml --output json backup delete run PLAN_UUID --confirm-digest FULL_SHA256
+backupctl --config /absolute/config.toml --output json inventory recover
+```
+
+Deletion permanently removes the confirmed artifact files. It retains keyless tombstones, job dependencies and audit events. A successful result names its job and exact completed IDs. Repeating a completed plan with the same digest returns its receipt with `audit_recorded: false`, even after expiry; it does not remove anything else. New execution needs the reader identity and trusted verifier, no signing secret or PostgreSQL tools. Upgrade an old supported index explicitly through maintenance before making a new preview; run never migrates it implicitly.
+
+If execution exits 1 after starting a job, keep its JSON result: `completed`, `deleting` and `pending` partition the original candidates. A deleting ID is unusable even if its completion marker remains. Run `inventory recover` on the same intact store/plan/index; it uses no keys or PostgreSQL and finishes only previously started IDs after checking their evidence and remaining bytes. The existing real-create maintenance pass can do the same. A busy store refuses maintenance. Missing/changed plan evidence or unexpected remaining files fail closed; preserve them for investigation rather than manually restoring a marker or deleting the index.
+
+Recovery never starts pending IDs or turns an original failed/interrupted job into a successful one. Obtain and review a new preview for pending intact backups. Ordinary list/inspect/open calls do not recover anything, and reconcile/adopt cannot revive tombstones. Rebuild of a readable deleting index refuses until recovery. A lost-history rebuild cannot recover old tombstones or protection: its unknown facts still cannot authorize retention. B05 rollback warnings and B06's full destructive acceptance drill remain separate gates; the production CLI is not finished.

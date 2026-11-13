@@ -88,7 +88,7 @@ const OPEN_STATES: &[JobState] = &[JobState::Running, JobState::Staged];
 pub struct JobRow {
     pub job_id: Uuid,
     /// NULL for a job whose scope is a set of artifacts rather than one, which is M5b's shape for
-    /// `prune` and `delete`. Every writer today names exactly one artifact.
+    /// `prune` and `delete`; their exact dependencies are recorded separately.
     pub backup_id: Option<Uuid>,
     pub source_fingerprint: String,
     pub profile_fingerprint: String,
@@ -115,6 +115,8 @@ pub enum AuditAction {
     InventoryRebuilt,
     ArtifactProtected,
     ArtifactUnprotected,
+    ArtifactDeleting,
+    ArtifactDeleted,
 }
 
 impl AuditAction {
@@ -133,6 +135,8 @@ impl AuditAction {
             AuditAction::InventoryRebuilt => "inventory_rebuilt",
             AuditAction::ArtifactProtected => "artifact_protected",
             AuditAction::ArtifactUnprotected => "artifact_unprotected",
+            AuditAction::ArtifactDeleting => "artifact_deleting",
+            AuditAction::ArtifactDeleted => "artifact_deleted",
         }
     }
 
@@ -151,6 +155,8 @@ impl AuditAction {
             "inventory_rebuilt" => Ok(AuditAction::InventoryRebuilt),
             "artifact_protected" => Ok(AuditAction::ArtifactProtected),
             "artifact_unprotected" => Ok(AuditAction::ArtifactUnprotected),
+            "artifact_deleting" => Ok(AuditAction::ArtifactDeleting),
+            "artifact_deleted" => Ok(AuditAction::ArtifactDeleted),
             other => bail!("inventory holds audit action {other:?}, which this build cannot write"),
         }
     }

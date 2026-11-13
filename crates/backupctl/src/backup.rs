@@ -1,5 +1,6 @@
 use crate::cli::{
-    BackupCommand, VerifyLevel, json_created, json_inventory, json_record, selection_json,
+    BackupCommand, DeletionCommand, VerifyLevel, json_created, json_inventory, json_record,
+    selection_json,
 };
 use crate::open_store;
 use crate::report::{
@@ -13,6 +14,46 @@ use backup_postgres::PostgresAdapter;
 
 pub(crate) fn run(config: Config, command: BackupCommand, json: bool) -> Result<()> {
     match command {
+        BackupCommand::Prune {
+            command: Some(command),
+            ..
+        } => deletion(
+            config,
+            command,
+            backup_domain::RetentionOperation::Prune,
+            json,
+        )?,
+        BackupCommand::Delete {
+            command: Some(command),
+            ..
+        } => deletion(
+            config,
+            command,
+            backup_domain::RetentionOperation::Delete,
+            json,
+        )?,
+        BackupCommand::Prune {
+            keep_last,
+            profile,
+            command: None,
+        } => {
+            let name = match profile.as_deref() {
+                Some(name) => &config.profile(name)?.name,
+                None => backup_domain::WHOLE_DATABASE_PROFILE,
+            };
+            let request = backup_domain::RetentionRequest::Prune {
+                keep_last: keep_last.expect("clap requires quota for preview"),
+                profile_fingerprint: backup_domain::profile_fingerprint(name),
+            };
+            retention(config, request, json)?;
+        }
+        BackupCommand::Delete { id, command: None } => retention(
+            config,
+            backup_domain::RetentionRequest::Delete {
+                backup_id: id.expect("clap requires ID for preview"),
+            },
+            json,
+        )?,
         BackupCommand::Protect { id } | BackupCommand::Unprotect { id } => {
             let protected = matches!(command, BackupCommand::Protect { .. });
             let report = backup_application::InventoryService::new(backup_local::LocalProtection(
@@ -166,6 +207,73 @@ pub(crate) fn run(config: Config, command: BackupCommand, json: bool) -> Result<
                 print_verify(&report);
             }
         }
+    }
+    Ok(())
+}
+
+fn retention(config: Config, request: backup_domain::RetentionRequest, json: bool) -> Result<()> {
+    let r = backup_application::preview_retention(&backup_local::LocalRetention(config), &request)?;
+    let value = serde_json::json!({
+        "operation": r.operation, "source_fingerprint": r.source_fingerprint,
+        "profile_fingerprint": r.profile_fingerprint, "keep_last": r.keep_last,
+        "candidates": r.candidates, "retained": r.retained, "excluded": r.excluded,
+        "plan_id": r.plan_id, "digest": r.digest, "expires_unix_ms": r.expires_unix_ms,
+        "audit_recorded": r.audit_recorded,
+    });
+    if json {
+        println!("{}", serde_json::to_string_pretty(&value)?);
+    } else {
+        println!("Retention preview (no deletion):");
+        println!("{}", serde_json::to_string_pretty(&value)?);
+        println!(
+            "Local history only: rebuild loses protection/deletion history; this digest is not rollback protection. No execution is enabled."
+        );
+    }
+    Ok(())
+}
+
+fn deletion(
+    config: Config,
+    command: DeletionCommand,
+    operation: backup_domain::RetentionOperation,
+    json: bool,
+) -> Result<()> {
+    let DeletionCommand::Run {
+        plan_id,
+        confirm_digest,
+    } = command;
+    let outcome = backup_application::execute_deletion(
+        &backup_local::LocalRetention(config),
+        plan_id,
+        operation,
+        &confirm_digest,
+    )?;
+    let r = outcome.result;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "operation": r.operation, "plan_id": r.plan_id, "digest": r.digest, "job_id": r.job_id,
+                "outcome": r.outcome, "completed": r.completed, "deleting": r.deleting, "pending": r.pending,
+                "audit_recorded": r.audit_recorded,
+            }))?
+        );
+    } else {
+        println!(
+            "{:?} plan={} digest={} job={} outcome={} completed={:?} deleting={:?} pending={:?} audit_recorded={}",
+            operation,
+            r.plan_id,
+            r.digest,
+            r.job_id,
+            r.outcome,
+            r.completed,
+            r.deleting,
+            r.pending,
+            r.audit_recorded
+        );
+    }
+    if let Some(code) = outcome.error {
+        bail!("{code}: run inventory recover for started IDs; pending IDs require a new preview");
     }
     Ok(())
 }

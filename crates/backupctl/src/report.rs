@@ -109,7 +109,11 @@ pub(crate) fn print_recovery(recovery: &Recovery) {
             path.display()
         );
     }
-    if recovery.removed.is_empty() && recovery.interrupted.is_empty() {
+    for id in &recovery.deleted {
+        println!("recovery finalized confirmed deletion {id}");
+    }
+    if recovery.removed.is_empty() && recovery.interrupted.is_empty() && recovery.deleted.is_empty()
+    {
         return;
     }
     eprintln!(

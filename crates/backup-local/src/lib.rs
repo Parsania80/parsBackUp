@@ -14,6 +14,7 @@ mod fixture;
 mod inventory;
 mod keys;
 mod reconcile;
+mod retention;
 mod scratch;
 mod stage;
 mod store;
@@ -47,6 +48,7 @@ use layout::{
     PAYLOAD_FILE, PLANS_DIR, PUBLIC_FILE, SIGNATURE_FILE, STAGING_DIR,
 };
 pub use reconcile::LocalReconciler;
+pub use retention::LocalRetention;
 use sha2::{Digest, Sha256};
 use stage::Target;
 use std::fs::{self, DirBuilder, File, OpenOptions};
@@ -83,7 +85,13 @@ pub struct StoreKeys {
 /// then was `manifest.age` decrypted and compared field by field with `public.json`. So a
 /// value read off [`SignedArtifactHandle::manifest`] is a claim about bytes written by whoever
 /// holds the signing key, not about bytes an attacker chose.
+pub struct ArtifactUse {
+    _resource: backup_inventory::ResourceLock,
+    activity: ActivityLock,
+}
+
 pub struct SignedArtifact {
+    _use: Option<std::sync::Arc<ArtifactUse>>,
     header: PublicHeader,
     manifest: ArtifactManifest,
     payload: PathBuf,
@@ -141,6 +149,7 @@ impl JobHandle for LocalJob {
 }
 
 pub struct LocalArtifact {
+    _use: std::sync::Arc<ArtifactUse>,
     manifest: DevelopmentManifest,
     payload: PathBuf,
     globals: Option<PathBuf>,
@@ -152,10 +161,10 @@ pub struct LocalArtifact {
 /// store's scratch directory, and this type owns it: dropping the view removes the
 /// directory, so decrypted bytes do not outlive the operation that needed them.
 pub struct LocalPlaintext {
+    _use: Option<std::sync::Arc<ArtifactUse>>,
     path: PathBuf,
     scratch: Option<PathBuf>,
-    /// Held while `scratch` exists, and dropped after it is removed. A view of a plaintext artifact
-    /// owns no directory, so it claims nothing.
+    /// Scratch ownership lasts through cleanup; artifact-use ownership is held separately.
     _claim: Option<ActivityLock>,
 }
 
@@ -311,6 +320,7 @@ impl LocalStore {
     }
 
     fn load_artifact(&self, id: Uuid) -> Result<LocalArtifact> {
+        let usage = self.claim_artifact(id)?;
         let dir = self.artifact_dir(id);
         ensure_real_dir(&dir)?;
         let marker = dir.join(COMPLETE_MARKER);
@@ -381,6 +391,7 @@ impl LocalStore {
             None
         };
         Ok(LocalArtifact {
+            _use: usage,
             manifest,
             payload: payload_path,
             globals,
@@ -389,6 +400,19 @@ impl LocalStore {
 }
 
 impl ArtifactStore for LocalStore {
+    type Use = std::sync::Arc<ArtifactUse>;
+    fn claim_artifact(&self, id: Uuid) -> Result<Self::Use> {
+        let activity = ActivityLock::hold(&self.root)?;
+        let resource = backup_inventory::ResourceLock::artifact(&self.root, id, false)?
+            .context("RETENTION_BUSY: artifact has an exclusive user")?;
+        self.check_lifecycle(id)?;
+        activity.inherit_in_children()?;
+        resource.inherit_in_children()?;
+        Ok(std::sync::Arc::new(ArtifactUse {
+            _resource: resource,
+            activity,
+        }))
+    }
     type Stage = LocalStage;
     type Artifact = LocalArtifact;
     type Plaintext = LocalPlaintext;
@@ -426,6 +450,7 @@ impl ArtifactStore for LocalStore {
         // Claimed before the directory exists: a maintenance pass that is still deleting inside
         // `staging/` must be finished before this command puts a live directory in it.
         let claim = ActivityLock::hold(&self.root)?;
+        self.check_lifecycle(id)?;
         let dir = self.root.join(STAGING_DIR).join(id.to_string());
         DirBuilder::new()
             .mode(0o700)
@@ -583,6 +608,9 @@ impl ArtifactStore for LocalStore {
             let Ok(id) = Uuid::parse_str(&name) else {
                 continue;
             };
+            if self.is_tombstoned(id)? {
+                continue;
+            }
             if !entry.path().join(COMPLETE_MARKER).exists() {
                 continue;
             }
@@ -610,6 +638,7 @@ impl ArtifactStore for LocalStore {
                 path: artifact.payload.clone(),
                 scratch: None,
                 _claim: None,
+                _use: Some(artifact._use.clone()),
             });
         }
         // The recorded plaintext size is the bound: a ciphertext that inflates past what
@@ -624,6 +653,10 @@ impl ArtifactStore for LocalStore {
             Some(limit),
             Some((artifact.manifest.size_bytes, &artifact.manifest.sha256)),
         )
+        .map(|mut view| {
+            view._use = Some(artifact._use.clone());
+            view
+        })
     }
 
     fn plaintext_staged_payload(&self, stage: &Self::Stage) -> Result<Self::Plaintext> {
@@ -633,6 +666,7 @@ impl ArtifactStore for LocalStore {
                 path: stage.payload.clone(),
                 scratch: None,
                 _claim: None,
+                _use: None,
             });
         }
         // A stage has no manifest yet, so only the format-wide cap applies.
@@ -649,6 +683,7 @@ impl ArtifactStore for LocalStore {
                 path: path.clone(),
                 scratch: None,
                 _claim: None,
+                _use: Some(artifact._use.clone()),
             });
         }
         // Globals carry no recorded plaintext size, so the cap here is the format's own;
@@ -669,6 +704,10 @@ impl ArtifactStore for LocalStore {
                     .context("globals digest missing")?,
             )),
         )
+        .map(|mut view| {
+            view._use = Some(artifact._use.clone());
+            view
+        })
     }
 
     fn rewrite_manifest(
@@ -838,6 +877,7 @@ impl ArtifactStore for LocalStore {
     /// artifacts are reported by id rather than skipped, because an unsigned artifact that a
     /// signature-first listing hides is the failure mode this function exists to catch.
     fn list_signed(&self) -> Result<StoreListing> {
+        let _activity = ActivityLock::hold(&self.root)?;
         let mut listing = StoreListing {
             signed: Vec::new(),
             unsigned: Vec::new(),
@@ -851,6 +891,9 @@ impl ArtifactStore for LocalStore {
             else {
                 continue;
             };
+            if self.is_tombstoned(id)? {
+                continue;
+            }
             if !path.join(COMPLETE_MARKER).exists() {
                 continue;
             }
@@ -872,126 +915,19 @@ impl ArtifactStore for LocalStore {
     /// No manifest is decrypted here, so this is the whole of what a host holding nothing but
     /// a verifying key can prove about an artifact.
     fn verify_signed(&self, id: Uuid) -> Result<PublicHeader> {
-        let keys = self
-            .keys
-            .as_ref()
-            .context("artifact is signed but no key files are configured")?;
-        let verifying = keys
-            .verifying
-            .as_ref()
-            .context("no verifying key is configured, so no signature can be trusted")?;
+        let _use = self.claim_artifact(id)?;
         let dir = self.artifact_dir(id);
         ensure_real_dir(&dir)?;
-        ensure_regular_file(&dir.join(COMPLETE_MARKER))?;
-        Self::refuse_split_manifest(&dir)?;
-        let header = self.read_header(&dir)?;
-        if header.backup_id != id {
-            bail!(
-                "public.json records backup id {}, found under directory {id}",
-                header.backup_id
-            );
-        }
-        let payload = dir.join(AGE_PAYLOAD_FILE);
-        ensure_regular_file(&payload)?;
-        let (payload_bytes, payload_digest) = hash_file(&payload)?;
-        if payload_bytes != header.payload_ciphertext_bytes
-            || payload_digest != header.payload_sha256
-        {
-            bail!(
-                "payload.age is not the ciphertext public.json describes: {payload_bytes} bytes digesting {payload_digest}"
-            );
-        }
-        let manifest_path = dir.join(AGE_MANIFEST_FILE);
-        ensure_regular_file(&manifest_path)?;
-        let (manifest_bytes, manifest_digest) = hash_file(&manifest_path)?;
-        if manifest_bytes != header.manifest_ciphertext_bytes
-            || manifest_digest != header.manifest_sha256
-        {
-            bail!(
-                "manifest.age is not the ciphertext public.json describes: {manifest_bytes} bytes digesting {manifest_digest}"
-            );
-        }
-        let signature_path = dir.join(SIGNATURE_FILE);
-        ensure_regular_file(&signature_path)?;
-        let stored = read_bounded(&signature_path, HYBRID_SIGNATURE_BYTES as u64 + 1)?;
-        let signature = backup_crypto::signing::HybridSignature::from_bytes(&stored)
-            .with_context(|| format!("read {}", signature_path.display()))?;
-        let tuple = signature_tuple(
-            id.as_bytes(),
-            &digest_bytes(&manifest_digest)?,
-            &digest_bytes(&payload_digest)?,
-        );
-        verifying
-            .verifier()
-            .verify(&tuple, &signature)
-            .with_context(|| format!("origin signature of artifact {id} does not verify"))?;
-        Ok(header)
+        self.verify_signed_in(id, &dir)
     }
 
-    /// Reads one v1 artifact, authenticating it before decrypting anything.
-    ///
-    /// The order is the contract's, and it is the whole point of the type: [`Self::verify_signed`]
-    /// first, and only then is `manifest.age` opened — under a size bound, and checked field by
-    /// field against the header it was sealed beside.
-    ///
-    /// `globals.age` is bound one step further in, by the digest inside the signed manifest,
-    /// so a swapped globals file is caught through the signature rather than by its own
-    /// metadata.
     fn open_signed(&self, id: Uuid) -> Result<SignedArtifact> {
-        let _claim = ActivityLock::hold(&self.root)?;
-        let header = self.verify_signed(id)?;
-        // Everything from here in was written by whoever holds the configured signing key.
+        let usage = self.claim_artifact(id)?;
         let dir = self.artifact_dir(id);
-        let manifest = self.authenticated_manifest(&dir.join(AGE_MANIFEST_FILE), &header)?;
-        manifest.matches_header(&header)?;
-        if manifest.backup_id != id {
-            bail!(
-                "authenticated manifest records backup id {}, requested {id}",
-                manifest.backup_id
-            );
-        }
-        let inventory_path = self.root.join(layout::INVENTORY_FILE);
-        match fs::symlink_metadata(&inventory_path) {
-            Ok(_) => {
-                let inventory = backup_inventory::Inventory::open_read_only_bound(&inventory_path)?;
-                if inventory.schema_version()? >= 3 {
-                    inventory.check_provisional_source(id, &manifest.source_fingerprint)?;
-                }
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
-        let payload = dir.join(AGE_PAYLOAD_FILE);
-        let globals_path = dir.join(AGE_GLOBALS_FILE);
-        let globals = match manifest.globals_policy.as_str() {
-            GLOBALS_POLICY_EXPORTED => {
-                ensure_regular_file(&globals_path)?;
-                let (bytes, digest) = hash_file(&globals_path)?;
-                if manifest.globals_sha256.as_deref() != Some(digest.as_str())
-                    || manifest.globals_ciphertext_bytes != Some(bytes)
-                {
-                    bail!(
-                        "globals.age does not match the digest inside the signed manifest; the file was changed after publication"
-                    );
-                }
-                Some(globals_path)
-            }
-            GLOBALS_POLICY_SKIPPED => {
-                if globals_path.symlink_metadata().is_ok() {
-                    bail!(
-                        "artifact holds a globals file its authenticated manifest declares skipped"
-                    );
-                }
-                None
-            }
-            other => bail!("manifest globals policy {other:?} is not a known policy"),
-        };
-        Ok(SignedArtifact {
-            header,
-            manifest,
-            payload,
-            globals,
-        })
+        ensure_real_dir(&dir)?;
+        let mut artifact = self.open_signed_claimed(id, &dir, &usage.activity)?;
+        artifact._use = Some(usage);
+        Ok(artifact)
     }
 
     fn record_verification(
@@ -1038,6 +974,10 @@ impl ArtifactStore for LocalStore {
                 &artifact.manifest.payload_ciphertext_sha256,
             )),
         )
+        .map(|mut view| {
+            view._use = artifact._use.clone();
+            view
+        })
     }
 
     /// The authenticated globals file as plaintext, under the format-wide bound: role
@@ -1063,6 +1003,10 @@ impl ArtifactStore for LocalStore {
                     .context("globals digest missing")?,
             )),
         )
+        .map(|mut view| {
+            view._use = artifact._use.clone();
+            view
+        })
     }
 
     fn save_plan(&self, plan: &RestorePlan) -> Result<()> {
@@ -1120,7 +1064,7 @@ fn ensure_regular_file(path: &Path) -> Result<()> {
 }
 
 fn hash_file(path: &Path) -> Result<(u64, String)> {
-    let mut file = File::open(path)?;
+    let mut file = open_regular(path)?;
     let mut hasher = Sha256::new();
     let mut bytes = 0_u64;
     let mut buffer = [0_u8; 64 * 1024];
@@ -1141,7 +1085,7 @@ fn hash_file(path: &Path) -> Result<(u64, String)> {
 /// size an attacker controls is not a bound: the reader has to stop on its own terms.
 fn read_bounded(path: &Path, limit: u64) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
-    File::open(path)?.take(limit).read_to_end(&mut bytes)?;
+    open_regular(path)?.take(limit).read_to_end(&mut bytes)?;
     if bytes.len() as u64 > limit {
         bail!(
             "{} is larger than the {limit} byte bound this reader applies",
@@ -1173,6 +1117,153 @@ fn digest_bytes(value: &str) -> Result<[u8; DIGEST_BYTES]> {
         *byte = (nibble(pair[0])? << 4) | nibble(pair[1])?;
     }
     Ok(digest)
+}
+
+impl LocalStore {
+    fn verify_signed_in(&self, id: Uuid, dir: &Path) -> Result<PublicHeader> {
+        let keys = self
+            .keys
+            .as_ref()
+            .context("artifact is signed but no key files are configured")?;
+        let verifying = keys
+            .verifying
+            .as_ref()
+            .context("no verifying key is configured, so no signature can be trusted")?;
+        ensure_regular_file(&dir.join(COMPLETE_MARKER))?;
+        Self::refuse_split_manifest(dir)?;
+        let header = self.read_header(dir)?;
+        if header.backup_id != id {
+            bail!(
+                "public.json records backup id {}, found under directory {id}",
+                header.backup_id
+            );
+        }
+        let payload = dir.join(AGE_PAYLOAD_FILE);
+        ensure_regular_file(&payload)?;
+        let (payload_bytes, payload_digest) = hash_file(&payload)?;
+        if payload_bytes != header.payload_ciphertext_bytes
+            || payload_digest != header.payload_sha256
+        {
+            bail!(
+                "payload.age is not the ciphertext public.json describes: {payload_bytes} bytes digesting {payload_digest}"
+            );
+        }
+        let manifest_path = dir.join(AGE_MANIFEST_FILE);
+        ensure_regular_file(&manifest_path)?;
+        let (manifest_bytes, manifest_digest) = hash_file(&manifest_path)?;
+        if manifest_bytes != header.manifest_ciphertext_bytes
+            || manifest_digest != header.manifest_sha256
+        {
+            bail!(
+                "manifest.age is not the ciphertext public.json describes: {manifest_bytes} bytes digesting {manifest_digest}"
+            );
+        }
+        let signature_path = dir.join(SIGNATURE_FILE);
+        ensure_regular_file(&signature_path)?;
+        let stored = read_bounded(&signature_path, HYBRID_SIGNATURE_BYTES as u64 + 1)?;
+        let signature = backup_crypto::signing::HybridSignature::from_bytes(&stored)
+            .with_context(|| format!("read {}", signature_path.display()))?;
+        let tuple = signature_tuple(
+            id.as_bytes(),
+            &digest_bytes(&manifest_digest)?,
+            &digest_bytes(&payload_digest)?,
+        );
+        verifying
+            .verifier()
+            .verify(&tuple, &signature)
+            .with_context(|| format!("origin signature of artifact {id} does not verify"))?;
+        Ok(header)
+    }
+
+    fn is_tombstoned(&self, id: Uuid) -> Result<bool> {
+        let path = self.root.join(layout::INVENTORY_FILE);
+        match fs::symlink_metadata(&path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(e.into()),
+            Ok(_) => Ok(backup_inventory::Inventory::open_read_only_bound(&path)?
+                .artifact(id)?
+                .is_some_and(|r| r.state.is_deletion())),
+        }
+    }
+    fn check_lifecycle(&self, id: Uuid) -> Result<()> {
+        anyhow::ensure!(
+            !self.is_tombstoned(id)?,
+            "DELETION_RECOVERY_REQUIRED: artifact is deleting or deleted"
+        );
+        Ok(())
+    }
+
+    // The caller keeps maintenance/activity ownership and the directory descriptor alive.
+    fn open_signed_claimed(
+        &self,
+        id: Uuid,
+        dir: &Path,
+        claim: &ActivityLock,
+    ) -> Result<SignedArtifact> {
+        self.check_lifecycle(id)?;
+        let header = self.verify_signed_in(id, dir)?;
+        // Everything from here in was written by whoever holds the configured signing key.
+        let manifest = self.authenticated_manifest(&dir.join(AGE_MANIFEST_FILE), &header, claim)?;
+        manifest.matches_header(&header)?;
+        if manifest.backup_id != id {
+            bail!(
+                "authenticated manifest records backup id {}, requested {id}",
+                manifest.backup_id
+            );
+        }
+        let inventory_path = self.root.join(layout::INVENTORY_FILE);
+        match fs::symlink_metadata(&inventory_path) {
+            Ok(_) => {
+                let inventory = backup_inventory::Inventory::open_read_only_bound(&inventory_path)?;
+                if inventory.schema_version()? >= 3 {
+                    inventory.check_provisional_source(id, &manifest.source_fingerprint)?;
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        let payload = dir.join(AGE_PAYLOAD_FILE);
+        let globals_path = dir.join(AGE_GLOBALS_FILE);
+        let globals = match manifest.globals_policy.as_str() {
+            GLOBALS_POLICY_EXPORTED => {
+                ensure_regular_file(&globals_path)?;
+                let (bytes, digest) = hash_file(&globals_path)?;
+                if manifest.globals_sha256.as_deref() != Some(digest.as_str())
+                    || manifest.globals_ciphertext_bytes != Some(bytes)
+                {
+                    bail!(
+                        "globals.age does not match the digest inside the signed manifest; the file was changed after publication"
+                    );
+                }
+                Some(globals_path)
+            }
+            GLOBALS_POLICY_SKIPPED => {
+                if globals_path.symlink_metadata().is_ok() {
+                    bail!(
+                        "artifact holds a globals file its authenticated manifest declares skipped"
+                    );
+                }
+                None
+            }
+            other => bail!("manifest globals policy {other:?} is not a known policy"),
+        };
+        Ok(SignedArtifact {
+            _use: None,
+            header,
+            manifest,
+            payload,
+            globals,
+        })
+    }
+}
+
+fn open_regular(path: &Path) -> Result<File> {
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)?;
+    anyhow::ensure!(file.metadata()?.is_file(), "expected a regular file");
+    Ok(file)
 }
 
 #[cfg(test)]

@@ -5,6 +5,7 @@ use uuid::Uuid;
 pub struct JobInfo {
     pub job_id: Uuid,
     pub backup_id: Option<Uuid>,
+    pub artifact_ids: Option<Vec<Uuid>>,
     pub source_fingerprint: String,
     pub profile_fingerprint: Option<String>,
     pub operation: Option<String>,

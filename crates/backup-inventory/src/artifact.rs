@@ -57,6 +57,10 @@ pub(super) const UPSERT_ARTIFACT: &str = "INSERT INTO artifact \
 /// Writes one row. Split out so [`crate::Inventory::register`] is the only place that decides
 /// what an inventory error becomes.
 pub(super) fn write(conn: &Connection, row: &ArtifactRow) -> Result<()> {
+    ensure!(
+        !row.state.is_deletion(),
+        "deletion lifecycle requires durable intent"
+    );
     let payload_bytes = sql_size("payload_bytes", row.payload_bytes)?;
     let manifest_bytes = sql_size("manifest_bytes", row.manifest_bytes)?;
     let changed = conn.execute(
@@ -164,18 +168,26 @@ impl Shape {
 /// build writes — which is choice 2's residual anyway.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum State {
-    /// This host saw the artifact's files. The one state anything writes today.
+    /// This host saw the artifact's files.
     Registered,
     Missing,
     Conflict,
+    Deleting,
+    Deleted,
 }
 
 impl State {
+    pub fn is_deletion(self) -> bool {
+        matches!(self, Self::Deleting | Self::Deleted)
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             State::Registered => "registered",
             State::Missing => "missing",
             State::Conflict => "conflict",
+            State::Deleting => "deleting",
+            State::Deleted => "deleted",
         }
     }
 
@@ -184,6 +196,8 @@ impl State {
             "registered" => Ok(State::Registered),
             "missing" => Ok(State::Missing),
             "conflict" => Ok(State::Conflict),
+            "deleting" => Ok(State::Deleting),
+            "deleted" => Ok(State::Deleted),
             other => bail!("inventory holds state {other:?}, which this build cannot write"),
         }
     }
@@ -220,6 +234,20 @@ pub struct ArtifactRow {
 }
 
 impl ArtifactRow {
+    /// Discovery facts bound to a freshly authenticated public record.
+    pub fn matches_header(&self, header: &backup_domain::PublicHeader) -> bool {
+        self.backup_id == header.backup_id
+            && self.shape == Shape::V1Signed
+            && self.payload_sha256.as_deref() == Some(&header.payload_sha256)
+            && self.manifest_sha256.as_deref() == Some(&header.manifest_sha256)
+            && self.payload_bytes == Some(header.payload_ciphertext_bytes)
+            && self.manifest_bytes == Some(header.manifest_ciphertext_bytes)
+            && self.signer_id.as_deref() == Some(&header.signer_id)
+            && self.recipient_id.as_deref() == Some(&header.recipient_id)
+            && self.recipient_suite.as_deref() == Some(&header.recipient_suite)
+            && self.signature_suite.as_deref() == Some(&header.signature_suite)
+    }
+
     /// Refuses a row this inventory must not hold, before any statement sees it.
     pub(crate) fn validate(&self, estate: &Estate) -> Result<()> {
         ensure!(
@@ -583,15 +611,19 @@ mod tests {
         for shape in [Shape::V1Signed, Shape::AgeUnsigned, Shape::PlaintextDev] {
             assert_eq!(Shape::parse(shape.as_str()).unwrap(), shape);
         }
-        assert_eq!(
-            State::parse(State::Registered.as_str()).unwrap(),
-            State::Registered
-        );
+        for state in [
+            State::Registered,
+            State::Missing,
+            State::Conflict,
+            State::Deleting,
+            State::Deleted,
+        ] {
+            assert_eq!(State::parse(state.as_str()).unwrap(), state);
+        }
         for word in ["", "V1-SIGNED", "v1", "signed", "deleted", "missing"] {
             assert!(Shape::parse(word).is_err(), "{word} is not a shape");
         }
-        // `deleted` is reserved for a future lifecycle task and must not be guessed here.
-        for word in ["", "registered ", "deleted", "v1-signed"] {
+        for word in ["", "registered ", "DELETED", "v1-signed"] {
             assert!(
                 State::parse(word).is_err(),
                 "{word} is not a state this build writes"

@@ -6,7 +6,7 @@ use backup_local::LocalInventory;
 use serde_json::{Value, json};
 
 fn job_json(job: &JobInfo) -> Value {
-    json!({
+    let mut value = json!({
         "job_id": job.job_id,
         "backup_id": job.backup_id,
         "source_fingerprint": job.source_fingerprint,
@@ -16,10 +16,17 @@ fn job_json(job: &JobInfo) -> Value {
         "updated_at_utc": job.updated_at_utc,
         "operation": job.operation,
         "target_fingerprint": job.target_fingerprint,
-    })
+    });
+    if let Some(ids) = &job.artifact_ids {
+        value["artifact_ids"] = json!(ids);
+    }
+    value
 }
 
 fn print_job(job: &JobInfo) {
+    if let Some(ids) = &job.artifact_ids {
+        println!("artifacts={ids:?}");
+    }
     println!(
         "{}  {}  {}  backup={}  source={}  profile={}  updated={}  operation={}  target={}",
         job.job_id,
@@ -81,6 +88,22 @@ pub(crate) fn inventory(
     json_output: bool,
 ) -> Result<()> {
     match command {
+        InventoryCommand::Recover => {
+            let recovery = backup_local::LocalStore::new(config.storage.root.clone())?.recover()?;
+            if json_output {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({"claimed":recovery.claimed,
+                    "interrupted":recovery.interrupted,"deleted":recovery.deleted,
+                    "removed":recovery.removed,"refused":recovery.refused}))?
+                );
+            } else {
+                crate::report::print_recovery(&recovery);
+            }
+            if !recovery.claimed {
+                bail!("RETENTION_BUSY: store has active work");
+            }
+        }
         InventoryCommand::Verification { id } => {
             let service = InventoryService::new(LocalInventory::open(&config.storage.root)?);
             let events = service.verification_events(id)?;
@@ -146,7 +169,7 @@ pub(crate) fn inventory(
             let report = match command {
                 InventoryCommand::List => backup_application::discover(&reader)?,
                 InventoryCommand::Reconcile => backup_application::reconcile(&reader)?,
-                InventoryCommand::Check => unreachable!(),
+                InventoryCommand::Check | InventoryCommand::Recover => unreachable!(),
                 InventoryCommand::Verification { .. } => unreachable!(),
                 InventoryCommand::Rebuild { .. } => unreachable!(),
                 InventoryCommand::Adopt { .. } => unreachable!(),

@@ -1,4 +1,9 @@
 mod inventory;
+mod retention;
+pub use retention::{
+    DeletionExecutor, DeletionOutcome, DeletionResult, RetentionPlanner, RetentionPreview,
+    execute_deletion, preview_retention,
+};
 
 pub use inventory::{
     DiscoveryEntry, InventoryCheck, InventoryReader, InventoryService, JobInfo, ProtectionChange,
@@ -222,6 +227,9 @@ pub struct SignedKeyFacts {
 }
 
 pub trait ArtifactStore {
+    type Use;
+    fn claim_artifact(&self, id: Uuid) -> Result<Self::Use>;
+
     type Stage: StageHandle;
     type Artifact: ArtifactHandle;
     type Plaintext: PlaintextView;
@@ -854,6 +862,7 @@ impl<E: DatabaseAdapter, S: ArtifactStore> VerifyService<E, S> {
         if !matches!(level, VERIFY_SIGNATURE | VERIFY_CHECKSUM | VERIFY_ARCHIVE) {
             bail!("verification level must be signature, checksum or archive");
         }
+        let _use = self.store.claim_artifact(id)?;
         let result = self.verify_inner(config, id, level);
         match result {
             Ok(mut report) => {

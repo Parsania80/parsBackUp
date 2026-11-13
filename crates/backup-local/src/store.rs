@@ -31,6 +31,8 @@ pub struct Recovery {
     pub claimed: bool,
     /// Jobs a dead process left non-terminal, which this pass moved to `interrupted`.
     pub interrupted: Vec<Uuid>,
+    /// Confirmed, already-started deletions finalized by this pass.
+    pub deleted: Vec<Uuid>,
     /// Working directories this pass removed.
     pub removed: Vec<PathBuf>,
     /// Names under `staging/` or `scratch/` this tool would not have written, left alone on purpose.
@@ -124,24 +126,29 @@ impl LocalStore {
         identity_file: impl AsRef<Path>,
         verifying_key_file: impl AsRef<Path>,
     ) -> Result<Self> {
-        let identity = KeyFile::load(identity_file.as_ref(), KeyRole::Identity)
-            .with_context(|| format!("load identity file {}", identity_file.as_ref().display()))?;
-        let verifying = SigningKeyFile::load(verifying_key_file.as_ref(), SigningRole::Verifying)
-            .with_context(|| {
-            format!(
-                "load verifying key file {}",
-                verifying_key_file.as_ref().display()
-            )
-        })?;
         Self::open(
             root,
-            Some(StoreKeys {
-                identity,
-                recipient: None,
-                signing: None,
-                verifying: Some(verifying),
-            }),
+            Some(Self::reader_keys(
+                identity_file.as_ref(),
+                verifying_key_file.as_ref(),
+            )?),
         )
+    }
+
+    pub(crate) fn reader_keys(
+        identity_file: &Path,
+        verifying_key_file: &Path,
+    ) -> Result<StoreKeys> {
+        let identity = KeyFile::load(identity_file, KeyRole::Identity)
+            .with_context(|| format!("load identity file {}", identity_file.display()))?;
+        let verifying = SigningKeyFile::load(verifying_key_file, SigningRole::Verifying)
+            .with_context(|| format!("load verifying key file {}", verifying_key_file.display()))?;
+        Ok(StoreKeys {
+            identity,
+            recipient: None,
+            signing: None,
+            verifying: Some(verifying),
+        })
     }
 
     fn open(root: PathBuf, keys: Option<StoreKeys>) -> Result<Self> {
@@ -185,9 +192,12 @@ impl LocalStore {
         };
         // The inventory is opened through its own binding: this pass cannot compute a source
         // fingerprint, because that needs the server major a preflight reads off a live database.
-        let interrupted = match Inventory::open_bound(&self.root.join(INVENTORY_FILE))? {
-            None => Vec::new(),
-            Some(inventory) => inventory.sweep_interrupted(&self.root)?,
+        let (interrupted, deleted) = match Inventory::open_bound(&self.root.join(INVENTORY_FILE))? {
+            None => (Vec::new(), Vec::new()),
+            Some(inventory) => {
+                let deleted = crate::retention::recover_deletions(&self.root, &inventory, &claim)?;
+                (inventory.sweep_interrupted(&self.root)?, deleted)
+            }
         };
         let mut removed = Vec::new();
         let mut refused = Vec::new();
@@ -200,6 +210,7 @@ impl LocalStore {
         Ok(Recovery {
             claimed: true,
             interrupted,
+            deleted,
             removed,
             refused,
         })

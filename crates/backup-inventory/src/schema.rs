@@ -9,7 +9,7 @@
 //! runs — so there is one code path that produces a schema and one test that exercises it.
 
 /// The schema version this build writes, and the maximum it will open.
-pub const SCHEMA_VERSION: i64 = 6;
+pub const SCHEMA_VERSION: i64 = 7;
 
 /// One step up the schema. `MIGRATIONS` must stay dense and ordered: a gap would be a version
 /// no build can reach, and an out-of-order pair would run a later step against an earlier shape.
@@ -56,6 +56,11 @@ static MIGRATIONS: &[Migration] = &[
         from: 5,
         to: 6,
         sql: "ALTER TABLE artifact ADD COLUMN protected INTEGER CHECK (protected IN (0,1));",
+    },
+    Migration {
+        from: 6,
+        to: 7,
+        sql: "CREATE TABLE deletion_job (job_id TEXT PRIMARY KEY, plan_id TEXT NOT NULL UNIQUE, digest TEXT NOT NULL) WITHOUT ROWID;              CREATE TABLE job_artifact (job_id TEXT NOT NULL, backup_id TEXT NOT NULL, role TEXT NOT NULL CHECK(role IN ('candidate','retained')), progress TEXT NOT NULL CHECK(progress IN ('pending','deleting','deleted')), PRIMARY KEY(job_id,backup_id)) WITHOUT ROWID;",
     },
 ];
 
@@ -440,6 +445,49 @@ mod tests {
         assert_eq!(inventory.protection(row.backup_id).unwrap(), None);
         drop(inventory);
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn version_six_upgrade_preserves_every_table_and_failed_step_rolls_back() {
+        for fail in [false, true] {
+            let (dir, path) = fresh("upgrade-v6");
+            let row = as_v1(&path);
+            let conn = Connection::open(&path).unwrap();
+            for version in 1..6 {
+                conn.execute_batch(MIGRATIONS.iter().find(|m| m.from == version).unwrap().sql)
+                    .unwrap();
+            }
+            set_user_version(&conn, 6).unwrap();
+            conn.execute("UPDATE artifact SET protected=1", []).unwrap();
+            if fail {
+                conn.execute_batch("CREATE TABLE job_artifact (fixture TEXT)")
+                    .unwrap();
+            }
+            drop(conn);
+            let result = crate::Inventory::open_existing_upgrade(&path, &estate());
+            if fail {
+                assert!(result.is_err());
+                let conn = Connection::open(&path).unwrap();
+                assert_eq!(user_version(&conn).unwrap(), 6);
+                assert_eq!(
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM sqlite_master WHERE name='deletion_job'",
+                        [],
+                        |r| r.get::<_, i64>(0)
+                    )
+                    .unwrap(),
+                    0
+                );
+                assert_eq!(rows(&conn), vec![row]);
+            } else {
+                let inventory = result.unwrap();
+                assert_eq!(inventory.schema_version().unwrap(), SCHEMA_VERSION);
+                assert_eq!(inventory.artifacts().unwrap(), vec![row.clone()]);
+                assert_eq!(inventory.protection(row.backup_id).unwrap(), Some(true));
+                assert!(inventory.deletion_recovery_ids().unwrap().is_empty());
+            }
+            fs::remove_dir_all(dir).unwrap();
+        }
     }
 
     #[test]

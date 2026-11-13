@@ -77,6 +77,8 @@ pub(crate) enum InventoryCommand {
         id: Uuid,
     },
     Reconcile,
+    /// Run explicit maintenance, including already-started confirmed deletions.
+    Recover,
     Adopt {
         id: Uuid,
         #[arg(long)]
@@ -165,6 +167,24 @@ pub(crate) enum BackupCommand {
     Unprotect {
         id: Uuid,
     },
+    /// Preview retention, or execute an exact saved plan with digest confirmation.
+    #[command(args_conflicts_with_subcommands = true, subcommand_negates_reqs = true)]
+    Prune {
+        #[arg(long, required = true, value_parser = clap::value_parser!(u64).range(1..))]
+        keep_last: Option<u64>,
+        #[arg(long)]
+        profile: Option<String>,
+        #[command(subcommand)]
+        command: Option<DeletionCommand>,
+    },
+    /// Preview explicit deletion, or execute its exact confirmed saved plan.
+    #[command(args_conflicts_with_subcommands = true, subcommand_negates_reqs = true)]
+    Delete {
+        #[arg(required = true)]
+        id: Option<Uuid>,
+        #[command(subcommand)]
+        command: Option<DeletionCommand>,
+    },
     Create {
         #[arg(long)]
         confirm_synthetic: bool,
@@ -187,6 +207,26 @@ pub(crate) enum BackupCommand {
         #[arg(long)]
         read_only: bool,
     },
+}
+
+#[derive(Subcommand)]
+pub(crate) enum DeletionCommand {
+    Run {
+        #[arg(value_parser = canonical_plan_id)]
+        plan_id: Uuid,
+        #[arg(long)]
+        confirm_digest: String,
+    },
+}
+fn canonical_plan_id(value: &str) -> std::result::Result<Uuid, String> {
+    let id = Uuid::parse_str(value).map_err(|_| "expected canonical UUIDv4".to_owned())?;
+    if id.to_string() != value
+        || id.get_version_num() != 4
+        || id.get_variant() != uuid::Variant::RFC4122
+    {
+        return Err("expected canonical UUIDv4".to_owned());
+    }
+    Ok(id)
 }
 
 #[derive(Subcommand)]

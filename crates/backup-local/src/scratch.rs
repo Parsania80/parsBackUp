@@ -42,12 +42,30 @@ impl LocalStore {
         max_plaintext_bytes: Option<u64>,
         expected_ciphertext: Option<(u64, &str)>,
     ) -> Result<LocalPlaintext> {
+        let claim = ActivityLock::hold(&self.root)?;
+        self.decrypt_to_scratch_owned(
+            ciphertext,
+            name,
+            max_plaintext_bytes,
+            expected_ciphertext,
+            Some(claim),
+        )
+    }
+
+    fn decrypt_to_scratch_owned(
+        &self,
+        ciphertext: &Path,
+        name: &str,
+        max_plaintext_bytes: Option<u64>,
+        expected_ciphertext: Option<(u64, &str)>,
+        claim: Option<ActivityLock>,
+    ) -> Result<LocalPlaintext> {
         let keys = self
             .keys
             .as_ref()
             .context("artifact is encrypted but no key files are configured")?;
         ensure_regular_file(ciphertext)?;
-        let claim = ActivityLock::hold(&self.root)?;
+        crate::ensure_real_dir(&self.root.join(SCRATCH_DIR))?;
         let scratch = self.root.join(SCRATCH_DIR).join(Uuid::new_v4().to_string());
         DirBuilder::new()
             .mode(0o700)
@@ -56,7 +74,8 @@ impl LocalStore {
         let view = LocalPlaintext {
             path: scratch.join(name),
             scratch: Some(scratch),
-            _claim: Some(claim),
+            _claim: claim,
+            _use: None,
         };
         let file = OpenOptions::new()
             .write(true)
@@ -66,7 +85,7 @@ impl LocalStore {
             .context("create private scratch file")?;
         let ciphertext = OpenOptions::new()
             .read(true)
-            .custom_flags(libc::O_NOFOLLOW)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .open(ciphertext)
             .context("open encrypted payload")?;
         if !ciphertext.metadata()?.is_file() {
@@ -101,12 +120,14 @@ impl LocalStore {
         &self,
         path: &Path,
         header: &PublicHeader,
+        _claim: &ActivityLock,
     ) -> Result<ArtifactManifest> {
-        let view = self.decrypt_to_scratch(
+        let view = self.decrypt_to_scratch_owned(
             path,
             MANIFEST_FILE,
             Some(MAX_MANIFEST_BYTES),
             Some((header.manifest_ciphertext_bytes, &header.manifest_sha256)),
+            None,
         )?;
         let result = (|| -> Result<ArtifactManifest> {
             let bytes = read_bounded(view.path(), MAX_MANIFEST_BYTES + 1)?;
@@ -167,7 +188,9 @@ mod tests {
         let mut replacement = Vec::new();
         backup_crypto::stream::encrypt(recipient.recipient(), &b""[..], &mut replacement)?;
         fs::write(&path, replacement)?;
-        let error = store.authenticated_manifest(&path, &header).unwrap_err();
+        let error = store
+            .authenticated_manifest(&path, &header, &ActivityLock::hold(&store.root).unwrap())
+            .unwrap_err();
         let error = format!("{error:#}");
         assert!(
             error.contains("ciphertext changed after authentication")

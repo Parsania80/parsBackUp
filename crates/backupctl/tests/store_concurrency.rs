@@ -780,3 +780,376 @@ fn a_killed_backups_leftovers_are_recovered_by_the_next_backup_of_its_scope() {
     assert_eq!(entries(&scene.artifacts()).len(), 2);
     assert!(entries(&scene.staging()).is_empty());
 }
+
+#[test]
+fn retention_cli_previews_save_intent_without_keys_for_writing_or_native_tools() {
+    let scene = signed_retention_scene("b03", 0);
+    let keys = scene.base.join("keys");
+    let ctl = |args: &[&str]| -> serde_json::Value {
+        let mut flags = vec!["--output", "json"];
+        flags.extend_from_slice(args);
+        let output = scene.run(&flags);
+        assert!(output.status.success(), "{}", text(&output));
+        serde_json::from_slice(&output.stdout).unwrap()
+    };
+    for _ in 0..2 {
+        let created = ctl(&["backup", "create", "--confirm-synthetic"]);
+        let id = created["manifest"]["backup_id"].as_str().unwrap();
+        ctl(&["backup", "verify", id, "--level", "archive"]);
+    }
+    let inventory = Inventory::open_read_only_bound(&scene.root.join(INVENTORY_FILE)).unwrap();
+    let mut rows = inventory.artifacts().unwrap();
+    rows.sort_by(|a, b| {
+        b.completed_at_utc
+            .cmp(&a.completed_at_utc)
+            .then(a.backup_id.cmp(&b.backup_id))
+    });
+    let before = fs::read(scene.root.join(INVENTORY_FILE)).unwrap();
+    fs::remove_file(keys.join("signing.key")).unwrap();
+    fs::remove_file(keys.join("recipient.key")).unwrap();
+    fs::rename(scene.base.join("bin"), scene.base.join("offline-bin")).unwrap();
+    let preview = ctl(&["backup", "prune", "--keep-last", "1"]);
+    assert_eq!(
+        preview["candidates"],
+        serde_json::json!([rows[1].backup_id])
+    );
+    assert_eq!(preview["retained"], serde_json::json!([rows[0].backup_id]));
+    assert_eq!(preview["audit_recorded"], false);
+    let mut fields = preview
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    fields.sort();
+    assert_eq!(
+        fields,
+        [
+            "audit_recorded",
+            "candidates",
+            "digest",
+            "excluded",
+            "expires_unix_ms",
+            "keep_last",
+            "operation",
+            "plan_id",
+            "profile_fingerprint",
+            "retained",
+            "source_fingerprint"
+        ]
+    );
+    assert!(
+        scene
+            .root
+            .join("plans")
+            .join(format!(
+                "deletion-{}.json",
+                preview["plan_id"].as_str().unwrap()
+            ))
+            .is_file()
+    );
+    let empty = ctl(&["backup", "prune", "--keep-last", "2"]);
+    assert!(empty["plan_id"].is_null());
+    assert!(empty["digest"].is_null());
+    let delete = ctl(&["backup", "delete", &rows[0].backup_id.to_string()]);
+    assert_eq!(delete["candidates"], serde_json::json!([rows[0].backup_id]));
+    assert!(delete["keep_last"].is_null());
+    let human = scene.run(&["backup", "prune", "--keep-last", "1"]);
+    assert!(human.status.success(), "{}", text(&human));
+    assert!(text(&human).contains("Local history only"));
+    for args in [
+        vec!["backup", "prune", "--keep-last", "0"],
+        vec!["backup", "prune", "--keep-last", "-1"],
+        vec!["backup", "prune", "--keep-last", "18446744073709551616"],
+        vec!["backup", "delete", "run"],
+        vec!["backup", "prune", "run"],
+    ] {
+        let output = scene.run(&args);
+        assert_eq!(output.status.code(), Some(2), "{}", text(&output));
+    }
+    let bad = scene.run(&["backup", "prune", "--keep-last", "1", "--profile", "absent"]);
+    assert_eq!(bad.status.code(), Some(1));
+    assert_eq!(before, fs::read(scene.root.join(INVENTORY_FILE)).unwrap());
+    // Persisted stale open rows pin their exact dependency without an implicit sweep.
+    let conn = rusqlite::Connection::open(scene.root.join(INVENTORY_FILE)).unwrap();
+    let job = Uuid::new_v4().to_string();
+    conn.execute("INSERT INTO job VALUES (?1,?2,?3,?4,'running','2026-11-13T00:00:00Z','2026-11-13T00:00:00Z')",rusqlite::params![job,rows[1].backup_id.to_string(),inventory.estate().source_fingerprint,rows[1].profile_fingerprint]).unwrap();
+    conn.execute(
+        "INSERT INTO job_operation VALUES (?1,'backup',NULL)",
+        [&job],
+    )
+    .unwrap();
+    let pinned = ctl(&["backup", "prune", "--keep-last", "1"]);
+    assert_eq!(pinned["candidates"], serde_json::json!([]));
+    assert!(
+        pinned["excluded"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["reasons"] == serde_json::json!(["job_dependency"]))
+    );
+    let refusal = scene.run(&["backup", "delete", &rows[1].backup_id.to_string()]);
+    assert!(text(&refusal).contains("RETENTION_JOB_DEPENDENCY"));
+    conn.execute("DELETE FROM job_operation WHERE job_id=?1", [&job])
+        .unwrap();
+    let unknown = scene.run(&["backup", "prune", "--keep-last", "1"]);
+    assert!(text(&unknown).contains("RETENTION_JOB_DEPENDENCY"));
+    assert_eq!(
+        inventory
+            .job(Uuid::parse_str(&job).unwrap())
+            .unwrap()
+            .unwrap()
+            .state,
+        JobState::Running
+    );
+}
+
+fn signed_retention_scene(label: &str, count: usize) -> Scene {
+    let scene = Scene::new(label, false, false);
+    let keys = scene.base.join("keys");
+    let mut cfg = fs::read_to_string(&scene.config).unwrap();
+    cfg.push_str(&format!("\n[encryption]\nidentity_file = '{0}/identity.key'\nrecipient_file = '{0}/recipient.key'\n[signing]\nsigning_key_file = '{0}/signing.key'\nverifying_key_file = '{0}/verifying.key'\n", keys.display()));
+    fs::write(&scene.config, &cfg).unwrap();
+    assert!(scene.run(&["key", "generate"]).status.success());
+
+    for _ in 0..count {
+        let created = ctl_json(&scene, &["backup", "create", "--confirm-synthetic"]);
+        ctl_json(
+            &scene,
+            &[
+                "backup",
+                "verify",
+                created["manifest"]["backup_id"].as_str().unwrap(),
+                "--level",
+                "archive",
+            ],
+        );
+    }
+    scene
+}
+fn ctl_json(scene: &Scene, args: &[&str]) -> serde_json::Value {
+    let mut flags = vec!["--output", "json"];
+    flags.extend_from_slice(args);
+    let output = scene.run(&flags);
+    assert!(output.status.success(), "{}", text(&output));
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+#[test]
+fn confirmed_cli_run_and_repeated_receipt_preserve_json_contract_and_scope() {
+    let scene = signed_retention_scene("b04-complete", 4);
+    let preview = ctl_json(&scene, &["backup", "prune", "--keep-last", "2"]);
+    let id = preview["plan_id"].as_str().unwrap();
+    let digest = preview["digest"].as_str().unwrap();
+    let index = scene.root.join(INVENTORY_FILE);
+    let before = fs::read(&index).unwrap();
+    let wrong = scene.run(&[
+        "--output",
+        "json",
+        "backup",
+        "prune",
+        "run",
+        id,
+        "--confirm-digest",
+        &digest[..16],
+    ]);
+    assert_eq!(wrong.status.code(), Some(1));
+    assert!(wrong.stdout.is_empty());
+    assert!(text(&wrong).contains("RETENTION_CONFIRMATION_MISMATCH"));
+    assert_eq!(fs::read(&index).unwrap(), before);
+    for args in [
+        vec![
+            "backup",
+            "prune",
+            "--keep-last",
+            "1",
+            "run",
+            id,
+            "--confirm-digest",
+            digest,
+        ],
+        vec![
+            "backup",
+            "prune",
+            "run",
+            id,
+            "--confirm-digest",
+            digest,
+            "--profile",
+            "other",
+        ],
+        vec![
+            "backup",
+            "delete",
+            "run",
+            "../not-a-plan",
+            "--confirm-digest",
+            digest,
+        ],
+        vec![
+            "backup",
+            "delete",
+            "run",
+            "11111111-1111-1111-8111-111111111111",
+            "--confirm-digest",
+            digest,
+        ],
+        vec!["backup", "delete", "run", id],
+    ] {
+        let output = scene.run(&args);
+        assert_eq!(output.status.code(), Some(2), "{}", text(&output));
+    }
+    let result = ctl_json(
+        &scene,
+        &["backup", "prune", "run", id, "--confirm-digest", digest],
+    );
+    let mut fields = result
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    fields.sort_unstable();
+    assert_eq!(
+        fields,
+        [
+            "audit_recorded",
+            "completed",
+            "deleting",
+            "digest",
+            "job_id",
+            "operation",
+            "outcome",
+            "pending",
+            "plan_id"
+        ]
+    );
+    assert_eq!(result["completed"], preview["candidates"]);
+    assert_eq!(result["outcome"], "complete");
+    assert_eq!(result["audit_recorded"], true);
+    assert_eq!(entries(&scene.artifacts()).len(), 2);
+    let job = ctl_json(
+        &scene,
+        &["job", "inspect", result["job_id"].as_str().unwrap()],
+    );
+    assert_eq!(job["job"]["operation"], "prune");
+    assert_eq!(job["job"]["artifact_ids"].as_array().unwrap().len(), 4);
+    let before = fs::read(&index).unwrap();
+    let receipt = ctl_json(
+        &scene,
+        &["backup", "prune", "run", id, "--confirm-digest", digest],
+    );
+    assert_eq!(receipt["job_id"], result["job_id"]);
+    assert_eq!(receipt["audit_recorded"], false);
+    assert_eq!(fs::read(&index).unwrap(), before);
+    let singleton = preview["retained"][0].as_str().unwrap();
+    let deletion = ctl_json(&scene, &["backup", "delete", singleton]);
+    let deleted = ctl_json(
+        &scene,
+        &[
+            "backup",
+            "delete",
+            "run",
+            deletion["plan_id"].as_str().unwrap(),
+            "--confirm-digest",
+            deletion["digest"].as_str().unwrap(),
+        ],
+    );
+    assert_eq!(deleted["operation"], "delete");
+    assert_eq!(deleted["completed"], serde_json::json!([singleton]));
+    let refused = scene.run(&["backup", "delete", preview["retained"][1].as_str().unwrap()]);
+    assert!(text(&refused).contains("RETENTION_LAST_VALID"));
+}
+
+#[test]
+fn cli_partial_failure_prints_durable_partition_and_recovery_never_starts_pending_ids() {
+    let scene = signed_retention_scene("b04-partial", 4);
+    let index = scene.root.join(INVENTORY_FILE);
+    let conn = rusqlite::Connection::open(&index).unwrap();
+    conn.execute_batch("CREATE TRIGGER refuse_deleted BEFORE INSERT ON audit_event WHEN NEW.action='artifact_deleted' BEGIN SELECT RAISE(ABORT,'injected'); END;").unwrap();
+    let preview = ctl_json(&scene, &["backup", "prune", "--keep-last", "1"]);
+    let id = preview["plan_id"].as_str().unwrap();
+    let digest = preview["digest"].as_str().unwrap();
+    let output = scene.run(&[
+        "--output",
+        "json",
+        "backup",
+        "prune",
+        "run",
+        id,
+        "--confirm-digest",
+        digest,
+    ]);
+    assert_eq!(output.status.code(), Some(1), "{}", text(&output));
+    assert!(text(&output).contains("DELETION_RECOVERY_REQUIRED"));
+    let partial: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(partial["outcome"], "partial");
+    assert_eq!(partial["completed"], serde_json::json!([]));
+    assert_eq!(
+        partial["deleting"],
+        serde_json::json!([preview["candidates"][0]])
+    );
+    assert_eq!(
+        partial["pending"],
+        serde_json::json!(&preview["candidates"].as_array().unwrap()[1..])
+    );
+    assert_eq!(partial["audit_recorded"], true);
+    let first = preview["candidates"][0].as_str().unwrap();
+    assert!(!scene.artifacts().join(first).exists());
+    let inventory = Inventory::open_read_only_bound(&index).unwrap();
+    let job_id = Uuid::parse_str(partial["job_id"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        inventory.job(job_id).unwrap().unwrap().state,
+        JobState::Failed
+    );
+    assert_eq!(
+        inventory
+            .artifact(Uuid::parse_str(first).unwrap())
+            .unwrap()
+            .unwrap()
+            .state,
+        backup_inventory::State::Deleting
+    );
+    let before = fs::read(&index).unwrap();
+    let again = scene.run(&[
+        "--output",
+        "json",
+        "backup",
+        "prune",
+        "run",
+        id,
+        "--confirm-digest",
+        digest,
+    ]);
+    assert_eq!(again.status.code(), Some(1));
+    let again: serde_json::Value = serde_json::from_slice(&again.stdout).unwrap();
+    assert_eq!(again["deleting"], partial["deleting"]);
+    assert_eq!(again["audit_recorded"], false);
+    assert_eq!(fs::read(&index).unwrap(), before);
+    conn.execute_batch("DROP TRIGGER refuse_deleted;").unwrap();
+    drop(conn);
+    fs::remove_dir_all(scene.base.join("keys")).unwrap();
+    fs::remove_dir_all(scene.base.join("bin")).unwrap();
+    let recovered = ctl_json(&scene, &["inventory", "recover"]);
+    assert_eq!(recovered["deleted"], serde_json::json!([first]));
+    assert_eq!(
+        inventory.job(job_id).unwrap().unwrap().state,
+        JobState::Failed
+    );
+    assert_eq!(entries(&scene.artifacts()).len(), 3);
+    for pending in partial["pending"].as_array().unwrap() {
+        assert!(
+            scene
+                .artifacts()
+                .join(pending.as_str().unwrap())
+                .join("complete")
+                .is_file()
+        );
+    }
+    let before = fs::read(&index).unwrap();
+    assert_eq!(
+        ctl_json(&scene, &["inventory", "recover"])["deleted"],
+        serde_json::json!([])
+    );
+    assert_eq!(fs::read(&index).unwrap(), before);
+}

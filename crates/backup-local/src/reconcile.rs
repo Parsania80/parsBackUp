@@ -21,7 +21,7 @@ pub struct LocalReconciler(pub PathBuf);
 type StateChanges = Vec<(Uuid, State, State)>;
 
 // Open relative to the already-held directory descriptor, never following a final symlink.
-fn open_at(dir: &File, name: &str, directory: bool) -> io::Result<File> {
+pub(crate) fn open_at(dir: &File, name: &str, directory: bool) -> io::Result<File> {
     let name = CString::new(name).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
     let flags = libc::O_RDONLY
         | libc::O_CLOEXEC
@@ -35,7 +35,7 @@ fn open_at(dir: &File, name: &str, directory: bool) -> io::Result<File> {
     Ok(unsafe { File::from_raw_fd(fd) })
 }
 
-fn directory(path: &Path) -> Result<File> {
+pub(crate) fn directory(path: &Path) -> Result<File> {
     Ok(OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
@@ -47,7 +47,7 @@ fn entries(dir: &File) -> Result<fs::ReadDir> {
     Ok(fs::read_dir(format!("/proc/self/fd/{}", dir.as_raw_fd()))?)
 }
 
-fn entries_for_hash(dir: &File) -> Result<Vec<String>> {
+pub(crate) fn entries_for_hash(dir: &File) -> Result<Vec<String>> {
     entries(dir)?
         .map(|entry| {
             let name = entry?.file_name();
@@ -159,17 +159,7 @@ fn observe(
             header.payload_ciphertext_bytes,
             &header.payload_sha256,
         )?;
-        let agrees = row.is_none_or(|r| {
-            r.shape == Shape::V1Signed
-                && r.payload_sha256.as_deref() == Some(&header.payload_sha256)
-                && r.manifest_sha256.as_deref() == Some(&header.manifest_sha256)
-                && r.payload_bytes == Some(header.payload_ciphertext_bytes)
-                && r.manifest_bytes == Some(header.manifest_ciphertext_bytes)
-                && r.signer_id.as_deref() == Some(&header.signer_id)
-                && r.recipient_id.as_deref() == Some(&header.recipient_id)
-                && r.recipient_suite.as_deref() == Some(&header.recipient_suite)
-                && r.signature_suite.as_deref() == Some(&header.signature_suite)
-        });
+        let agrees = row.is_none_or(|r| r.matches_header(&header));
         for name in [MANIFEST_FILE, PAYLOAD_FILE, GLOBALS_FILE] {
             absent(dir, name)?;
         }
@@ -226,6 +216,15 @@ impl Reconciler for LocalReconciler {
 
 impl LocalReconciler {
     fn rebuild_digest(&self, estate: &Estate) -> Result<(ReconcileReport, String)> {
+        if let Ok(inventory) = Inventory::open_read_only_bound(&self.0.join(INVENTORY_FILE)) {
+            ensure!(
+                !inventory
+                    .artifacts()?
+                    .iter()
+                    .any(|a| a.state == State::Deleting),
+                "DELETION_RECOVERY_REQUIRED: recover started deletion before replacing its index"
+            );
+        }
         let (entries, _) = self.scan_files(&[])?;
         ensure!(
             entries.iter().all(|e| e.status == "unregistered"),
@@ -561,7 +560,7 @@ impl LocalReconciler {
         })
     }
 
-    fn scan_files(
+    pub(crate) fn scan_files(
         &self,
         snapshot: &[backup_inventory::ArtifactRow],
     ) -> Result<(Vec<DiscoveryEntry>, StateChanges)> {
@@ -608,6 +607,16 @@ impl LocalReconciler {
                 }
             };
             let row = rows.remove(&id);
+            if let Some(row) = row.as_ref().filter(|row| row.state.is_deletion()) {
+                output.push(DiscoveryEntry {
+                    backup_id: Some(id),
+                    shape: Some(row.shape.as_str()),
+                    status: row.state.as_str(),
+                    reason: None,
+                    provenance: None,
+                });
+                continue;
+            }
             let observed = if aliases.contains(&id) {
                 Err(Problem::Invalid)
             } else {
@@ -665,6 +674,16 @@ impl LocalReconciler {
             });
         }
         for (id, row) in rows {
+            if row.state.is_deletion() {
+                output.push(DiscoveryEntry {
+                    backup_id: Some(id),
+                    shape: Some(row.shape.as_str()),
+                    status: row.state.as_str(),
+                    reason: None,
+                    provenance: None,
+                });
+                continue;
+            }
             let to = if aliases.contains(&id) {
                 State::Conflict
             } else {
