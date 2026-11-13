@@ -1071,6 +1071,141 @@ mod tests {
     }
 
     #[test]
+    fn job_start_and_transitions_roll_back_when_audit_insertion_fails() {
+        let (root, path) = created("job-audit-rollback");
+        let inventory = Inventory::open(&path, &estate()).unwrap();
+        let scope = JobScope {
+            source_fingerprint: SOURCE.into(),
+            profile_fingerprint: "651dd7a74505b176".into(),
+            backup_id: Uuid::new_v4(),
+        };
+        inventory.conn.execute_batch("CREATE TRIGGER reject_start BEFORE INSERT ON audit_event BEGIN SELECT RAISE(ABORT, 'injected'); END;").unwrap();
+        assert!(JobGuard::begin(&root, &scope).is_err());
+        assert!(RestoreGuard::begin(&root, "0123456789abcdef", scope.backup_id).is_err());
+        assert!(inventory.jobs().unwrap().is_empty());
+        assert!(inventory.audit_events().unwrap().is_empty());
+        assert_eq!(
+            inventory
+                .conn
+                .query_row("SELECT count(*) FROM job_operation", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        inventory
+            .conn
+            .execute_batch("DROP TRIGGER reject_start")
+            .unwrap();
+        let guard = JobGuard::begin(&root, &scope).unwrap();
+        let before = inventory.job(guard.id()).unwrap().unwrap();
+        let events = inventory.audit_events().unwrap();
+        inventory.conn.execute_batch("CREATE TRIGGER reject_transition BEFORE INSERT ON audit_event BEGIN SELECT RAISE(ABORT, 'injected'); END;").unwrap();
+        for (state, action) in [
+            (JobState::Staged, AuditAction::JobStaged),
+            (JobState::Complete, AuditAction::JobCompleted),
+            (JobState::Failed, AuditAction::JobFailed),
+        ] {
+            assert!(inventory.set_job_state(guard.id(), state, action).is_err());
+            assert_eq!(inventory.job(guard.id()).unwrap().unwrap(), before);
+            assert_eq!(inventory.audit_events().unwrap(), events);
+        }
+        assert!(job::mark_interrupted(&inventory.conn, guard.id()).is_err());
+        assert_eq!(inventory.job(guard.id()).unwrap().unwrap(), before);
+        assert_eq!(inventory.audit_events().unwrap(), events);
+        inventory
+            .conn
+            .execute_batch("DROP TRIGGER reject_transition")
+            .unwrap();
+        guard.complete().unwrap();
+        drop(guard);
+        drop(inventory);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn artifact_state_and_observations_roll_back_when_events_cannot_commit() {
+        let (root, path) = created("artifact-audit-rollback");
+        let inventory = Inventory::open(&path, &estate()).unwrap();
+        let row = signed_row("00000000-0000-4000-8000-000000000001");
+        inventory.conn.execute_batch("CREATE TRIGGER reject_audit BEFORE INSERT ON audit_event BEGIN SELECT RAISE(ABORT, 'injected'); END;").unwrap();
+        assert!(inventory.register(&row).is_err());
+        assert!(inventory.artifacts().unwrap().is_empty());
+        assert!(inventory.audit_events().unwrap().is_empty());
+        inventory
+            .conn
+            .execute_batch("DROP TRIGGER reject_audit")
+            .unwrap();
+        inventory.register(&row).unwrap();
+        inventory
+            .record_verification(
+                row.backup_id,
+                "signature",
+                true,
+                Some((
+                    row.payload_sha256.as_deref().unwrap(),
+                    row.manifest_sha256.as_deref(),
+                )),
+                None,
+            )
+            .unwrap();
+        let rows = inventory.artifacts().unwrap();
+        let events = inventory.audit_events().unwrap();
+        let observations = inventory.verification_events(row.backup_id).unwrap();
+        for table in ["audit_event", "verification_event"] {
+            inventory.conn.execute_batch(&format!("CREATE TRIGGER reject_event BEFORE INSERT ON {table} BEGIN SELECT RAISE(ABORT, 'injected'); END;")).unwrap();
+            if table == "audit_event" {
+                assert!(
+                    inventory
+                        .reconcile_states(
+                            &rows,
+                            &[(row.backup_id, State::Registered, State::Missing)]
+                        )
+                        .is_err()
+                );
+                assert_eq!(inventory.artifacts().unwrap(), rows);
+                assert_eq!(
+                    inventory.verification_events(row.backup_id).unwrap(),
+                    observations
+                );
+            } else {
+                assert!(
+                    inventory
+                        .record_verification(row.backup_id, "checksum", false, None, None)
+                        .is_err()
+                );
+                assert_eq!(
+                    inventory.verification_events(row.backup_id).unwrap(),
+                    observations
+                );
+            }
+            // The mismatch branch changes lifecycle, invalidates history and inserts two events.
+            assert!(
+                inventory
+                    .record_verification(
+                        row.backup_id,
+                        "checksum",
+                        true,
+                        Some((&"e".repeat(64), row.manifest_sha256.as_deref())),
+                        None
+                    )
+                    .is_err()
+            );
+            assert_eq!(inventory.artifacts().unwrap(), rows);
+            assert_eq!(inventory.audit_events().unwrap(), events);
+            assert_eq!(
+                inventory.verification_events(row.backup_id).unwrap(),
+                observations
+            );
+            inventory
+                .conn
+                .execute_batch("DROP TRIGGER reject_event")
+                .unwrap();
+        }
+        drop(inventory);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn verification_enrichment_is_digest_bound_and_atomic() {
         let (dir, path) = created("verify-observation");
         let inventory = Inventory::open(&path, &estate()).unwrap();
@@ -1122,6 +1257,9 @@ mod tests {
                 &[(row.backup_id, State::Conflict, State::Registered)],
             )
             .unwrap();
+        let before_enrichment = inventory.artifact(row.backup_id).unwrap().unwrap();
+        let before_observations = inventory.verification_events(row.backup_id).unwrap();
+        let before_audit = inventory.audit_events().unwrap();
         inventory.conn.execute_batch("CREATE TRIGGER reject_verification BEFORE INSERT ON verification_event BEGIN SELECT RAISE(FAIL, 'injected'); END;").unwrap();
         assert!(
             inventory
@@ -1135,13 +1273,14 @@ mod tests {
                 .is_err()
         );
         assert_eq!(
-            inventory
-                .artifact(row.backup_id)
-                .unwrap()
-                .unwrap()
-                .profile_fingerprint,
-            None
+            inventory.artifact(row.backup_id).unwrap().unwrap(),
+            before_enrichment
         );
+        assert_eq!(
+            inventory.verification_events(row.backup_id).unwrap(),
+            before_observations
+        );
+        assert_eq!(inventory.audit_events().unwrap(), before_audit);
         assert!(inventory.is_provisional(row.backup_id).unwrap());
         inventory
             .conn

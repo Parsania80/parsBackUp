@@ -25,6 +25,9 @@ REPO = Path.cwd()
 CLI = str(REPO / "target/debug/backupctl")
 DATABASE = "backupctl_fixture_m1"
 TARGET = "backupctl_fixture_m5a_restore"
+PRIVATE_PROFILE = "m5a-private-profile"
+PRIVATE_SCOPE = "m5a_private_scope"
+FAKE_CREDENTIAL = "m5a-fake-credential-never-real"
 SCHEMA = (REPO / "crates/backup-inventory/src/schema.rs").read_text()
 CURRENT = int(re.search(r"pub const SCHEMA_VERSION: i64 = (\d+);", SCHEMA)[1])
 assert os.geteuid() != 0, "run as a non-root user to prove read-only permissions"
@@ -80,6 +83,14 @@ for major in (16, 17, 18):
         bin_dir = base / "bin"
         bin_dir.mkdir()
         keys = base / "keys"
+        captures = []
+        secrets = {"fake-credential": FAKE_CREDENTIAL.encode()}
+        metadata = {"database": DATABASE.encode(), "host": b"127.0.0.1",
+                    "profile": PRIVATE_PROFILE.encode(), "scope": PRIVATE_SCOPE.encode(),
+                    "target": TARGET.encode()}
+        password_file = base / "pgpass"
+        password_file.write_text(f"127.0.0.1:5432:{DATABASE}:postgres:{FAKE_CREDENTIAL}\n")
+        password_file.chmod(0o600)
 
         def docker(*args, **kwargs):
             return run(["docker", "exec", "-i", container, *args], **kwargs)
@@ -98,8 +109,13 @@ port = 5432
 user = "postgres"
 database = "{DATABASE}"
 client_bin_dir = "{bin_dir}"
+password_file = "{password_file}"
 [storage]
 root = "{store}"
+[[profile]]
+name = "{PRIVATE_PROFILE}"
+database = "{DATABASE}"
+large_objects = true
 '''
             if shape != "plain":
                 text += f'''[encryption]
@@ -117,11 +133,15 @@ verifying_key_file = "{key_dir}/verifying.key"
         writer = config("writer")
         keyless = config("keyless", key_dir=base / "absent-keys")
 
-        def command(*args, cfg=writer):
-            return [CLI, "--config", str(cfg), "--output", "json", *args]
+        def command(*args, cfg=writer, output="json"):
+            return [CLI, "--config", str(cfg), "--output", output, *args]
+
+        def capture(args, output, result):
+            captures.append((args, output, result.stdout.encode(), result.stderr.encode()))
+            return result
 
         def ctl(*args, cfg=writer, ok=True, env=None):
-            result = run(command(*args, cfg=cfg), ok=ok, env=env)
+            result = capture(args, "json", run(command(*args, cfg=cfg), ok=ok, env=env))
             return json.loads(result.stdout) if ok else result
 
         def rejects(*args, cfg=writer, contains=None):
@@ -155,6 +175,65 @@ verifying_key_file = "{key_dir}/verifying.key"
             children.append((child, log))
             return child
 
+        def hits(blob, tokens):
+            return {label for label, token in tokens.items() if token in blob}
+
+        def scan_inventory():
+            scanned = []
+            for path in base.rglob("*"):
+                if path.is_file() and "inventory" in path.name and ".db" in path.name:
+                    found = hits(path.read_bytes(), {**secrets, **metadata})
+                    assert not found, f"inventory metadata leak in {path.name}: {sorted(found)}"
+                    scanned.append(path)
+            assert scanned, "inventory scan examined no files"
+
+        def history():
+            return {table: sql_file(index, f"SELECT * FROM {table} ORDER BY 1")
+                    for table in ("job", "job_operation", "audit_event", "verification_event")}
+
+        def trace_write(*args, ok=True, cfg=writer, fsync_ordinal=1):
+            trace = base / "live-journal.trace"
+            trace.unlink(missing_ok=True)
+            child = subprocess.Popen(
+                ["strace", "-yy", "-e", "trace=fsync", "-e",
+                 f"inject=fsync:delay_exit=2s:when={fsync_ordinal}", "-o", str(trace), *command(*args, cfg=cfg)],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
+            try:
+                wait_for(lambda: trace.exists() and "(DELAYED)" in trace.read_text(), "live SQLite journal")
+                delayed = next(line for line in trace.read_text().splitlines() if "(DELAYED)" in line)
+                assert ".db-journal>" in delayed, delayed
+                journal = Path(re.search(r"<([^>]+\.db-journal)>", delayed)[1])
+                assert journal.is_file() and journal.stat().st_size > 512
+                scan_inventory()
+                assert hits(journal.read_bytes() + b"\n".join(secrets.values()), secrets) == set(secrets)
+                stdout, stderr = child.communicate(timeout=150)
+                result = subprocess.CompletedProcess(child.args, child.returncode, stdout, stderr)
+                capture(args, "json", result)
+                assert (result.returncode == 0) == ok, stderr
+                scan_inventory()
+                return json.loads(stdout) if ok else result
+            finally:
+                if child.poll() is None:
+                    os.killpg(child.pid, signal.SIGKILL)
+                    child.communicate(timeout=10)
+
+        def check_reports(artifact):
+            # Keyless reports must not inherit the metadata authenticated detail commands expose.
+            requests = [("job", "list"), ("inventory", "check"), ("inventory", "list"),
+                        ("inventory", "verification", artifact),
+                        ("inventory", "rebuild", "--source-fingerprint", estate, "--dry-run")]
+            requests += [("job", "inspect", j["job_id"]) for j in jobs()]
+            for args in requests:
+                for output in ("json", "human"):
+                    result = capture(args, output, run(command(*args, cfg=keyless, output=output)))
+                    assert not hits((result.stdout + result.stderr).encode(), {**secrets, **metadata}), args
+            for output in ("json", "human"):
+                for args in [("backup", "inspect", artifact), ("key", "status")]:
+                    capture(args, output, run(command(*args, output=output)))
+            for args, output, stdout, stderr in captures:
+                assert not hits(stdout + stderr, secrets), f"secret in {output} {args[:2]}"
+            scan_inventory()
+
         try:
             run(["docker", "run", "--rm", "-d", "--name", container, "--network", "none",
                  "-e", "POSTGRES_HOST_AUTH_METHOD=trust", "-v", f"{base}:{base}",
@@ -168,6 +247,7 @@ verifying_key_file = "{key_dir}/verifying.key"
                    input=(REPO / "tests/fixtures/postgres/core.sql").read_text())
             pg("CREATE TABLE public.m5a_stream AS SELECT i, md5(i::text) AS value "
                "FROM generate_series(1,200000) i")
+            pg(f"CREATE SCHEMA {PRIVATE_SCOPE}; CREATE TABLE {PRIVATE_SCOPE}.entries (id int)")
 
             # Forward real archive bytes, then back-pressure the still-running native dump.
             (base / "pause-dump.py").write_text(f'''import pathlib, sys, time
@@ -194,7 +274,11 @@ EXECUTE FUNCTION public.m5a_pause();
                 wrapper = bin_dir / tool
                 wrapper.write_text(f'''#!/usr/bin/env bash
 set -euo pipefail
-if [[ "{tool}" == createdb && -f {base}/pause-restore && "$*" != --version ]]; then
+if [[ -f {base}/fail-preflight && "$*" == --version ]]; then
+    cat {base}/native-secret >&2; exit 1
+elif [[ -f {base}/fail-{tool} && "$*" != --version && "$1" != --list ]]; then
+    cat {base}/native-secret >&2; exit 1
+elif [[ "{tool}" == createdb && -f {base}/pause-restore && "$*" != --version ]]; then
     docker exec -i {container} createdb "$@"
     docker exec -i {container} psql -U postgres -X -v ON_ERROR_STOP=1 -d "${{@: -1}}" -f {pause_sql}
 elif [[ "{tool}" == pg_dump && -f {base}/pause-dump && "$*" != --version ]]; then
@@ -206,8 +290,59 @@ fi
                 wrapper.chmod(0o700)
 
             ctl("key", "generate")
+            for name in ("identity", "signing"):
+                seed = (keys / f"{name}.key").read_text().splitlines()[1]
+                secrets[f"{name}-hex"] = seed.encode()
+                secrets[f"{name}-raw"] = bytes.fromhex(seed)
+                if name == "signing":
+                    for number, component in enumerate((seed[:64], seed[64:])):
+                        secrets[f"signing-component-{number}-hex"] = component.encode()
+                        secrets[f"signing-component-{number}-raw"] = bytes.fromhex(component)
+            (base / "native-secret").write_bytes(b"\n".join([*secrets.values(), *metadata.values()]))
             artifact = create()
             estate = ctl("inventory", "check", cfg=keyless)["source_fingerprint"]
+            scan_inventory()
+            # A populated SQLite copy proves every sentinel is detectable by the byte scan.
+            control = base / "positive-control.db"
+            shutil.copyfile(index, control)
+            with contextlib.closing(sqlite3.connect(control)) as db:
+                db.execute("CREATE TABLE privacy_control (value BLOB)")
+                db.executemany("INSERT INTO privacy_control VALUES (?)", [(v,) for v in [*secrets.values(), *metadata.values()]])
+                db.commit()
+            assert hits(control.read_bytes(), {**secrets, **metadata}) == set(secrets) | set(metadata)
+            print(f"PostgreSQL {major}: raw SQLite privacy positive control detected all sentinels", flush=True)
+
+            before = history()
+            invalid = base / "invalid-config.toml"
+            invalid.write_text(writer.read_text() + f'\nunrecognized_secret = "{FAKE_CREDENTIAL}"\n')
+            for output in ("json", "human"):
+                args = ("config", "check")
+                report = capture(args, output, run(command(*args, cfg=invalid, output=output), ok=False))
+                assert "invalid configuration" in report.stderr
+            assert history() == before, "configuration refusal invented history"
+            (base / "fail-preflight").touch()
+            rejects("backup", "create", "--confirm-synthetic", contains="output withheld")
+            (base / "fail-preflight").unlink()
+            assert history() == before, "preflight refusal invented history"
+            (base / "fail-pg_dump").touch()
+            failure = trace_write("backup", "create", "--confirm-synthetic", ok=False)
+            (base / "fail-pg_dump").unlink()
+            assert "output withheld" in failure.stderr
+            failed = next(j for j in jobs() if j["job_id"] not in {r[0] for r in before["job"]})
+            assert failed["state"] == "failed"
+            assert sql_file(index, "SELECT action FROM audit_event WHERE job_id=? ORDER BY event_id",
+                            (failed["job_id"],)) == [("job_started",), ("job_failed",)]
+            assert not (root / "artifacts" / failed["backup_id"]).exists()
+            profiled = trace_write("backup", "create", "--confirm-synthetic", "--profile", PRIVATE_PROFILE)["manifest"]["backup_id"]
+            assert PRIVATE_PROFILE.encode() in captures[-1][2], "authenticated create report control was absent"
+            args = ("backup", "create", "--confirm-synthetic", "--profile", PRIVATE_PROFILE)
+            report = capture(args, "human", run(command(*args, output="human")))
+            assert PRIVATE_PROFILE in report.stdout
+            (base / "fail-pg_dump").touch()
+            report = capture(args, "human", run(command(*args, output="human"), ok=False))
+            (base / "fail-pg_dump").unlink()
+            assert "output withheld" in report.stderr
+            check_reports(profiled)
             artifacts_before = digest_tree(root / "artifacts")
             print(f"PostgreSQL {major}: native fixture backup registered", flush=True)
 
@@ -219,7 +354,9 @@ fi
             interrupted_backup = running[0]
             stage = root / "staging" / interrupted_backup["backup_id"]
             assert stage.is_dir()
+            before = history()
             rejects("backup", "create", "--confirm-synthetic", contains="already running")
+            assert history() == before, "duplicate startup invented history"
             assert job(interrupted_backup["job_id"])["state"] == "running"
             ctl("backup", "inspect", artifact)
             ctl("inventory", "list", cfg=keyless)
@@ -237,7 +374,23 @@ fi
             print(f"PostgreSQL {major}: killed dump, duplicate/read safety and same-scope restart passed", flush=True)
 
             # A live native restore keeps inherited claims after its CLI parent dies.
+            failed_target = TARGET + "_failure"
+            failed_plan = ctl("restore", "plan", artifact, "--target", failed_target,
+                              "--security", "portable")["plan"]["id"]
+            before = history()
+            (base / "fail-pg_restore").touch()
+            failure = trace_write("restore", "run", failed_plan, "--confirm-target", failed_target, ok=False)
+            (base / "fail-pg_restore").unlink()
+            assert "output withheld" in failure.stderr
+            failed = next(j for j in jobs() if j["job_id"] not in {r[0] for r in before["job"]})
+            assert failed["operation"] == "restore" and failed["state"] == "failed"
+            assert sql_file(index, "SELECT action FROM audit_event WHERE job_id=? ORDER BY event_id",
+                            (failed["job_id"],)) == [("job_started",), ("job_failed",)]
+            assert pg(f"SELECT count(*) FROM pg_database WHERE datname='{failed_target}'") == "1"
             plan = restore_plan(artifact)
+            before = history()
+            rejects("restore", "run", plan, "--confirm-target", TARGET + "_wrong", contains="confirmation target")
+            assert history() == before, "confirmation refusal invented history"
             (base / "pause-restore").touch()
             restore = spawn(command("restore", "run", plan, "--confirm-target", TARGET))
             wait_for(lambda: pg("SELECT count(*) FROM pg_stat_activity WHERE datname='" + TARGET +
@@ -248,7 +401,9 @@ fi
             artifact_lock = root / "locks" / f"artifact-{artifact}.lock"
             target_lock = root / "locks" / f"target-{restore_job['target_fingerprint']}.lock"
             assert not lock_free(artifact_lock) and not lock_free(target_lock)
+            before = history()
             rejects("restore", "run", plan, "--confirm-target", TARGET, contains="RESTORE_BUSY")
+            assert history() == before, "target-lock refusal invented history"
             ctl("backup", "inspect", artifact)
             os.kill(restore.pid, signal.SIGKILL)
             restore.wait(timeout=10)
@@ -265,11 +420,16 @@ fi
             # The drill owns this partial fixture; production recovery deliberately keeps it.
             docker("dropdb", "-U", "postgres", TARGET)
             plan = restore_plan(artifact)
-            ctl("restore", "run", plan, "--confirm-target", TARGET)
+            trace_write("restore", "run", plan, "--confirm-target", TARGET)
             docker("psql", "-U", "postgres", "-v", "ON_ERROR_STOP=1", "-d", TARGET,
                    input=(REPO / "tests/fixtures/postgres/assertions.sql").read_text())
             assert pg("SELECT count(*) FROM public.m5a_stream", TARGET) == "200000"
             assert any(j["operation"] == "restore" and j["state"] == "complete" for j in jobs())
+            completed = [j for j in jobs() if j["operation"] == "restore" and j["state"] == "complete"]
+            assert len(completed) == 1
+            assert sql_file(index, "SELECT action FROM audit_event WHERE job_id=? ORDER BY event_id",
+                            (completed[0]["job_id"],)) == [("job_started",), ("job_completed",)]
+            check_reports(artifact)
             print(f"PostgreSQL {major}: killed native restore, inherited claims, recovery and validated restore passed", flush=True)
 
             # Refuse registration only after the authoritative artifact is complete.
@@ -285,7 +445,8 @@ fi
             assert next(j for j in jobs() if j["backup_id"] == orphan)["state"] == "failed"
             sql_file(index, "DROP TRIGGER m5a_fail")
             ctl("inventory", "adopt", orphan, "--source-fingerprint", estate, cfg=keyless)
-            ctl("backup", "verify", orphan, "--level", "archive")
+            trace_write("backup", "verify", orphan, "--level", "archive")
+            check_reports(orphan)
             print(f"PostgreSQL {major}: publication/registration failure and explicit adoption passed", flush=True)
 
             # Real native writers create all three shapes in one directory.
@@ -335,6 +496,7 @@ fi
             assert sql_file(index, "SELECT count(*) FROM provisional_artifact")[0][0] == len(rows)
             ctl("backup", "verify", artifact, "--level", "archive")
             assert sql_file(index, "SELECT profile_fingerprint FROM artifact WHERE backup_id=?", (artifact,))[0][0]
+            check_reports(artifact)
             print(f"PostgreSQL {major}: mixed shapes, malformed header, wrong estate and keyless rebuild passed", flush=True)
 
             # Discover syscall ordinals from this build, then delay each successful boundary
@@ -376,6 +538,20 @@ fi
                     checkpoints[checkpoint] = (syscall, ordinals[syscall])
             assert set(checkpoints) == {"stage-create", "stage-sync", "old-link", "old-dir-sync",
                                         "replacement", "replacement-dir-sync"}, checkpoints
+            journal_ordinal = 0
+            last_journal = None
+            for line in (base / "rebuild-baseline.trace").read_text().splitlines():
+                if line.startswith("fsync("):
+                    journal_ordinal += 1
+                    if ".db-journal>" in line:
+                        last_journal = journal_ordinal
+            assert last_journal is not None
+            journal_root, journal_cfg = crash_store("journal-rebuild")
+            prepared = rebuild("--prepare-rebuild", cfg=journal_cfg)["plan_id"]
+            trace_write("inventory", "rebuild", "--source-fingerprint", estate, "--confirm-rebuild",
+                        "--plan-id", prepared, cfg=journal_cfg, fsync_ordinal=last_journal)
+            assert ctl("inventory", "check", cfg=journal_cfg)["valid"]
+            assert ctl("job", "list", cfg=journal_cfg)["jobs"] == []
             authoritative = saved_index.read_bytes()
             for checkpoint, (syscall, ordinal) in checkpoints.items():
                 crash_root, crash_cfg = crash_store(f"crash-{checkpoint}")
@@ -484,6 +660,14 @@ fi
             ctl("job", "inspect", copied_jobs[0]["job_id"], cfg=copy_cfg)
             assert digest_tree(copy_root) == original and len(list(copy_root.iterdir())) == 1
             copy_root.chmod(0o700)
+            scan_inventory()
+            for args, output, stdout, stderr in captures:
+                assert not hits(stdout + stderr, secrets), f"secret in {output} {args[:2]}"
+            for _, log in children:
+                log.flush()
+                log.seek(0)
+                assert not hits(log.read().encode(), secrets), "secret in spawned CLI output"
+            print(f"PostgreSQL {major}: metadata/seed scans, live journals and honest audit timing passed", flush=True)
             print(f"PostgreSQL {major}: v1/v2 upgrades, newer-schema refusal, populated corruption/rebuild and read-only copy passed", flush=True)
         finally:
             # Kill CLI process groups, then stop the isolated server and its docker-exec children.

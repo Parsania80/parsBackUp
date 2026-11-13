@@ -23,7 +23,7 @@
 
 use anyhow::{Context, Result, bail, ensure};
 use std::fs::{DirBuilder, File, OpenOptions};
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 /// Where lock files live inside a storage root. A directory of its own so a store's top level
@@ -61,6 +61,12 @@ impl JobLock {
                 }
             })
             .with_context(|| format!("cannot create {} for a job lock", dir.display()))?;
+        let metadata = std::fs::symlink_metadata(&dir)?;
+        ensure!(
+            metadata.is_dir() && !metadata.file_type().is_symlink(),
+            "{} is not a real lock directory",
+            dir.display()
+        );
 
         let path = Self::path_for(root, source_fingerprint, profile_fingerprint);
         // 0600 like every other file this tool writes: the lock is only two fingerprints, but the
@@ -71,8 +77,10 @@ impl JobLock {
             .create(true)
             .truncate(false)
             .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .open(&path)
             .with_context(|| format!("cannot open job lock {}", path.display()))?;
+        check_file(&file, &path)?;
 
         // `LOCK_EX | LOCK_NB`: exclusive, and never wait. Waiting would put an operator in front of
         // a command that appears to have hung, which is the failure mode this whole file exists to
@@ -121,8 +129,23 @@ impl JobLock {
         profile_fingerprint: &str,
     ) -> Result<bool> {
         check_scope(source_fingerprint, profile_fingerprint)?;
+        let dir = root.join(LOCK_DIR);
+        let metadata = match std::fs::symlink_metadata(&dir) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+            Err(error) => return Err(error).context("inspect job lock directory"),
+        };
+        ensure!(
+            metadata.is_dir() && !metadata.file_type().is_symlink(),
+            "{} is not a real lock directory",
+            dir.display()
+        );
         let path = Self::path_for(root, source_fingerprint, profile_fingerprint);
-        let file = match File::open(&path) {
+        let file = match OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(&path)
+        {
             Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
             Err(error) => {
@@ -130,6 +153,7 @@ impl JobLock {
                     .with_context(|| format!("cannot check job lock {}", path.display()));
             }
         };
+        check_file(&file, &path)?;
         let outcome = unsafe {
             libc::flock(
                 std::os::fd::AsRawFd::as_raw_fd(&file),
@@ -159,6 +183,16 @@ impl JobLock {
     pub fn path(&self) -> &Path {
         &self.path
     }
+}
+
+fn check_file(file: &File, path: &Path) -> Result<()> {
+    let metadata = file.metadata()?;
+    ensure!(
+        metadata.is_file() && metadata.permissions().mode() & 0o077 == 0,
+        "{} is not a private regular job lock file",
+        path.display()
+    );
+    Ok(())
 }
 
 /// A scope is two fingerprints and nothing else, and the holder and the prober must say so in the
@@ -196,7 +230,6 @@ impl Drop for JobLock {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt as _;
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
     use uuid::Uuid;
@@ -204,6 +237,70 @@ mod tests {
     const SOURCE: &str = "c1cb425f097b6522";
     const NIGHTLY: &str = "651dd7a74505b176";
     const WEEKLY: &str = "1111111111111111";
+
+    #[test]
+    fn acquisition_and_probe_refuse_unsafe_lock_files() {
+        let root = temp_root("unsafe-file");
+        std::fs::create_dir(root.join(LOCK_DIR)).unwrap();
+        let path = JobLock::path_for(&root, SOURCE, NIGHTLY);
+        let target = root.join("private-target");
+        std::fs::write(&target, b"unchanged").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
+        for destination in [&target, &root.join("absent-target")] {
+            std::os::unix::fs::symlink(destination, &path).unwrap();
+            assert!(JobLock::acquire(&root, SOURCE, NIGHTLY).is_err());
+            assert!(JobLock::is_free(&root, SOURCE, NIGHTLY).is_err());
+            std::fs::remove_file(&path).unwrap();
+        }
+        assert_eq!(std::fs::read(&target).unwrap(), b"unchanged");
+        assert!(!root.join("absent-target").exists());
+        std::fs::write(&path, b"lock contents").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(JobLock::acquire(&root, SOURCE, NIGHTLY).is_err());
+        assert!(JobLock::is_free(&root, SOURCE, NIGHTLY).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"lock contents");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        drop(JobLock::acquire(&root, SOURCE, NIGHTLY).unwrap());
+        assert!(JobLock::is_free(&root, SOURCE, NIGHTLY).unwrap());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn acquisition_and_probe_refuse_special_files_and_linked_directory() {
+        let root = temp_root("unsafe-directory");
+        let outside = root.join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join(LOCK_DIR)).unwrap();
+        assert!(JobLock::acquire(&root, SOURCE, NIGHTLY).is_err());
+        assert!(JobLock::is_free(&root, SOURCE, NIGHTLY).is_err());
+        assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
+        std::fs::remove_file(root.join(LOCK_DIR)).unwrap();
+        std::fs::create_dir(root.join(LOCK_DIR)).unwrap();
+        let path = JobLock::path_for(&root, SOURCE, NIGHTLY);
+        std::fs::create_dir(&path).unwrap();
+        assert!(JobLock::acquire(&root, SOURCE, NIGHTLY).is_err());
+        assert!(JobLock::is_free(&root, SOURCE, NIGHTLY).is_err());
+        std::fs::remove_dir(&path).unwrap();
+        let fifo = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        // The nonblocking descriptor open must refuse the FIFO without waiting for a writer.
+        let (sender, receiver) = mpsc::channel();
+        let probe_root = root.clone();
+        let worker = std::thread::spawn(move || {
+            sender
+                .send((
+                    JobLock::acquire(&probe_root, SOURCE, NIGHTLY).is_err(),
+                    JobLock::is_free(&probe_root, SOURCE, NIGHTLY).is_err(),
+                ))
+                .unwrap();
+        });
+        assert_eq!(
+            receiver.recv_timeout(Duration::from_secs(5)).unwrap(),
+            (true, true)
+        );
+        worker.join().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     fn temp_root(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("backupctl-lock-{name}-{}", Uuid::new_v4()));

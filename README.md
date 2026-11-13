@@ -105,3 +105,11 @@ Run `bash tests/m5a_docker_smoke.sh` for the M5a PostgreSQL 16–18 recovery and
 A06 passed on PostgreSQL 16, 17 and 18, including 18 inventory-replacement crash checkpoints. All 216 workspace tests, formatting and strict Clippy pass. A07's metadata leakage and audit checks are next; M5a acceptance and the production CLI remain unfinished, and the production UI follows the stable API milestone.
 
 The A04–A06 changes are being committed together: authenticated verification history, restore job ownership and the PostgreSQL recovery/integrity drill. A07 remains next.
+
+A07 passed on PostgreSQL 16, 17 and 18. The drill now checks raw inventory files and live journals, credentials/private seeds in captured output, metadata-free keyless reports, and audit rollback/refusal behavior. Authenticated detail reports continue to show their documented database/profile/target fields. All 218 workspace tests, formatting and strict Clippy pass; see the [A07 checks](docs/development/m5a-inventory.md#a07-metadata-and-audit-checks).
+
+A08 / M5a accepted (2026-11-13): the operating guide, separate JobLock permission/symlink hardening, all 220 workspace tests and all seven PostgreSQL 16/17/18 regression matrices pass. B01 is next: inspect and define the retention policy/plan contract before implementing deletion. Production CLI completion still requires B, H and V; the production UI follows a stable API.
+
+The [M5a operating guide](docs/development/m5a-operations.md) explains keyless inspection, adoption, saved-plan rebuild, verification, DR restore and interrupted jobs, including unknown facts, lost history and writable-storage limits. Its [acceptance map](docs/development/m5a-inventory.md#a08-operating-guide-and-acceptance-map) distinguishes the delivered inventory CLI from legacy backup-reader behavior and later retention/service work.
+
+The verified A07–A08 changes are being committed together. The remaining production CLI roadmap has 14 tasks: B01–B06 retention/protection/deletion, H01–H05 hardening/deployment, and V01–V03 validation/release. The full platform then adds 11 API, UI and platform-release tasks; these counts describe scope, not equal effort or a delivery date.
