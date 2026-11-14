@@ -233,3 +233,15 @@ New signed plans use `m5b-restore-plan-v2`. Their digest binds the selected ciph
 `OLDER_SNAPSHOT_REPLAN_REQUIRED` means selected authenticated bytes or local warning context changed, including a newer observation or lost/rebuilt ledger. Create and review a new plan. Execution rechecks before PostgreSQL mutation; a refusal can leave a failed restore-job record, but does not create a target or apply globals for that refused attempt. Concurrent observations after a check remain possible; this is a local point-in-time warning.
 
 Migration starts with unknown history instead of guessing from old rows. Explicit rebuild reports `rollback` among `lost_history` and cannot recover a lost newer observation; later authentication establishes only what the host sees again. Missing inventory stays missing during planning, with `rollback.high_water: null`; restore execution still requires an explicit inventory rebuild. A null high-water is unknown history. This ledger is in the store's failure domain: replacing both files and inventory can erase the warning, so T03 and off-host replay protection remain open.
+
+## Retention drill and recovery interpretation
+
+The B06 drill runs with Docker, Python 3, `strace` syscall delay injection, the cached PostgreSQL 16/17/18 images used by the existing drills, and a non-root operator:
+
+```sh
+bash tests/m5b_retention_drill.sh
+```
+
+It creates isolated synthetic databases and private temporary stores, then removes its own process groups, containers and fixtures. It checks exact confirmed sets, every retention exclusion class, protected-copy preservation, unknown rebuilt history, missing/corrupt retained witnesses, competing deletion/restore commands, honest partial reports and durable tombstones. Eight syscall crash points per major span committed intent with a still-present marker through tombstone commit. A private native-tool wrapper pauses a real restore to test the reverse contention direction; runtime code has no failpoint. See [B06 acceptance](../../project.md#40-b06-destructiveracecrash-retention-drill--2026-11-14) for final gate status and evidence.
+
+An interrupted job can already contain completed tombstones. Recovery may therefore return an empty `deleted` list even though the old job remains interrupted and has pending IDs: those pending IDs were never authorized to resume automatically. Review the old job/partition, recover any started IDs, then obtain a new preview for remaining intact backups. Restoring complete files does not undo a tombstone in the surviving inventory. Preserve missing/changed intent or unexpected remaining files for investigation; recovery must refuse rather than guess. Tests use process termination, not power-loss simulation, and do not prove survival of host/root loss. Production-source enablement and off-host replay protection remain separate gates.
