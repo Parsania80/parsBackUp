@@ -164,9 +164,14 @@ verifying_key_file = "{key_dir}/verifying.key"
             return ctl("inventory", "rebuild", "--source-fingerprint", source or estate,
                        *flags, cfg=cfg)
 
-        def restore_plan(artifact):
-            return ctl("restore", "plan", artifact, "--target", TARGET,
-                       "--security", "portable")["plan"]["id"]
+        def restore_plan(artifact, target=TARGET):
+            # This drill deliberately restores an old snapshot. Review the local warning,
+            # then explicitly bind it in the newly saved plan; runtime authenticates again.
+            listing = ctl("backup", "list")
+            acknowledgement = ["--acknowledge-older-snapshot"] if any(
+                w["artifact_id"] == artifact for w in listing["rollback_warnings"]) else []
+            return ctl("restore", "plan", artifact, "--target", target,
+                       "--security", "portable", *acknowledgement)["plan"]["id"]
 
         def spawn(args, *, env=None):
             log = (base / f"child-{len(children)}.log").open("w+")
@@ -357,6 +362,37 @@ fi
             whole = [artifact, create(), create()]
             for known in [*whole, profiled]:
                 ctl("backup", "verify", known, "--level", "archive")
+            # B05: real authenticated publication, cross-profile local warning and explicit
+            # plan acknowledgement. Keep mutations in this block out of B03's frozen snapshot.
+            high_water = sql_file(index, "SELECT backup_id,completed_at_utc FROM completion_high_water")[0]
+            before_db = index.read_bytes()
+            listed = ctl("backup", "list")
+            assert set(listed) == {"signed", "unsigned", "rollback_warnings", "rollback_unknown"}
+            warning = next(w for w in listed["rollback_warnings"] if w["artifact_id"] == artifact)
+            assert warning["high_water"] == {"artifact_id": high_water[0], "completed_at_utc": high_water[1]}
+            assert warning["completed_at_utc"] < high_water[1] and listed["rollback_unknown"] == []
+            human = capture(("backup", "list"), "human", run(command("backup", "list", output="human")))
+            assert "WARNING: older snapshot" in human.stdout
+            assert index.read_bytes() == before_db
+            plan_files = digest_tree(root / "plans")
+            rejects("restore", "plan", artifact, "--target", TARGET, "--security", "portable",
+                    contains="OLDER_SNAPSHOT_ACK_REQUIRED")
+            assert digest_tree(root / "plans") == plan_files
+            acknowledged = ctl("restore", "plan", artifact, "--target", TARGET, "--security", "portable",
+                               "--acknowledge-older-snapshot")["plan"]
+            assert acknowledged["format"] == "m5b-restore-plan-v2"
+            assert acknowledged["rollback"]["acknowledged"] is True
+            assert acknowledged["rollback"]["high_water"] == warning["high_water"]
+            # Wait for the timestamp boundary explicitly; equal-second completions are ties.
+            import calendar
+            boundary = calendar.timegm(time.strptime(high_water[1], "%Y-%m-%dT%H:%M:%SZ")) + 1
+            wait_for(lambda: time.time() >= boundary, "new authenticated completion second")
+            ctl("backup", "create", "--confirm-synthetic", "--profile", PRIVATE_PROFILE)
+            rejects("restore", "run", acknowledged["id"], "--confirm-target", TARGET,
+                    contains="OLDER_SNAPSHOT_REPLAN_REQUIRED")
+            assert pg(f"SELECT count(*) FROM pg_database WHERE datname='{TARGET}'") == "0"
+            scan_inventory()
+            print(f"PostgreSQL {major}: B05 authenticated history/list warnings/bound acknowledgement/stale refusal passed", flush=True)
             reader_cfg = config("retention-reader")
             reader_cfg.write_text(reader_cfg.read_text().replace(
                 f'signing_key_file = "{keys}/signing.key"\n', "").replace(
@@ -489,8 +525,7 @@ fi
 
             # A live native restore keeps inherited claims after its CLI parent dies.
             failed_target = TARGET + "_failure"
-            failed_plan = ctl("restore", "plan", artifact, "--target", failed_target,
-                              "--security", "portable")["plan"]["id"]
+            failed_plan = restore_plan(artifact, failed_target)
             before = history()
             (base / "fail-pg_restore").touch()
             failure = trace_write("restore", "run", failed_plan, "--confirm-target", failed_target, ok=False)
@@ -593,7 +628,7 @@ fi
             original_ids = {e["backup_id"] for e in ctl("inventory", "list", cfg=keyless)["entries"]}
             index.unlink()
             preview = rebuild("--dry-run")
-            assert not index.exists() and preview["lost_history"] == ["jobs", "audit", "protection", "verification"]
+            assert not index.exists() and preview["lost_history"] == ["jobs", "audit", "protection", "verification", "rollback"]
             prepared = rebuild("--prepare-rebuild")["plan_id"]
             public.write_bytes(saved_header + b"\n")
             rejects("inventory", "rebuild", "--source-fingerprint", estate, "--confirm-rebuild",
@@ -608,8 +643,11 @@ fi
             rows = sql_file(index, "SELECT profile_fingerprint,completed_at_utc FROM artifact")
             assert len(rows) == len(entries) and all(row == (None, None) for row in rows)
             assert all(row == (None,) for row in sql_file(index, "SELECT protected FROM artifact"))
+            assert sql_file(index, "SELECT * FROM completion_high_water") == []
+            assert artifact in ctl("backup", "list")["rollback_unknown"]
             assert sql_file(index, "SELECT count(*) FROM provisional_artifact")[0][0] == len(rows)
             ctl("backup", "verify", artifact, "--level", "archive")
+            assert sql_file(index, "SELECT backup_id FROM completion_high_water") == [(artifact,)]
             assert sql_file(index, "SELECT profile_fingerprint FROM artifact WHERE backup_id=?", (artifact,))[0][0]
             assert sql_file(index, "SELECT protected FROM artifact WHERE backup_id=?", (artifact,)) == [(None,)]
             rejects("backup", "prune", "--keep-last", "1", contains="RETENTION_PROTECTION_UNKNOWN")

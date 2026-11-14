@@ -9,7 +9,7 @@
 //! runs — so there is one code path that produces a schema and one test that exercises it.
 
 /// The schema version this build writes, and the maximum it will open.
-pub const SCHEMA_VERSION: i64 = 7;
+pub const SCHEMA_VERSION: i64 = 8;
 
 /// One step up the schema. `MIGRATIONS` must stay dense and ordered: a gap would be a version
 /// no build can reach, and an out-of-order pair would run a later step against an earlier shape.
@@ -61,6 +61,11 @@ static MIGRATIONS: &[Migration] = &[
         from: 6,
         to: 7,
         sql: "CREATE TABLE deletion_job (job_id TEXT PRIMARY KEY, plan_id TEXT NOT NULL UNIQUE, digest TEXT NOT NULL) WITHOUT ROWID;              CREATE TABLE job_artifact (job_id TEXT NOT NULL, backup_id TEXT NOT NULL, role TEXT NOT NULL CHECK(role IN ('candidate','retained')), progress TEXT NOT NULL CHECK(progress IN ('pending','deleting','deleted')), PRIMARY KEY(job_id,backup_id)) WITHOUT ROWID;",
+    },
+    Migration {
+        from: 7,
+        to: 8,
+        sql: "CREATE TABLE completion_high_water (source_fingerprint TEXT NOT NULL, signer_id TEXT NOT NULL, backup_id TEXT NOT NULL, completed_at_utc TEXT NOT NULL, PRIMARY KEY(source_fingerprint,signer_id)) WITHOUT ROWID;",
     },
 ];
 
@@ -556,6 +561,113 @@ mod tests {
     /// that skipped a number would leave an operator's file stranded at a schema this build has
     /// no statements for. `migrate` only `debug_assert!`s this, which a release build does not
     /// run, so the shape of the list is checked here instead.
+    #[test]
+    fn version_seven_migration_preserves_populated_history_without_inventing_a_mark() {
+        for broken in [false, true] {
+            let (dir, path) = fresh("completion-v8");
+            let row = as_v1(&path);
+            let conn = Connection::open(&path).unwrap();
+            for version in 1..7 {
+                conn.execute_batch(MIGRATIONS.iter().find(|m| m.from == version).unwrap().sql)
+                    .unwrap();
+            }
+            set_user_version(&conn, 7).unwrap();
+            let id = row.backup_id.to_string();
+            conn.execute("UPDATE artifact SET protected=1", []).unwrap();
+            conn.execute("INSERT INTO provisional_artifact VALUES (?1)", [&id])
+                .unwrap();
+            conn.execute("INSERT INTO verification_event VALUES (1,?1,'2026-09-28T06:15:00Z','archive','success',?2,?3,1)", rusqlite::params![id, row.payload_sha256, row.manifest_sha256]).unwrap();
+            let job = Uuid::new_v4().to_string();
+            conn.execute("INSERT INTO job VALUES (?1,NULL,?2,'651dd7a74505b176','complete','2026-09-28T06:15:00Z','2026-09-28T06:15:00Z')", rusqlite::params![job,SOURCE]).unwrap();
+            conn.execute(
+                "INSERT INTO job_operation VALUES (?1,'delete',NULL)",
+                [&job],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO audit_event VALUES (1,'2026-09-28T06:15:00Z','job_completed',?1,?2)",
+                rusqlite::params![job, id],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO deletion_job VALUES (?1,?2,?3)",
+                rusqlite::params![job, Uuid::new_v4().to_string(), "e".repeat(64)],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO job_artifact VALUES (?1,?2,'candidate','deleted')",
+                rusqlite::params![job, id],
+            )
+            .unwrap();
+            let tables = [
+                "meta",
+                "artifact",
+                "provisional_artifact",
+                "job",
+                "job_operation",
+                "audit_event",
+                "verification_event",
+                "deletion_job",
+                "job_artifact",
+            ];
+            let snapshot = |conn: &Connection| {
+                tables
+                    .iter()
+                    .map(|table| {
+                        let mut statement = conn
+                            .prepare(&format!("SELECT * FROM {table} ORDER BY 1"))
+                            .unwrap();
+                        let n = statement.column_count();
+                        statement
+                            .query_map([], |r| {
+                                (0..n)
+                                    .map(|i| r.get::<_, rusqlite::types::Value>(i))
+                                    .collect::<rusqlite::Result<Vec<_>>>()
+                            })
+                            .unwrap()
+                            .collect::<rusqlite::Result<Vec<_>>>()
+                            .unwrap()
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let before = snapshot(&conn);
+            if broken {
+                conn.execute_batch("CREATE TABLE completion_high_water (fixture TEXT)")
+                    .unwrap();
+            }
+            drop(conn);
+            let bytes = fs::read(&path).unwrap();
+            let readonly = crate::Inventory::open_read_only_bound(&path).unwrap();
+            assert_eq!(readonly.schema_version().unwrap(), 7);
+            assert!(
+                readonly
+                    .completion_mark(SOURCE, row.signer_id.as_deref().unwrap())
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(fs::read(&path).unwrap(), bytes);
+            drop(readonly);
+            let result = crate::Inventory::open_existing_upgrade(&path, &estate());
+            if broken {
+                assert!(result.is_err());
+                let conn = Connection::open(&path).unwrap();
+                assert_eq!(user_version(&conn).unwrap(), 7);
+                assert_eq!(snapshot(&conn), before);
+            } else {
+                let inventory = result.unwrap();
+                assert_eq!(inventory.schema_version().unwrap(), 8);
+                assert_eq!(snapshot(&inventory.conn), before);
+                assert!(
+                    inventory
+                        .completion_mark(SOURCE, row.signer_id.as_deref().unwrap())
+                        .unwrap()
+                        .is_none()
+                );
+            }
+            fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
     #[test]
     fn the_migration_list_is_dense_and_ends_at_this_builds_version() {
         assert!(!MIGRATIONS.is_empty());

@@ -936,6 +936,110 @@ fn ctl_json(scene: &Scene, args: &[&str]) -> serde_json::Value {
 }
 
 #[test]
+fn older_snapshot_cli_reports_and_plan_acknowledgement_bind_surviving_local_history() {
+    let scene = signed_retention_scene("b05-rollback", 1);
+    let index = scene.root.join(INVENTORY_FILE);
+    let row = Inventory::open_read_only_bound(&index)
+        .unwrap()
+        .artifacts()
+        .unwrap()
+        .remove(0);
+    let id = row.backup_id.to_string();
+    // A surviving mark may refer to a copy already removed from the local store.
+    let observed = Uuid::new_v4().to_string();
+    let conn = rusqlite::Connection::open(&index).unwrap();
+    conn.execute(
+        "UPDATE completion_high_water SET backup_id=?1,completed_at_utc='2099-01-01T00:00:00Z'",
+        [&observed],
+    )
+    .unwrap();
+    let bytes = fs::read(&index).unwrap();
+    let listed = ctl_json(&scene, &["backup", "list"]);
+    assert_eq!(
+        listed
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        [
+            "rollback_unknown",
+            "rollback_warnings",
+            "signed",
+            "unsigned"
+        ]
+    );
+    assert_eq!(listed["rollback_unknown"], serde_json::json!([]));
+    assert_eq!(
+        listed["rollback_warnings"],
+        serde_json::json!([{
+            "artifact_id": id, "source_fingerprint": row.source_fingerprint, "signer_id": row.signer_id,
+            "completed_at_utc": row.completed_at_utc,
+            "high_water": {"artifact_id": observed, "completed_at_utc":"2099-01-01T00:00:00Z"}
+        }])
+    );
+    assert_eq!(fs::read(&index).unwrap(), bytes);
+    let human = scene.run(&["backup", "list"]);
+    assert!(human.status.success() && text(&human).contains("WARNING: older snapshot"));
+    let bin = scene.base.join("bin");
+    write_tool(
+        &bin,
+        "psql",
+        &psql_script().replace("esac\nexit 1", "  *pg_database*) exit 0 ;;\nesac\nexit 1"),
+    );
+    let target = "backupctl_fixture_b05";
+    let args = [
+        "restore",
+        "plan",
+        &id,
+        "--target",
+        target,
+        "--security",
+        "portable",
+    ];
+    let error = scene.run(&args);
+    assert!(!error.status.success() && text(&error).contains("OLDER_SNAPSHOT_ACK_REQUIRED"));
+    assert!(entries(&scene.root.join("plans")).is_empty());
+    let mut args_ack = args.to_vec();
+    args_ack.push("--acknowledge-older-snapshot");
+    let report = ctl_json(&scene, &args_ack);
+    let plan = &report["plan"];
+    assert_eq!(plan["format"], backup_domain::RESTORE_PLAN_V2);
+    assert_eq!(plan["rollback"]["acknowledged"], true);
+    assert_eq!(
+        plan["rollback"]["high_water"],
+        listed["rollback_warnings"][0]["high_water"]
+    );
+    let human = scene.run(&args_ack);
+    assert!(
+        human.status.success() && text(&human).contains("explicitly acknowledged in this plan")
+    );
+    conn.execute("DELETE FROM completion_high_water", [])
+        .unwrap();
+    let error = scene.run(&[
+        "restore",
+        "run",
+        plan["id"].as_str().unwrap(),
+        "--confirm-target",
+        target,
+    ]);
+    assert!(
+        !error.status.success() && text(&error).contains("OLDER_SNAPSHOT_REPLAN_REQUIRED"),
+        "{}",
+        text(&error)
+    );
+    let error = scene.run(&args_ack);
+    assert!(!error.status.success() && text(&error).contains("ACK_NOT_APPLICABLE"));
+    conn.execute("DELETE FROM completion_high_water", [])
+        .unwrap();
+    let unknown = ctl_json(&scene, &["backup", "list"]);
+    assert_eq!(unknown["rollback_warnings"], serde_json::json!([]));
+    assert_eq!(unknown["rollback_unknown"], serde_json::json!([id]));
+    let unknown = ctl_json(&scene, &args);
+    assert!(unknown["plan"]["rollback"]["high_water"].is_object());
+}
+
+#[test]
 fn confirmed_cli_run_and_repeated_receipt_preserve_json_contract_and_scope() {
     let scene = signed_retention_scene("b04-complete", 4);
     let preview = ctl_json(&scene, &["backup", "prune", "--keep-last", "2"]);

@@ -265,7 +265,7 @@ pub(crate) fn inventory(
                         "entries": entries,
                         "estate_provenance": "unconfirmed",
                         "unknown_facts": ["source_provenance", "profile_fingerprint", "completed_at_utc", "verification"],
-                        "lost_history": ["jobs", "audit", "protection", "verification"],
+                        "lost_history": ["jobs", "audit", "protection", "verification", "rollback"],
                         "audit_recorded": report.audit_recorded,
                         "previous_inventory": previous_inventory,
                         "rebuilt": confirm_rebuild,
@@ -274,7 +274,7 @@ pub(crate) fn inventory(
                 );
             } else {
                 println!(
-                    "source {source_fingerprint} is unconfirmed; rebuild loses job, audit, protection, and verification history"
+                    "source {source_fingerprint} is unconfirmed; rebuild loses job, audit, protection, verification, and local rollback history"
                 );
                 for entry in report.entries {
                     println!(

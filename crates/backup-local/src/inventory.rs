@@ -42,7 +42,7 @@ impl LocalStore {
             completed_at_utc: Some(manifest.completed_at_utc.clone()),
             state: State::Registered,
         };
-        inventory.register(&row).with_context(|| {
+        inventory.register_published(&row).with_context(|| {
             format!(
                 "backup {} is published and restorable; only its inventory row failed, so it is \
                  unregistered until a reconcile pass adopts it",

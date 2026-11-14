@@ -212,13 +212,20 @@ fn run() -> Result<()> {
                     target,
                     security,
                     sections,
+                    acknowledge_older_snapshot,
                 } => {
                     let policy = match security {
                         SecurityPreset::Dr => RestoreSecurityPolicy::dr_full(),
                         SecurityPreset::Portable => RestoreSecurityPolicy::portable(),
                     };
-                    let plan =
-                        service.plan(&config, id, &target, policy, sections_from(&sections))?;
+                    let plan = service.plan_with_acknowledgement(
+                        &config,
+                        id,
+                        &target,
+                        policy,
+                        sections_from(&sections),
+                        acknowledge_older_snapshot,
+                    )?;
                     if json {
                         println!(
                             "{}",

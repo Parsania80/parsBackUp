@@ -1,6 +1,6 @@
 # M5a inventory and recovery operating guide
 
-This guide covers the delivered inventory, job, verification and recovery CLI. The exact reports and failure categories are in the [inventory contract](m5a-inventory.md); artifact bytes remain governed by [artifact v1](../backup-format/manifest-v1.md). Current operations are restricted to synthetic local fixture databases. Production-source enablement, deletion execution, scheduling, packaging and API/UI release have later gates in [project.md](../../project.md).
+This guide covers the delivered inventory, job, verification and recovery CLI. The exact reports and failure categories are in the [inventory contract](m5a-inventory.md); artifact bytes remain governed by [artifact v1](../backup-format/manifest-v1.md). Current operations are restricted to synthetic local fixture databases. Production-source enablement, scheduling, packaging and API/UI release have later gates in [project.md](../../project.md).
 
 ## Choose a configuration and mode
 
@@ -18,7 +18,7 @@ Use absolute paths, source-major PostgreSQL clients, and a private operator-owne
 | `inventory rebuild --prepare-rebuild` / `--confirm-rebuild` | None | No | Saves a bound plan / installs a validated replacement and preserves any old index. |
 | `backup create` | Configured writer key files | Yes | Job and configured artifact shape; signed writes register inventory. Requires `--confirm-synthetic`. |
 | `backup list`, `backup inspect`, `backup verify` | Configured backup-reader key files | Archive verification invokes native tools; list/inspect/signature/checksum do not contact the server | Legacy store opening can create required directories; successful writable verification may record/enrich an existing row. |
-| `restore plan` / `restore run` | DR identity and trusted verifier; signing secret unnecessary | Yes | Private saved plan / restore job and fresh target. Run requires an existing bound index. |
+| `restore plan` / `restore run` | DR identity and trusted verifier; signing secret unnecessary | Yes | Private saved plan with authenticated local completion observation / restore job and fresh target. Planning may upgrade an existing index; run requires an existing bound index. |
 
 The backup-reader CLI currently loads configured key files during store opening even for signature-only verification or legacy `backup list`. Signature verification itself decrypts nothing. For observation with absent keys, use the `inventory` and `job` commands, not the legacy backup readers.
 
@@ -208,4 +208,28 @@ Deletion permanently removes the confirmed artifact files. It retains keyless to
 
 If execution exits 1 after starting a job, keep its JSON result: `completed`, `deleting` and `pending` partition the original candidates. A deleting ID is unusable even if its completion marker remains. Run `inventory recover` on the same intact store/plan/index; it uses no keys or PostgreSQL and finishes only previously started IDs after checking their evidence and remaining bytes. The existing real-create maintenance pass can do the same. A busy store refuses maintenance. Missing/changed plan evidence or unexpected remaining files fail closed; preserve them for investigation rather than manually restoring a marker or deleting the index.
 
-Recovery never starts pending IDs or turns an original failed/interrupted job into a successful one. Obtain and review a new preview for pending intact backups. Ordinary list/inspect/open calls do not recover anything, and reconcile/adopt cannot revive tombstones. Rebuild of a readable deleting index refuses until recovery. A lost-history rebuild cannot recover old tombstones or protection: its unknown facts still cannot authorize retention. B05 rollback warnings and B06's full destructive acceptance drill remain separate gates; the production CLI is not finished.
+Recovery never starts pending IDs or turns an original failed/interrupted job into a successful one. Obtain and review a new preview for pending intact backups. Ordinary list/inspect/open calls do not recover anything, and reconcile/adopt cannot revive tombstones. Rebuild of a readable deleting index refuses until recovery. A lost-history rebuild cannot recover old tombstones or protection: its unknown facts still cannot authorize retention. B05 rollback warnings are described below; B06's full destructive acceptance drill remains before retention closes, and the production CLI is not finished.
+
+## Review older-snapshot warnings
+
+B05 records the newest authenticated completion seen locally for each source fingerprint and signer ID, across all profiles. Signed publication, successful writable checksum/archive verification of registered backups, and restore planning can advance this record. Equal completion times are ties. This record survives deletion of its newest artifact: removing that file does not make older copies newest again. It is separate from retention's per-profile validity and protection rules.
+
+```sh
+backupctl --config /absolute/path/to/dr.toml --output json backup list
+backupctl --config /absolute/path/to/dr.toml restore plan BACKUP_UUID --target backupctl_fixture_dr --security portable
+```
+
+Signed listing adds `rollback_warnings` and `rollback_unknown` to its existing `signed` and `unsigned` arrays. Warnings name the selected ID/time and the newer recorded ID/time. They use matching local inventory facts; listing still performs no fresh signature or archive validation. An ID in `rollback_unknown` has insufficient local history, including after migration or rebuild. Empty warnings alone do not prove freshness, validity or recoverability. List, inspect, read-only verification and retention preview never advance the record.
+
+When planning refuses with `OLDER_SNAPSHOT_ACK_REQUIRED`, review whether that older snapshot is the one you intend to restore. If it is, explicitly create a new plan:
+
+```sh
+backupctl --config /absolute/path/to/dr.toml --output json restore plan BACKUP_UUID --target backupctl_fixture_dr --security portable --acknowledge-older-snapshot
+backupctl --config /absolute/path/to/dr.toml restore run PLAN_UUID --confirm-target backupctl_fixture_dr
+```
+
+New signed plans use `m5b-restore-plan-v2`. Their digest binds the selected ciphertexts, authenticated source/signer/completion, the nullable local high-water record and the acknowledgement. Acknowledgement applies to that exact warning. The flag refuses with `OLDER_SNAPSHOT_ACK_NOT_APPLICABLE` when no older snapshot is known; do not add it unconditionally. Development plans keep their original format and digest. Older signed plans remain readable but cannot authorize an older-snapshot restore; recreate them with the warning bound explicitly.
+
+`OLDER_SNAPSHOT_REPLAN_REQUIRED` means selected authenticated bytes or local warning context changed, including a newer observation or lost/rebuilt ledger. Create and review a new plan. Execution rechecks before PostgreSQL mutation; a refusal can leave a failed restore-job record, but does not create a target or apply globals for that refused attempt. Concurrent observations after a check remain possible; this is a local point-in-time warning.
+
+Migration starts with unknown history instead of guessing from old rows. Explicit rebuild reports `rollback` among `lost_history` and cannot recover a lost newer observation; later authentication establishes only what the host sees again. Missing inventory stays missing during planning, with `rollback.high_water: null`; restore execution still requires an explicit inventory rebuild. A null high-water is unknown history. This ledger is in the store's failure domain: replacing both files and inventory can erase the warning, so T03 and off-host replay protection remain open.

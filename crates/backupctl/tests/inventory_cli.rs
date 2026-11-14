@@ -866,7 +866,7 @@ fn protection_refuses_malformed_inventory_rows_before_changing_anything() {
 fn protection_upgrades_v5_only_for_a_valid_request_and_rolls_back_failed_audit() {
     let (scene, id) = protection_scene();
     let conn = rusqlite::Connection::open(scene.inventory()).unwrap();
-    conn.execute_batch("ALTER TABLE artifact DROP COLUMN protected; DROP TABLE job_artifact; DROP TABLE deletion_job; PRAGMA user_version=5;")
+    conn.execute_batch("ALTER TABLE artifact DROP COLUMN protected; DROP TABLE completion_high_water; DROP TABLE job_artifact; DROP TABLE deletion_job; PRAGMA user_version=5;")
         .unwrap();
     drop(conn);
     let old = fs::read(scene.inventory()).unwrap();

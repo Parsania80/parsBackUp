@@ -344,6 +344,18 @@ pub(crate) fn print_inventory(inventory: &Inventory) {
             for id in &listing.unsigned {
                 println!("{id}  unsigned development artifact; no record without keys");
             }
+            for warning in &listing.rollback_warnings {
+                println!(
+                    "WARNING: older snapshot {} completed at {}; local history saw {} at {} (local accident warning only)",
+                    warning.artifact_id,
+                    warning.completed_at_utc,
+                    warning.high_water.artifact_id,
+                    warning.high_water.completed_at_utc
+                );
+            }
+            for id in &listing.rollback_unknown {
+                println!("{id}: local rollback history unknown");
+            }
             if listing.signed.is_empty() && listing.unsigned.is_empty() {
                 println!("no artifacts");
             }
@@ -385,6 +397,18 @@ pub(crate) fn print_plan(plan: &RestorePlan) {
         println!("backup profile scope: {profile}");
     }
     println!("target: {} (new database)", plan.target_database);
+    if let Some(binding) = &plan.rollback {
+        if let Some(mark) = &binding.high_water {
+            if binding.is_older() {
+                println!(
+                    "WARNING: older snapshot completed at {}; local history saw {} at {}; explicitly acknowledged in this plan",
+                    binding.completed_at_utc, mark.artifact_id, mark.completed_at_utc
+                );
+            }
+        } else {
+            println!("local rollback history unknown; no independent replay protection");
+        }
+    }
     println!(
         "security: roles={} ownership={} privileges={}",
         plan.security.roles, plan.security.ownership, plan.security.privileges

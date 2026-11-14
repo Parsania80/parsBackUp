@@ -15,6 +15,7 @@ mod inventory;
 mod keys;
 mod reconcile;
 mod retention;
+mod rollback;
 mod scratch;
 mod stage;
 mod store;
@@ -881,6 +882,8 @@ impl ArtifactStore for LocalStore {
         let mut listing = StoreListing {
             signed: Vec::new(),
             unsigned: Vec::new(),
+            rollback_warnings: Vec::new(),
+            rollback_unknown: Vec::new(),
         };
         for entry in fs::read_dir(self.root.join(ARTIFACTS_DIR))? {
             let path = entry?.path();
@@ -905,7 +908,22 @@ impl ArtifactStore for LocalStore {
         }
         listing.signed.sort_by_key(|header| header.backup_id);
         listing.unsigned.sort();
+        self.list_rollback(&mut listing)?;
         Ok(listing)
+    }
+
+    fn completion_mark(
+        &self,
+        artifact: &SignedArtifact,
+    ) -> Result<Option<backup_domain::CompletionMark>> {
+        self.read_completion(artifact)
+    }
+
+    fn observe_completion(
+        &self,
+        artifact: &SignedArtifact,
+    ) -> Result<Option<backup_domain::CompletionMark>> {
+        self.record_completion(artifact)
     }
 
     /// The reader's first three steps and no further: parse `public.json`, recompute both
@@ -1630,6 +1648,7 @@ mod tests {
             artifact_scope: None,
             created_unix_ms: now,
             expires_unix_ms: now + 900_000,
+            rollback: None,
         };
         store.save_plan(&plan).unwrap();
         let loaded = store.load_plan(plan.id).unwrap().unwrap();

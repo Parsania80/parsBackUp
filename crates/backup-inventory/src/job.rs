@@ -117,6 +117,7 @@ pub enum AuditAction {
     ArtifactUnprotected,
     ArtifactDeleting,
     ArtifactDeleted,
+    CompletionAdvanced,
 }
 
 impl AuditAction {
@@ -137,6 +138,7 @@ impl AuditAction {
             AuditAction::ArtifactUnprotected => "artifact_unprotected",
             AuditAction::ArtifactDeleting => "artifact_deleting",
             AuditAction::ArtifactDeleted => "artifact_deleted",
+            AuditAction::CompletionAdvanced => "completion_advanced",
         }
     }
 
@@ -157,6 +159,7 @@ impl AuditAction {
             "artifact_unprotected" => Ok(AuditAction::ArtifactUnprotected),
             "artifact_deleting" => Ok(AuditAction::ArtifactDeleting),
             "artifact_deleted" => Ok(AuditAction::ArtifactDeleted),
+            "completion_advanced" => Ok(AuditAction::CompletionAdvanced),
             other => bail!("inventory holds audit action {other:?}, which this build cannot write"),
         }
     }

@@ -210,6 +210,8 @@ pub trait SignedArtifactHandle {
 pub struct StoreListing {
     pub signed: Vec<PublicHeader>,
     pub unsigned: Vec<Uuid>,
+    pub rollback_warnings: Vec<backup_domain::RollbackWarning>,
+    pub rollback_unknown: Vec<Uuid>,
 }
 
 /// The key facts a v1 manifest must record, computed by the store from its own key files.
@@ -314,6 +316,15 @@ pub trait ArtifactStore {
 
     /// Discovery from `public.json` alone, with no key material and nothing decrypted.
     fn list_signed(&self) -> Result<StoreListing>;
+
+    fn completion_mark(
+        &self,
+        artifact: &Self::Signed,
+    ) -> Result<Option<backup_domain::CompletionMark>>;
+    fn observe_completion(
+        &self,
+        artifact: &Self::Signed,
+    ) -> Result<Option<backup_domain::CompletionMark>>;
 
     /// An authenticated payload as plaintext, decrypted into private storage.
     fn payload_plaintext(&self, artifact: &Self::Signed) -> Result<Self::Plaintext>;
@@ -1029,9 +1040,58 @@ pub struct RestoreOutcome {
     pub recorded_in_artifact: bool,
 }
 
+fn rollback_binding(
+    manifest: &ArtifactManifest,
+    header: &PublicHeader,
+    high_water: Option<backup_domain::CompletionMark>,
+) -> backup_domain::RollbackBinding {
+    backup_domain::RollbackBinding {
+        source_fingerprint: manifest.source_fingerprint.clone(),
+        signer_id: manifest.signer_id.clone(),
+        completed_at_utc: manifest.completed_at_utc.clone(),
+        payload_sha256: manifest.payload_ciphertext_sha256.clone(),
+        manifest_sha256: header.manifest_sha256.clone(),
+        high_water,
+        acknowledged: false,
+    }
+}
+
+fn ensure_acknowledgement(older: bool, acknowledged: bool) -> Result<()> {
+    if acknowledged && !older {
+        bail!("OLDER_SNAPSHOT_ACK_NOT_APPLICABLE: no older-snapshot warning to acknowledge");
+    }
+    Ok(())
+}
+
 impl<E: DatabaseAdapter, S: ArtifactStore> RestoreService<E, S> {
     pub fn new(engine: E, store: S) -> Self {
         Self { engine, store }
+    }
+
+    fn check_rollback(&self, artifact: &Opened<S>, plan: &RestorePlan) -> Result<()> {
+        match artifact {
+            Opened::Development(_) => {
+                if plan.rollback.is_some() {
+                    bail!("signed restore plan requires a signed artifact");
+                }
+            }
+            Opened::Signed(signed) => {
+                let mut current = rollback_binding(
+                    signed.manifest(),
+                    signed.header(),
+                    self.store.completion_mark(signed)?,
+                );
+                current.acknowledged = current.is_older();
+                match &plan.rollback {
+                    Some(bound) if *bound == current => {}
+                    None if !current.is_older() => {}
+                    _ => bail!(
+                        "OLDER_SNAPSHOT_REPLAN_REQUIRED: authenticated snapshot or local warning changed; create a new restore plan and explicitly acknowledge any older snapshot"
+                    ),
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Refuses an artifact whose signed manifest was written for a different source than the
@@ -1061,6 +1121,18 @@ impl<E: DatabaseAdapter, S: ArtifactStore> RestoreService<E, S> {
         target: &str,
         security: RestoreSecurityPolicy,
         sections: RestoreSections,
+    ) -> Result<RestorePlan> {
+        self.plan_with_acknowledgement(config, artifact_id, target, security, sections, false)
+    }
+
+    pub fn plan_with_acknowledgement(
+        &self,
+        config: &Config,
+        artifact_id: Uuid,
+        target: &str,
+        security: RestoreSecurityPolicy,
+        sections: RestoreSections,
+        acknowledge_older_snapshot: bool,
     ) -> Result<RestorePlan> {
         config.validate()?;
         sections.validate()?;
@@ -1102,8 +1174,35 @@ impl<E: DatabaseAdapter, S: ArtifactStore> RestoreService<E, S> {
             }
         }
         let created = now_unix_ms()?;
+        let rollback = match &artifact {
+            Opened::Signed(signed) => {
+                let high_water = self.store.observe_completion(signed)?;
+                let mut binding = rollback_binding(signed.manifest(), signed.header(), high_water);
+                if binding.is_older() && !acknowledge_older_snapshot {
+                    bail!(
+                        "OLDER_SNAPSHOT_ACK_REQUIRED: selected snapshot {} completed at {}, older than {} at {}; create a new plan with --acknowledge-older-snapshot (local history only)",
+                        artifact_id,
+                        binding.completed_at_utc,
+                        binding.high_water.as_ref().unwrap().artifact_id,
+                        binding.high_water.as_ref().unwrap().completed_at_utc
+                    );
+                }
+                ensure_acknowledgement(binding.is_older(), acknowledge_older_snapshot)?;
+                binding.acknowledged = acknowledge_older_snapshot;
+                Some(binding)
+            }
+            Opened::Development(_) => {
+                ensure_acknowledgement(false, acknowledge_older_snapshot)?;
+                None
+            }
+        };
         let plan = RestorePlan {
-            format: backup_domain::PLAN_FORMAT.to_string(),
+            format: if rollback.is_some() {
+                backup_domain::RESTORE_PLAN_V2
+            } else {
+                backup_domain::PLAN_FORMAT
+            }
+            .to_string(),
             id: Uuid::new_v4(),
             artifact_id,
             artifact_database: facts.database.clone(),
@@ -1114,7 +1213,10 @@ impl<E: DatabaseAdapter, S: ArtifactStore> RestoreService<E, S> {
             sections,
             artifact_scope: facts.profile.clone(),
             created_unix_ms: created,
-            expires_unix_ms: created + PLAN_TTL.as_millis(),
+            expires_unix_ms: created
+                .checked_add(PLAN_TTL.as_millis())
+                .context("restore plan expiry overflow")?,
+            rollback,
         };
         plan.validate(now_unix_ms()?)?;
         self.store.save_plan(&plan)?;
@@ -1156,6 +1258,7 @@ impl<E: DatabaseAdapter, S: ArtifactStore> RestoreService<E, S> {
         // Re-bound here as well: a plan is a claim about a file that another process may
         // have swapped out while it sat in the store.
         Self::check_source(config, &facts, info.source_major)?;
+        self.check_rollback(&artifact, &plan)?;
         if self
             .engine
             .database_exists(&config.source, &plan.target_database, timeout)?
@@ -1179,6 +1282,7 @@ impl<E: DatabaseAdapter, S: ArtifactStore> RestoreService<E, S> {
             }
             // Step 2: roles, attributes, and memberships before any object
             // can be owned by or granted to them.
+            self.check_rollback(&artifact, &plan)?;
             self.engine
                 .apply_globals(&config.source, globals.path(), timeout)
                 .context("globals restore failed; cluster roles may be partially applied")?;
@@ -1189,6 +1293,9 @@ impl<E: DatabaseAdapter, S: ArtifactStore> RestoreService<E, S> {
             .database_exists(&config.source, &plan.target_database, timeout)?
         {
             bail!("target database appeared after planning; refusing to touch it");
+        }
+        if !plan.security.roles {
+            self.check_rollback(&artifact, &plan)?;
         }
         self.engine
             .create_database(&config.source, &plan.target_database, timeout)

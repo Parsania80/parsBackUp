@@ -14,6 +14,7 @@ mod config;
 mod profile;
 mod restore;
 mod retention;
+mod rollback;
 mod selection;
 mod utc;
 
@@ -33,6 +34,7 @@ pub use retention::{
     RetentionMember, RetentionOperation, RetentionRequest, RetentionSelection, SavedDeletionPlan,
     select_retention,
 };
+pub use rollback::{CompletionMark, RESTORE_PLAN_V2, RollbackBinding, RollbackWarning};
 pub use selection::{DanglingReference, DumpOptions, ResolvedSelection};
 pub use utc::{format_utc, is_utc_timestamp};
 

@@ -121,12 +121,19 @@ pub struct RestorePlan {
     pub artifact_scope: Option<String>,
     pub created_unix_ms: u128,
     pub expires_unix_ms: u128,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rollback: Option<crate::RollbackBinding>,
 }
 
 impl RestorePlan {
     pub fn validate(&self, now_unix_ms: u128) -> Result<()> {
-        if self.format != PLAN_FORMAT {
+        if self.format != PLAN_FORMAT && self.format != crate::RESTORE_PLAN_V2 {
             bail!("unrecognized restore plan format");
+        }
+        match (&self.rollback, self.format.as_str()) {
+            (None, PLAN_FORMAT) => {}
+            (Some(binding), crate::RESTORE_PLAN_V2) => binding.validate()?,
+            _ => bail!("restore plan version does not match its rollback binding"),
         }
         if !self.target_database.starts_with(FIXTURE_PREFIX) {
             bail!("restore target must be a synthetic fixture database");
@@ -141,6 +148,15 @@ impl RestorePlan {
         self.sections.check_security(&self.security)?;
         if now_unix_ms >= self.expires_unix_ms {
             bail!("restore plan has expired; create a new plan");
+        }
+        if self.format == crate::RESTORE_PLAN_V2
+            && (now_unix_ms < self.created_unix_ms
+                || self
+                    .created_unix_ms
+                    .checked_add(u128::from(crate::PLAN_TTL_SECONDS) * 1000)
+                    != Some(self.expires_unix_ms))
+        {
+            bail!("invalid restore plan time window");
         }
         Ok(())
     }
@@ -161,6 +177,82 @@ impl RestorePlan {
 mod tests {
     use super::*;
     use crate::fixture;
+
+    #[test]
+    fn legacy_plan_bytes_and_digest_remain_compatible() {
+        let bytes = br#"{"format":"m3-restore-plan","id":"11111111-1111-4111-8111-111111111111","artifact_id":"22222222-2222-4222-8222-222222222222","artifact_database":"backupctl_fixture_m1","source_major":16,"client_version":"pg_restore (PostgreSQL) 16.4","target_database":"backupctl_fixture_dr","security":{"roles":false,"ownership":false,"privileges":false},"sections":{"pre_data":true,"data":true,"post_data":true},"artifact_scope":null,"created_unix_ms":1000,"expires_unix_ms":2000}"#;
+        let plan: RestorePlan = serde_json::from_slice(bytes).unwrap();
+        assert!(plan.rollback.is_none());
+        assert_eq!(serde_json::to_vec(&plan).unwrap(), bytes);
+        assert_eq!(plan.digest(), format!("{:x}", sha2::Sha256::digest(bytes)));
+    }
+
+    #[test]
+    fn version_two_binds_acknowledgement_history_bytes_and_time() {
+        let mut plan = fixture::plan("backupctl_fixture_dr", RestoreSecurityPolicy::portable());
+        plan.format = crate::RESTORE_PLAN_V2.to_string();
+        plan.expires_unix_ms = plan.created_unix_ms + 900_000;
+        plan.rollback = Some(crate::RollbackBinding {
+            source_fingerprint: "a".repeat(16),
+            signer_id: "b".repeat(16),
+            completed_at_utc: "2026-11-01T00:00:00Z".into(),
+            payload_sha256: "c".repeat(64),
+            manifest_sha256: "d".repeat(64),
+            high_water: Some(crate::CompletionMark {
+                artifact_id: Uuid::new_v4(),
+                completed_at_utc: "2026-11-02T00:00:00Z".into(),
+            }),
+            acknowledged: true,
+        });
+        plan.validate(1500).unwrap();
+        let digest = plan.digest();
+        let mut edited = plan.clone();
+        edited.rollback.as_mut().unwrap().acknowledged = false;
+        assert_ne!(edited.digest(), digest);
+        assert!(edited.validate(1500).is_err());
+        for key in [
+            "source_fingerprint",
+            "signer_id",
+            "completed_at_utc",
+            "payload_sha256",
+            "manifest_sha256",
+        ] {
+            let mut value = serde_json::to_value(&plan).unwrap();
+            value["rollback"][key] = serde_json::json!("bad");
+            let edited: RestorePlan = serde_json::from_value(value).unwrap();
+            assert_ne!(edited.digest(), digest);
+            assert!(edited.validate(1500).is_err());
+        }
+        for key in ["high_water", "acknowledged"] {
+            let mut value = serde_json::to_value(&plan).unwrap();
+            value["rollback"].as_object_mut().unwrap().remove(key);
+            assert!(serde_json::from_value::<RestorePlan>(value).is_err());
+        }
+        let mut value = serde_json::to_value(&plan).unwrap();
+        value["rollback"]["extra"] = serde_json::json!(0);
+        assert!(serde_json::from_value::<RestorePlan>(value).is_err());
+        assert!(plan.validate(999).is_err());
+        assert!(plan.validate(plan.expires_unix_ms).is_err());
+        edited = plan.clone();
+        edited.expires_unix_ms += 1;
+        assert!(edited.validate(1500).is_err());
+        edited = plan.clone();
+        edited.format = PLAN_FORMAT.into();
+        assert!(edited.validate(1500).is_err());
+        edited = plan.clone();
+        edited.rollback = None;
+        assert!(edited.validate(1500).is_err());
+        let duplicate = serde_json::to_string(&plan).unwrap().replace(
+            "\"acknowledged\":true",
+            "\"acknowledged\":true,\"acknowledged\":true",
+        );
+        assert!(serde_json::from_str::<RestorePlan>(&duplicate).is_err());
+        let binding = plan.rollback.as_mut().unwrap();
+        binding.high_water.as_mut().unwrap().completed_at_utc = binding.completed_at_utc.clone();
+        assert!(plan.validate(1500).is_err());
+        plan.rollback.as_mut().unwrap().acknowledged = false;
+        plan.validate(1500).unwrap();
+    }
 
     #[test]
     fn plan_digest_binds_security_policy_and_target() {

@@ -905,7 +905,11 @@ PY
     mv "$test_root/verifying.key.out" "$test_root/keys/gen1/verifying.key"
 
     first_digest=$(dir_state "$first_dir")
+    rejects "older snapshot without explicit acknowledgement" dctl restore plan "$first" \
+        --target "$dr_db" --security dr
+    grep -q "OLDER_SNAPSHOT_ACK_REQUIRED" "$test_root/reject.out"
     dctl restore plan "$first" --target "$dr_db" --security dr --output json \
+        --acknowledge-older-snapshot \
         > "$test_root/plan.json"
     python3 - "$test_root/plan.json" "$fixture_db" "$major" <<'PY'
 import json

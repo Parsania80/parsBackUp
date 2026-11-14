@@ -10,7 +10,8 @@
 mod common;
 
 use backup_application::{
-    BackupService, Created, Inventory, Record, RestoreService, VerifyService,
+    ArtifactStore, BackupService, Created, Inventory, Record, RestoreService, VerifyService,
+    WriteOptions,
 };
 use backup_crypto::protocol::{HYBRID_SIGNATURE_BYTES, SUITE_HYBRID};
 use backup_domain::{
@@ -36,6 +37,288 @@ use uuid::Uuid;
 
 const SOURCE_DATABASE: &str = "backupctl_fixture_m4b";
 const DR_TARGET: &str = "backupctl_fixture_m4b_dr";
+
+fn rebuild_fixture(fixture: &Fixture) {
+    let scanner = backup_local::LocalReconciler(fixture.store_root.clone());
+    let (id, _) = scanner
+        .prepare_rebuild(&fixture.manifest.source_fingerprint)
+        .unwrap();
+    scanner
+        .rebuild(&fixture.manifest.source_fingerprint, id)
+        .unwrap();
+}
+
+fn publish_at(fixture: &Fixture, time: &str, profile: &str) -> Uuid {
+    let store = fixture.writer();
+    let id = Uuid::new_v4();
+    let globals = fixture.manifest.globals_sha256.is_some();
+    let stage = store
+        .begin(
+            id,
+            &WriteOptions {
+                with_globals: globals,
+            },
+        )
+        .unwrap();
+    let mut sink = store.payload_sink(&stage).unwrap();
+    std::io::Write::write_all(&mut sink, &archive_bytes()).unwrap();
+    sink.finish().unwrap();
+    drop(sink);
+    let mut manifest = fixture.manifest.clone();
+    manifest.backup_id = id;
+    manifest.started_at_utc = time.to_owned();
+    manifest.completed_at_utc = time.to_owned();
+    manifest.profile_snapshot.name = profile.to_owned();
+    (
+        manifest.payload_ciphertext_bytes,
+        manifest.payload_ciphertext_sha256,
+    ) = store.measure(&stage).unwrap();
+    if globals {
+        let mut sink = store.globals_sink(&stage).unwrap();
+        std::io::Write::write_all(&mut sink, GLOBALS_MARKER).unwrap();
+        sink.finish().unwrap();
+        drop(sink);
+        let (size, hash) = store.measure_globals(&stage).unwrap();
+        manifest.globals_ciphertext_bytes = Some(size);
+        manifest.globals_sha256 = Some(hash);
+    }
+    store.publish_signed(stage, &manifest).unwrap();
+    id
+}
+
+#[test]
+fn rollback_publication_is_cross_profile_monotone_and_listing_borrows_only_matching_facts() {
+    let capture = Capture::default();
+    let fixture = write_signed(&capture);
+    let old = publish_at(&fixture, "2099-01-01T00:00:00Z", WHOLE_DATABASE_PROFILE);
+    let newest = publish_at(&fixture, "2099-01-02T00:00:00Z", "different-profile");
+    let tie = publish_at(&fixture, "2099-01-02T00:00:00Z", WHOLE_DATABASE_PROFILE);
+    let store = fixture.reader();
+    let handle = store.open_signed(old).unwrap();
+    let mark = store.completion_mark(&handle).unwrap().unwrap();
+    assert_eq!(mark.artifact_id, newest);
+    let before = fs::read(fixture.store_root.join(INVENTORY_FILE)).unwrap();
+    let artifacts = files_under(&fixture.store_root.join("artifacts"))
+        .into_iter()
+        .map(|p| (p.clone(), fs::read(p).unwrap()))
+        .collect::<Vec<_>>();
+    let listing = store.list_signed().unwrap();
+    assert!(
+        listing
+            .rollback_warnings
+            .iter()
+            .any(|w| w.artifact_id == old && w.high_water == mark)
+    );
+    assert!(
+        !listing
+            .rollback_warnings
+            .iter()
+            .any(|w| w.artifact_id == tie || w.artifact_id == newest)
+    );
+    assert!(listing.rollback_unknown.is_empty());
+    assert_eq!(
+        fs::read(fixture.store_root.join(INVENTORY_FILE)).unwrap(),
+        before
+    );
+    assert_eq!(
+        artifacts,
+        files_under(&fixture.store_root.join("artifacts"))
+            .into_iter()
+            .map(|p| (p.clone(), fs::read(p).unwrap()))
+            .collect::<Vec<_>>()
+    );
+    let public = artifact_dir(&fixture.store_root, old).join("public.json");
+    let mut header: PublicHeader = serde_json::from_slice(&fs::read(&public).unwrap()).unwrap();
+    header.payload_sha256 = "a".repeat(64);
+    fs::write(public, serde_json::to_vec(&header).unwrap()).unwrap();
+    let listing = store.list_signed().unwrap();
+    assert!(listing.rollback_unknown.contains(&old));
+    assert!(
+        !listing
+            .rollback_warnings
+            .iter()
+            .any(|w| w.artifact_id == old)
+    );
+    drop(handle);
+    fixture.remove();
+}
+
+#[test]
+fn restore_older_acknowledgement_is_bound_and_changed_or_lost_history_refuses_before_mutation() {
+    let capture = Capture::default();
+    let fixture = write_signed(&capture);
+    let old = publish_at(&fixture, "2099-01-01T00:00:00Z", WHOLE_DATABASE_PROFILE);
+    let newest = publish_at(&fixture, "2099-01-02T00:00:00Z", WHOLE_DATABASE_PROFILE);
+    let service = RestoreService::new(StubEngine { capture: &capture }, fixture.reader());
+    let plans = files_under(&fixture.store_root.join("plans"));
+    assert!(
+        failure(service.plan(
+            &fixture.config,
+            old,
+            DR_TARGET,
+            RestoreSecurityPolicy::dr_full(),
+            RestoreSections::full()
+        ))
+        .contains("OLDER_SNAPSHOT_ACK_REQUIRED")
+    );
+    assert_eq!(plans, files_under(&fixture.store_root.join("plans")));
+    assert!(capture.created().is_empty());
+    assert_eq!(capture.globals_applied.get(), 0);
+    assert!(
+        failure(service.plan_with_acknowledgement(
+            &fixture.config,
+            newest,
+            DR_TARGET,
+            RestoreSecurityPolicy::portable(),
+            RestoreSections::full(),
+            true
+        ))
+        .contains("ACK_NOT_APPLICABLE")
+    );
+    let plan = service
+        .plan_with_acknowledgement(
+            &fixture.config,
+            old,
+            DR_TARGET,
+            RestoreSecurityPolicy::dr_full(),
+            RestoreSections::full(),
+            true,
+        )
+        .unwrap();
+    assert_eq!(plan.format, backup_domain::RESTORE_PLAN_V2);
+    assert!(plan.rollback.as_ref().unwrap().acknowledged);
+    let immutable = snapshot(&artifact_dir(&fixture.store_root, old));
+    service.run(&fixture.config, plan.id, DR_TARGET).unwrap();
+    assert_eq!(capture.created(), [DR_TARGET]);
+    assert_eq!(snapshot(&artifact_dir(&fixture.store_root, old)), immutable);
+
+    let fresh_capture = Capture::default();
+    let service = RestoreService::new(
+        StubEngine {
+            capture: &fresh_capture,
+        },
+        fixture.reader(),
+    );
+    let mut legacy = plan.clone();
+    legacy.id = Uuid::new_v4();
+    legacy.format = backup_domain::PLAN_FORMAT.into();
+    legacy.rollback = None;
+    fixture.reader().save_plan(&legacy).unwrap();
+    assert!(
+        failure(service.run(&fixture.config, legacy.id, DR_TARGET))
+            .contains("OLDER_SNAPSHOT_REPLAN_REQUIRED")
+    );
+    publish_at(&fixture, "2099-01-03T00:00:00Z", WHOLE_DATABASE_PROFILE);
+    assert!(
+        failure(service.run(&fixture.config, plan.id, DR_TARGET))
+            .contains("OLDER_SNAPSHOT_REPLAN_REQUIRED")
+    );
+    assert!(fresh_capture.created().is_empty());
+    assert_eq!(fresh_capture.globals_applied.get(), 0);
+    let acknowledged = service
+        .plan_with_acknowledgement(
+            &fixture.config,
+            old,
+            DR_TARGET,
+            RestoreSecurityPolicy::dr_full(),
+            RestoreSections::full(),
+            true,
+        )
+        .unwrap();
+    rebuild_fixture(&fixture);
+    assert!(
+        failure(service.run(&fixture.config, acknowledged.id, DR_TARGET))
+            .contains("OLDER_SNAPSHOT_REPLAN_REQUIRED")
+    );
+    assert!(fresh_capture.created().is_empty());
+    assert_eq!(fresh_capture.globals_applied.get(), 0);
+    fixture.remove();
+}
+
+#[test]
+fn rollback_observation_requires_writable_private_authentication_and_rebuild_loses_history() {
+    let capture = Capture::default();
+    let fixture = write_signed(&capture);
+    let store = fixture.reader();
+    let index = fixture.store_root.join(INVENTORY_FILE);
+    rebuild_fixture(&fixture);
+    let before = fs::read(&index).unwrap();
+    store.list_signed().unwrap();
+    store.open_signed(fixture.id).unwrap();
+    let verify = VerifyService::new(StubEngine { capture: &capture }, fixture.reader());
+    verify
+        .verify_read_only(&fixture.config, fixture.id, VERIFY_CHECKSUM)
+        .unwrap();
+    assert_eq!(fs::read(&index).unwrap(), before);
+    verify
+        .verify(&fixture.config, fixture.id, VERIFY_SIGNATURE)
+        .unwrap();
+    let artifact = store.open_signed(fixture.id).unwrap();
+    assert!(store.completion_mark(&artifact).unwrap().is_none());
+    verify
+        .verify(&fixture.config, fixture.id, VERIFY_CHECKSUM)
+        .unwrap();
+    assert_eq!(
+        store
+            .completion_mark(&artifact)
+            .unwrap()
+            .unwrap()
+            .artifact_id,
+        fixture.id
+    );
+    drop(artifact);
+    rebuild_fixture(&fixture);
+    let service = RestoreService::new(StubEngine { capture: &capture }, fixture.reader());
+    let current_plan = service
+        .plan(
+            &fixture.config,
+            fixture.id,
+            DR_TARGET,
+            RestoreSecurityPolicy::portable(),
+            RestoreSections::full(),
+        )
+        .unwrap();
+    let mut legacy = current_plan.clone();
+    legacy.id = Uuid::new_v4();
+    legacy.format = backup_domain::PLAN_FORMAT.into();
+    legacy.rollback = None;
+    store.save_plan(&legacy).unwrap();
+    service.run(&fixture.config, legacy.id, DR_TARGET).unwrap();
+    assert!(
+        store
+            .completion_mark(&store.open_signed(fixture.id).unwrap())
+            .unwrap()
+            .is_some()
+    );
+    let scanner = backup_local::LocalReconciler(fixture.store_root.clone());
+    let (plan, _) = scanner
+        .prepare_rebuild(&fixture.manifest.source_fingerprint)
+        .unwrap();
+    scanner
+        .rebuild(&fixture.manifest.source_fingerprint, plan)
+        .unwrap();
+    let listing = store.list_signed().unwrap();
+    assert_eq!(listing.rollback_unknown, [fixture.id]);
+    assert!(
+        store
+            .completion_mark(&store.open_signed(fixture.id).unwrap())
+            .unwrap()
+            .is_none()
+    );
+    fs::remove_file(&index).unwrap();
+    let plan = service
+        .plan(
+            &fixture.config,
+            fixture.id,
+            DR_TARGET,
+            RestoreSecurityPolicy::portable(),
+            RestoreSections::full(),
+        )
+        .unwrap();
+    assert!(plan.rollback.unwrap().high_water.is_none());
+    assert!(!index.exists());
+    fixture.remove();
+}
 
 /// One v1 artifact written by the stub dump, with everything a test needs to talk back to it.
 struct Fixture {
@@ -758,11 +1041,15 @@ fn a_signed_backup_records_a_finished_job_and_the_trail_that_shows_how() {
             // Registration is part of publication, so the artifact is in the index before the
             // operation that wrote it reports itself finished.
             AuditAction::ArtifactRegistered,
+            AuditAction::CompletionAdvanced,
             AuditAction::JobCompleted,
         ]
     );
     for event in &events {
-        if event.action == AuditAction::ArtifactRegistered {
+        if matches!(
+            event.action,
+            AuditAction::ArtifactRegistered | AuditAction::CompletionAdvanced
+        ) {
             // The publish path holds no job of its own; the link is the artifact id.
             assert_eq!(event.job_id, None);
             assert_eq!(event.backup_id, Some(fixture.id));
@@ -1059,6 +1346,14 @@ fn restore_refusals_precede_cluster_mutation() {
     use backup_application::ArtifactStore;
     assert!(fixture.reader().open_signed(fixture.id).is_ok());
     let error = failure(service.run(&fixture.config, plan.id, DR_TARGET));
+    assert!(error.contains("OLDER_SNAPSHOT_REPLAN_REQUIRED"), "{error}");
+    // A pre-B05 plan has no ciphertext binding; it must still reach and enforce R05.
+    let mut legacy = plan.clone();
+    legacy.id = Uuid::new_v4();
+    legacy.format = backup_domain::PLAN_FORMAT.into();
+    legacy.rollback = None;
+    fixture.reader().save_plan(&legacy).unwrap();
+    let error = failure(service.run(&fixture.config, legacy.id, DR_TARGET));
     assert!(error.contains("failed to decrypt completely"), "{error}");
     assert_eq!(capture.globals_applied.get(), 0);
     assert!(capture.created().is_empty());

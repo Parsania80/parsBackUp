@@ -972,3 +972,53 @@ fn open_deletion_jobs_pin_their_whole_exact_set_and_unknown_evidence_blocks_plan
         preview.candidates
     );
 }
+
+#[test]
+fn deleting_the_high_water_artifact_keeps_the_local_history_and_remaining_warnings() {
+    use backup_application::ArtifactStore;
+    let scene = Scene::new(3);
+    let rows = scene.inventory().artifacts().unwrap();
+    let source = &rows[0].source_fingerprint;
+    let signer = rows[0].signer_id.as_deref().unwrap();
+    let mark = scene
+        .inventory()
+        .completion_mark(source, signer)
+        .unwrap()
+        .unwrap();
+    let planner = scene.planner();
+    let preview = planner
+        .preview(&RetentionRequest::Delete {
+            backup_id: mark.artifact_id,
+        })
+        .unwrap();
+    let saved = saved(&scene, &preview);
+    let result = planner
+        .run(
+            saved.plan.plan_id,
+            RetentionOperation::Delete,
+            &saved.digest,
+        )
+        .unwrap();
+    assert_eq!(result.result.completed, [mark.artifact_id]);
+    assert_eq!(
+        scene.inventory().completion_mark(source, signer).unwrap(),
+        Some(mark.clone())
+    );
+    assert!(!artifact_dir(scene.root(), mark.artifact_id).exists());
+    let listing = scene.reader().list_signed().unwrap();
+    assert!(listing.rollback_unknown.is_empty());
+    for header in &listing.signed {
+        let row = rows
+            .iter()
+            .find(|r| r.backup_id == header.backup_id)
+            .unwrap();
+        let older = row.completed_at_utc.as_ref().unwrap() < &mark.completed_at_utc;
+        assert_eq!(
+            listing
+                .rollback_warnings
+                .iter()
+                .any(|w| w.artifact_id == header.backup_id && w.high_water == mark),
+            older
+        );
+    }
+}

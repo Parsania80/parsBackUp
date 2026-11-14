@@ -240,6 +240,9 @@ pub(crate) enum RestoreCommand {
         /// Restrict the restore to archive sections; repeatable.
         #[arg(long = "section", value_enum)]
         sections: Vec<Section>,
+        /// Acknowledge the exact older-snapshot warning in a new saved restore plan.
+        #[arg(long)]
+        acknowledge_older_snapshot: bool,
     },
     Run {
         plan: Uuid,
@@ -332,6 +335,8 @@ pub(crate) fn json_inventory(inventory: &Inventory) -> Result<serde_json::Value>
         Inventory::Public(listing) => serde_json::json!({
             "signed": listing.signed,
             "unsigned": listing.unsigned,
+            "rollback_warnings": listing.rollback_warnings,
+            "rollback_unknown": listing.rollback_unknown,
         }),
     })
 }

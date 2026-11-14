@@ -69,6 +69,7 @@ pub(crate) fn plan(target: &str, policy: RestoreSecurityPolicy) -> RestorePlan {
         artifact_scope: None,
         created_unix_ms: 1_000,
         expires_unix_ms: 2_000,
+        rollback: None,
     }
 }
 

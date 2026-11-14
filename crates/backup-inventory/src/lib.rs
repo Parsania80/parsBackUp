@@ -29,6 +29,7 @@ mod artifact;
 mod job;
 mod job_lock;
 mod resource_lock;
+mod rollback;
 mod schema;
 
 pub use activity::{ACTIVITY_FILE, ActivityLock};
@@ -519,6 +520,15 @@ impl Inventory {
     /// path is what calls this and it holds no job; the link back to a `backup create` is the
     /// `backup_id` the job row already names.
     pub fn register(&self, row: &ArtifactRow) -> Result<()> {
+        self.register_inner(row, false)
+    }
+
+    /// Publication knows private facts; generic registration/adoption do not establish a mark.
+    pub fn register_published(&self, row: &ArtifactRow) -> Result<()> {
+        self.register_inner(row, true)
+    }
+
+    fn register_inner(&self, row: &ArtifactRow, published: bool) -> Result<()> {
         row.validate(&self.estate)
             .with_context(|| format!("cannot register backup {}", row.backup_id))?;
         in_transaction(&self.conn, |conn| {
@@ -541,7 +551,21 @@ impl Inventory {
                 AuditAction::ArtifactRegistered,
                 None,
                 Some(row.backup_id),
-            )
+            )?;
+            if published
+                && row.shape == Shape::V1Signed
+                && let (Some(signer), Some(completed)) = (&row.signer_id, &row.completed_at_utc)
+            {
+                self.advance_completion(
+                    &row.source_fingerprint,
+                    signer,
+                    &backup_domain::CompletionMark {
+                        artifact_id: row.backup_id,
+                        completed_at_utc: completed.clone(),
+                    },
+                )?;
+            }
+            Ok(())
         })
     }
 
@@ -741,6 +765,16 @@ impl Inventory {
                 conn.execute(
                     "DELETE FROM provisional_artifact WHERE backup_id = ?1",
                     [id.to_string()],
+                )?;
+                self.advance_completion(
+                    source,
+                    row.signer_id
+                        .as_deref()
+                        .context("missing authenticated signer")?,
+                    &backup_domain::CompletionMark {
+                        artifact_id: id,
+                        completed_at_utc: completed.to_owned(),
+                    },
                 )?;
             }
             if !success {
@@ -1116,6 +1150,7 @@ mod tests {
             [
                 "artifact",
                 "audit_event",
+                "completion_high_water",
                 "deletion_job",
                 "job",
                 "job_artifact",
@@ -1130,6 +1165,7 @@ mod tests {
             vec![
                 "artifact".to_string(),
                 "audit_event".to_string(),
+                "completion_high_water".to_string(),
                 "deletion_job".to_string(),
                 "job".to_string(),
                 "job_artifact".to_string(),
@@ -2714,6 +2750,167 @@ mod tests {
             assert!(inventory.artifacts().unwrap().is_empty());
             assert!(inventory.audit_events().unwrap().is_empty());
         }
+        drop(inventory);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn completion_marks_are_scoped_monotone_validated_and_survive_lifecycle_changes() {
+        let (dir, path) = created("completion");
+        let inventory = Inventory::open(&path, &estate()).unwrap();
+        let signer = "a".repeat(16);
+        let row = signed_row(&Uuid::new_v4().to_string());
+        inventory.register(&row).unwrap();
+        assert!(
+            inventory
+                .completion_mark(SOURCE, &signer)
+                .unwrap()
+                .is_none()
+        );
+        let mark = backup_domain::CompletionMark {
+            artifact_id: row.backup_id,
+            completed_at_utc: row.completed_at_utc.clone().unwrap(),
+        };
+        assert_eq!(
+            inventory
+                .observe_completion(SOURCE, &signer, &mark)
+                .unwrap(),
+            mark
+        );
+        let events = inventory.audit_events().unwrap();
+        let tie = backup_domain::CompletionMark {
+            artifact_id: Uuid::new_v4(),
+            ..mark.clone()
+        };
+        assert_eq!(
+            inventory.observe_completion(SOURCE, &signer, &tie).unwrap(),
+            mark
+        );
+        let old = backup_domain::CompletionMark {
+            completed_at_utc: "2026-01-01T00:00:00Z".into(),
+            ..tie.clone()
+        };
+        assert_eq!(
+            inventory.observe_completion(SOURCE, &signer, &old).unwrap(),
+            mark
+        );
+        assert_eq!(inventory.audit_events().unwrap(), events);
+        assert!(
+            inventory
+                .completion_mark(SOURCE, &"b".repeat(16))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            inventory
+                .observe_completion(OTHER_SOURCE, &signer, &mark)
+                .is_err()
+        );
+        assert!(inventory.observe_completion(SOURCE, "bad", &mark).is_err());
+        for time in ["", "2026-02-30T00:00:00Z", "2026-01-01T00:00:00+00:00"] {
+            assert!(
+                inventory
+                    .observe_completion(
+                        SOURCE,
+                        &signer,
+                        &backup_domain::CompletionMark {
+                            completed_at_utc: time.into(),
+                            ..tie.clone()
+                        }
+                    )
+                    .is_err()
+            );
+        }
+        let newest = backup_domain::CompletionMark {
+            completed_at_utc: "2026-11-14T00:00:00Z".into(),
+            ..tie
+        };
+        inventory
+            .observe_completion(SOURCE, &signer, &newest)
+            .unwrap();
+        inventory
+            .record_verification(row.backup_id, "checksum", false, None, None)
+            .unwrap();
+        inventory
+            .conn
+            .execute(
+                "UPDATE artifact SET state='deleted' WHERE backup_id=?1",
+                [row.backup_id.to_string()],
+            )
+            .unwrap();
+        assert_eq!(
+            inventory.completion_mark(SOURCE, &signer).unwrap(),
+            Some(newest)
+        );
+        drop(inventory);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn completion_advancement_rolls_back_with_publication_and_verification_audit_failures() {
+        let (dir, path) = created("completion-atomic");
+        let inventory = Inventory::open(&path, &estate()).unwrap();
+        let row = signed_row(&Uuid::new_v4().to_string());
+        let signer = row.signer_id.as_deref().unwrap();
+        inventory.conn.execute_batch("CREATE TRIGGER refuse_mark BEFORE INSERT ON audit_event WHEN NEW.action='completion_advanced' BEGIN SELECT RAISE(ABORT,'injected'); END").unwrap();
+        assert!(inventory.register_published(&row).is_err());
+        assert!(inventory.artifacts().unwrap().is_empty());
+        assert!(inventory.audit_events().unwrap().is_empty());
+        assert!(inventory.completion_mark(SOURCE, signer).unwrap().is_none());
+        let mut discovered = row.clone();
+        discovered.profile_fingerprint = None;
+        discovered.completed_at_utc = None;
+        inventory.adopt(&discovered).unwrap();
+        assert!(inventory.completion_mark(SOURCE, signer).unwrap().is_none());
+        let events = inventory.audit_events().unwrap();
+        assert!(
+            inventory
+                .record_verification(
+                    row.backup_id,
+                    "checksum",
+                    true,
+                    Some((
+                        row.payload_sha256.as_deref().unwrap(),
+                        row.manifest_sha256.as_deref()
+                    )),
+                    Some((
+                        SOURCE,
+                        row.profile_fingerprint.as_deref().unwrap(),
+                        row.completed_at_utc.as_deref().unwrap()
+                    ))
+                )
+                .is_err()
+        );
+        assert!(inventory.is_provisional(row.backup_id).unwrap());
+        assert!(
+            inventory
+                .verification_events(row.backup_id)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(inventory.completion_mark(SOURCE, signer).unwrap().is_none());
+        assert_eq!(inventory.audit_events().unwrap(), events);
+        inventory.conn.execute_batch("DROP TRIGGER refuse_mark; CREATE TRIGGER refuse_verification BEFORE INSERT ON verification_event BEGIN SELECT RAISE(ABORT,'injected'); END").unwrap();
+        assert!(
+            inventory
+                .record_verification(
+                    row.backup_id,
+                    "checksum",
+                    true,
+                    Some((
+                        row.payload_sha256.as_deref().unwrap(),
+                        row.manifest_sha256.as_deref()
+                    )),
+                    Some((
+                        SOURCE,
+                        row.profile_fingerprint.as_deref().unwrap(),
+                        row.completed_at_utc.as_deref().unwrap()
+                    ))
+                )
+                .is_err()
+        );
+        assert!(inventory.completion_mark(SOURCE, signer).unwrap().is_none());
+        assert_eq!(inventory.audit_events().unwrap(), events);
         drop(inventory);
         fs::remove_dir_all(dir).unwrap();
     }
