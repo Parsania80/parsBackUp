@@ -23,6 +23,16 @@ pub(crate) fn run_with_engine(
     engine: PostgresAdapter,
     report: &mut Reporter,
 ) -> Result<()> {
+    run_with_store(config, command, engine, None, report)
+}
+
+pub(crate) fn run_with_store(
+    config: Config,
+    command: BackupCommand,
+    engine: PostgresAdapter,
+    mut protected_store: Option<backup_local::LocalStore>,
+    report: &mut Reporter,
+) -> Result<()> {
     let json = report.is_json();
     match command {
         BackupCommand::Prune {
@@ -74,7 +84,10 @@ pub(crate) fn run_with_engine(
             profile,
             dry_run,
         } => {
-            let store = open_store(&config)?;
+            let store = match protected_store.take() {
+                Some(store) => store,
+                None => open_store(&config)?,
+            };
             // Recovery precedes the new scope claim and only runs for a real create.
             if !dry_run {
                 let recovery = store.recover()?;

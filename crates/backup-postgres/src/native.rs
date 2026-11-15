@@ -467,4 +467,34 @@ mod tests {
                 .is_err()
         );
     }
+    #[test]
+    fn restore_adapter_excludes_writer_only_paths_from_native_alias_checks() {
+        let config: backup_domain::ConfigV1 = serde_json::from_value(serde_json::json!({
+            "config_version":1,"mode":"fixture","access":"writer","read_only":false,
+            "storage":{"root":"/private/store"}, "export_globals":true,
+            "source":{"host":"127.0.0.1","port":5432,"user":"backup",
+                "database":"backupctl_fixture_keys","maintenance_database":"postgres",
+                "auth":"scram-passfile","password_file":"/private/passfile"},
+            "tools":{"client_bin_dir":"/usr/lib/postgresql/16/bin"},
+            "encryption":{"identity_file":"/private/identity","recipient_file":"/forbidden/recipient"},
+            "signing":{"signing_key_file":"/forbidden/signing","verifying_key_file":"/private/verifying"}
+        })).unwrap();
+        let writer = crate::PostgresAdapter::configured(&config)
+            .unwrap()
+            .policy
+            .unwrap();
+        let restore = crate::PostgresAdapter::configured_for_restore(&config)
+            .unwrap()
+            .policy
+            .unwrap();
+        assert_eq!(writer.keys.len(), 4);
+        assert_eq!(
+            restore.keys,
+            vec![
+                PathBuf::from("/private/identity"),
+                PathBuf::from("/private/verifying")
+            ]
+        );
+        assert_eq!(writer.context, restore.context);
+    }
 }

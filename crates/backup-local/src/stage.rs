@@ -10,11 +10,12 @@
 //! never finished has written an age header and nothing else, and the publish paths refuse such a
 //! stage by reading those flags — which is why finishing is the only thing that sets them.
 
+use crate::resources::ResourceWriter;
 use crate::{LocalStage, LocalStore};
 use anyhow::{Context, Result};
 use backup_application::{PayloadSink, StagedBytes};
 use backup_crypto::stream::EncryptSink;
-use std::fs::{File, OpenOptions};
+use std::fs::OpenOptions;
 use std::io::{self, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::sync::atomic::Ordering;
@@ -37,9 +38,9 @@ impl Target {
 
 enum Writer {
     /// Plaintext mode: the bytes land in the file exactly as they were written.
-    Plain { file: File, written: u64 },
+    Plain { file: ResourceWriter, written: u64 },
     /// Encrypted mode: age authenticates every chunk on its way into the file.
-    Age(EncryptSink<File>),
+    Age(EncryptSink<ResourceWriter>),
 }
 
 struct StageSink<'a> {
@@ -47,11 +48,20 @@ struct StageSink<'a> {
     writer: Option<Writer>,
     target: Target,
     stage: &'a LocalStage,
+    plaintext_limit: u64,
+    plaintext_written: u64,
 }
 
 impl Write for StageSink<'_> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        match self.writer.as_mut() {
+        if self
+            .plaintext_written
+            .checked_add(buf.len() as u64)
+            .is_none_or(|n| n > self.plaintext_limit)
+        {
+            return Err(io::Error::other("RESOURCE_LIMIT"));
+        }
+        let written = match self.writer.as_mut() {
             None => Err(io::Error::other("staged stream was already finished")),
             Some(Writer::Plain { file, written }) => {
                 let n = file.write(buf)?;
@@ -59,7 +69,9 @@ impl Write for StageSink<'_> {
                 Ok(n)
             }
             Some(Writer::Age(stream)) => stream.write(buf),
-        }
+        }?;
+        self.plaintext_written += written as u64;
+        Ok(written)
     }
 
     fn flush(&mut self) -> io::Result<()> {
@@ -80,7 +92,7 @@ impl PayloadSink for StageSink<'_> {
         let staged = match writer {
             Writer::Plain { mut file, written } => {
                 file.flush()?;
-                file.sync_all()?;
+                file.into_inner().sync_all()?;
                 StagedBytes {
                     plaintext_bytes: written,
                     recipient_suite: None,
@@ -88,7 +100,7 @@ impl PayloadSink for StageSink<'_> {
             }
             Writer::Age(stream) => {
                 let (file, outcome) = stream.finish()?;
-                file.sync_all()?;
+                file.into_inner().sync_all()?;
                 StagedBytes {
                     plaintext_bytes: outcome.plaintext_bytes,
                     recipient_suite: Some(outcome.suite),
@@ -132,10 +144,20 @@ impl LocalStore {
             .mode(0o600)
             .open(&path)
             .with_context(|| format!("create staged {}", target.name()))?;
+        let file = ResourceWriter::new(
+            file,
+            u64::MAX,
+            self.resources.as_ref().map_or(0, |r| r.min_free_bytes),
+            stage.quota.clone(),
+        );
+        let plaintext_limit = self.resources.as_ref().map_or(u64::MAX, |r| match target {
+            Target::Payload => r.max_payload_bytes,
+            Target::Globals => r.max_globals_bytes,
+        });
         let writer = match writer {
             None => Writer::Plain { file, written: 0 },
             Some(recipient) => Writer::Age(
-                EncryptSink::new(recipient.recipient(), file)
+                file.encrypt(recipient.recipient())
                     .with_context(|| format!("open {} stream", target.name()))?,
             ),
         };
@@ -143,6 +165,8 @@ impl LocalStore {
             writer: Some(writer),
             target,
             stage,
+            plaintext_limit,
+            plaintext_written: 0,
         }))
     }
 }

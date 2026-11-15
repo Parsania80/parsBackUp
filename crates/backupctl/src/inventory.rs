@@ -79,10 +79,24 @@ pub(crate) fn inventory(
     command: InventoryCommand,
     report: &mut Reporter,
 ) -> Result<()> {
+    inventory_with_store(root, command, None, None, report)
+}
+
+pub(crate) fn inventory_with_store(
+    root: &Path,
+    command: InventoryCommand,
+    store: Option<backup_local::LocalStore>,
+    configured_root: Option<&Path>,
+    report: &mut Reporter,
+) -> Result<()> {
     let json_output = report.is_json();
     match command {
         InventoryCommand::Recover => {
-            let recovery = backup_local::LocalStore::new(root.to_path_buf())?.recover()?;
+            let store = match store {
+                Some(store) => store,
+                None => backup_local::LocalStore::new(root.to_path_buf())?,
+            };
+            let recovery = store.recover()?;
             if json_output {
                 report.data(json!({"claimed":recovery.claimed,
                     "interrupted":recovery.interrupted,"deleted":recovery.deleted,
@@ -217,6 +231,15 @@ pub(crate) fn inventory(
             } else {
                 (scanner.preview_rebuild(&source_fingerprint)?, None, None)
             };
+            let previous_inventory = previous_inventory.map(|path| {
+                configured_root
+                    .and_then(|display| {
+                        path.strip_prefix(root)
+                            .ok()
+                            .map(|suffix| display.join(suffix))
+                    })
+                    .unwrap_or(path)
+            });
             if json_output {
                 let entries: Vec<_> = discovery
                     .entries

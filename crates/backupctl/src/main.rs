@@ -7,6 +7,7 @@ mod backup;
 mod cli;
 mod configuration;
 mod inventory;
+mod keys;
 mod native;
 mod output;
 mod report;

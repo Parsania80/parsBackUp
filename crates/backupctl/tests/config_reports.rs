@@ -40,19 +40,25 @@ impl Scene {
         if role == "reader" || role == "writer" {
             text += &format!(
                 "[encryption]\nidentity_file = {:?}\n",
-                self.0.join("missing-identity")
+                self.0.join("missing-parent/identity")
             );
             if role == "writer" {
-                text += &format!("recipient_file = {:?}\n", self.0.join("missing-recipient"));
+                text += &format!(
+                    "recipient_file = {:?}\n",
+                    self.0.join("missing-parent/recipient")
+                );
             }
         }
         if role != "inventory" {
             text += &format!(
                 "[signing]\nverifying_key_file = {:?}\n",
-                self.0.join("missing-verifier")
+                self.0.join("missing-parent/verifier")
             );
             if role == "writer" {
-                text += &format!("signing_key_file = {:?}\n", self.0.join("missing-signer"));
+                text += &format!(
+                    "signing_key_file = {:?}\n",
+                    self.0.join("missing-parent/signer")
+                );
             }
         }
         text
@@ -251,6 +257,10 @@ fn fixture_custody_read_only_and_availability_refuse_before_any_resource_open() 
                 scene.envelope(&args, None);
             } else if args == ["key", "status"] && role == "inventory" {
                 assert_eq!(scene.envelope(&args, None)["data"], json!({"keys":[]}));
+            } else if args[0] == "key" {
+                // New protected key commands require existing safe parent directories;
+                // no missing material is invented or opened through the store.
+                scene.envelope(&args, Some("KEY_UNSAFE"));
             } else if native && !read_only {
                 scene.envelope(&args, Some("CONFIG_INVALID"));
             } else if read_only
@@ -271,6 +281,7 @@ fn fixture_custody_read_only_and_availability_refuse_before_any_resource_open() 
 fn writable_keyless_inventory_works_without_source_tools_or_configured_keys() {
     let scene = Scene::new();
     fs::create_dir(scene.root()).unwrap();
+    fs::set_permissions(scene.root(), fs::Permissions::from_mode(0o700)).unwrap();
     let job = JobGuard::begin(
         &scene.root(),
         &JobScope {
@@ -458,6 +469,9 @@ fn versioned_inventory_maintenance_and_protection_use_the_existing_keyless_servi
     let id = Uuid::new_v4();
     let dir = scene.root().join("artifacts").join(id.to_string());
     fs::create_dir_all(&dir).unwrap();
+    for path in [scene.root(), scene.root().join("artifacts"), dir.clone()] {
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+    }
     fs::write(dir.join("complete"), []).unwrap();
     fs::write(dir.join("payload.dump"), b"abc").unwrap();
     fs::write(
@@ -509,5 +523,71 @@ fn versioned_inventory_maintenance_and_protection_use_the_existing_keyless_servi
         None,
     );
     scene.envelope(&["inventory", "recover"], None);
+    let abandoned = scene
+        .root()
+        .join("scratch")
+        .join(Uuid::new_v4().to_string());
+    fs::create_dir(&abandoned).unwrap();
+    fs::write(abandoned.join("plaintext"), b"synthetic leftover").unwrap();
+    let recovered = scene.envelope(&["inventory", "recover"], None);
+    assert_eq!(recovered["data"]["removed"], json!([abandoned]));
+    let prepared = scene.envelope(
+        &[
+            "inventory",
+            "rebuild",
+            "--source-fingerprint",
+            SOURCE,
+            "--prepare-rebuild",
+        ],
+        None,
+    );
+    let plan_id = prepared["data"]["plan_id"].as_str().unwrap();
+    let rebuilt = scene.envelope(
+        &[
+            "inventory",
+            "rebuild",
+            "--source-fingerprint",
+            SOURCE,
+            "--confirm-rebuild",
+            "--plan-id",
+            plan_id,
+        ],
+        None,
+    );
+    let previous = PathBuf::from(rebuilt["data"]["previous_inventory"].as_str().unwrap());
+    assert_eq!(previous.parent(), Some(scene.root().as_path()));
+    assert!(previous.is_file());
+    scene.envelope(&["inventory", "check"], None);
     assert_eq!(fs::read(dir.join("payload.dump")).unwrap(), b"abc");
+}
+
+#[test]
+fn versioned_resources_are_structural_and_filesystem_refusals_are_safe() {
+    let scene = Scene::new();
+    let base = scene.v1("inventory", false, false);
+    for resource in [
+        "max_payload_bytes = 0",
+        "max_globals_bytes = 8388609",
+        "max_stage_bytes = 0",
+        "max_scratch_bytes = 0",
+        "min_free_bytes = 1048575",
+        "min_free_bytes = 1099511627777",
+        "unknown = 1",
+        "max_payload_bytes = 18446744073709551616",
+    ] {
+        scene.write(&format!("{base}[resources]\n{resource}\n"));
+        scene.envelope(&["config", "check"], Some("CONFIG_INVALID"));
+    }
+    scene.write(&format!("{base}[resources]\nmax_payload_bytes = 1\n"));
+    scene.envelope(&["config", "check"], None);
+    assert!(!scene.root().exists());
+    fs::create_dir(scene.root()).unwrap();
+    fs::set_permissions(scene.root(), fs::Permissions::from_mode(0o750)).unwrap();
+    scene.envelope(&["inventory", "check"], Some("FILESYSTEM_UNSAFE"));
+    assert_eq!(fs::read_dir(scene.root()).unwrap().count(), 0);
+    fs::set_permissions(scene.root(), fs::Permissions::from_mode(0o700)).unwrap();
+    symlink(scene.0.join("absent"), scene.root().join("inventory.db")).unwrap();
+    scene.envelope(&["inventory", "recover"], Some("FILESYSTEM_UNSAFE"));
+    assert!(!scene.0.join("absent").exists());
+    assert_eq!(fs::read_dir(scene.root()).unwrap().count(), 1);
 }

@@ -164,19 +164,8 @@ pub(crate) fn run(
         }
         return Ok(());
     }
-    if matches!(
-        command,
-        TopCommand::Key {
-            command: KeyCommand::Status
-        }
-    ) && config.access == Access::Inventory
-    {
-        if report.is_json() {
-            report.data(json!({"keys": []}))?;
-        } else {
-            println!("no key material configured");
-        }
-        return Ok(());
+    if let TopCommand::Key { command } = command {
+        return crate::keys::run(&config, command, report);
     }
     // Snapshot readers must never enter the legacy lock/scratch path, even for inventory.
     if config.read_only {
@@ -195,7 +184,22 @@ pub(crate) fn run(
         }
         return crate::native::run(config, command, report);
     }
-    let root = &config.storage.root;
+    let store_command = matches!(
+        command,
+        TopCommand::Job { .. }
+            | TopCommand::Inventory { .. }
+            | TopCommand::Backup {
+                command: BackupCommand::Protect { .. } | BackupCommand::Unprotect { .. }
+            }
+    );
+    let guard = if store_command {
+        Some(backup_local::ProtectedRoot::open(&config, false)?)
+    } else {
+        None
+    };
+    let root = guard
+        .as_ref()
+        .map_or(config.storage.root.as_path(), |g| g.path());
     match command {
         TopCommand::Job { command } => {
             existing_reader_root(&config)?;
@@ -203,7 +207,18 @@ pub(crate) fn run(
         }
         TopCommand::Inventory { command } => {
             existing_reader_root(&config)?;
-            crate::inventory::inventory(root, command, report)
+            let store = if matches!(command, InventoryCommand::Recover) {
+                Some(guard.as_ref().unwrap().keyless_store()?)
+            } else {
+                None
+            };
+            crate::inventory::inventory_with_store(
+                root,
+                command,
+                store,
+                Some(&config.storage.root),
+                report,
+            )
         }
         TopCommand::Backup {
             command: BackupCommand::Protect { id },

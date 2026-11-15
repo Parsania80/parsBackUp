@@ -23,7 +23,9 @@ def run(args, content=None, ok=True):
 for major in (16, 17, 18):
     name = f'backupctl-h02-native-{major}-{os.getpid()}'
     try:
+        # A bounded tmpfs makes the low-space control independent of host disk size.
         run(['docker','run','-d','--name',name,'--network','none',
+             '--tmpfs','/h02:rw,size=256m,mode=755',
              '-e','POSTGRES_HOST_AUTH_METHOD=trust',
              '-v',f'{binary}:/backupctl:ro','-v',f'{libdir}:/host-lib:ro',
              f'docker.arvancloud.ir/library/postgres:{major}-bookworm','bash','-c',
@@ -144,7 +146,7 @@ auth = "{'peer' if peer else 'scram-passfile'}"
         cli('/h02/peer-bad.toml','profile','validate','public_data',user='postgres',error='NATIVE_OPERATION_FAILED')
         auth('scram-sha-256')
         print(f'PG{major} peer identity/socket and trusted executable checks passed',flush=True)
-        # Existing legacy bootstrap remains explicit; new key-generation capability is gated.
+        # New protected bootstrap creates a complete fixture generation without native access.
         legacy = f'''[source]
 host = "127.0.0.1"
 port = 5432
@@ -161,7 +163,39 @@ signing_key_file = "/h02/signer"
 verifying_key_file = "/h02/verifier"
 '''
         write('/h02/legacy.toml',legacy)
-        cli('/h02/legacy.toml','key','generate')
+        cli('/h02/writer.toml','key','generate')
+        # Protected key custody refuses foreign ownership before any store creation.
+        exec_('chown','postgres:postgres','/h02/identity')
+        cli('/h02/writer.toml','backup','create','--confirm-synthetic',error='KEY_UNSAFE')
+        assert exec_('test','-e','/h02/store',ok=False).returncode != 0
+        exec_('chown','root:root','/h02/identity')
+        writer_keys = cli('/h02/writer.toml','key','status')['keys']
+        assert len(writer_keys) == 4
+
+        # Filesystem preflight refuses unsafe state before creating inventory/layout.
+        exec_('mkdir','-m','750','/h02/store')
+        cli('/h02/writer.toml','backup','create','--confirm-synthetic',error='FILESYSTEM_UNSAFE')
+        assert exec_('find','/h02/store','-mindepth','1','-print').stdout == ''
+        exec_('chmod','700','/h02/store')
+        exec_('chown','postgres:postgres','/h02/store')
+        cli('/h02/writer.toml','backup','create','--confirm-synthetic',error='FILESYSTEM_UNSAFE')
+        exec_('chown','root:root','/h02/store')
+        exec_('mv','/h02/store','/h02/real-store')
+        exec_('ln','-s','/h02/real-store','/h02/store')
+        cli('/h02/writer.toml','backup','create','--confirm-synthetic',error='FILESYSTEM_UNSAFE')
+        exec_('rm','/h02/store')
+        exec_('mv','/h02/real-store','/h02/store')
+        def limited(text, field, value):
+            return text.replace('[storage]', f'[resources]\n{field} = {value}\n[storage]', 1)
+        for field,value,code in [('max_payload_bytes',1,'RESOURCE_LIMIT'),
+                                 ('max_globals_bytes',1,'RESOURCE_LIMIT'),
+                                 ('max_stage_bytes',1,'RESOURCE_LIMIT'),
+                                 ('min_free_bytes',1099511627776,'DISK_RESERVE_LOW')]:
+            write('/h02/limited.toml',limited(writer,field,value))
+            cli('/h02/limited.toml','backup','create','--confirm-synthetic',error=code)
+            for directory in ('artifacts','staging','scratch'):
+                assert exec_('find','/h02/store/'+directory,'-mindepth','1','-print').stdout == ''
+        print(f'PG{major} protected filesystem and streaming backup limits passed',flush=True)
         cli('/h02/writer.toml','backup','create',error='NATIVE_OPERATION_FAILED')
         created = cli('/h02/writer.toml','backup','create','--confirm-synthetic')
         backup_id = created['public']['backup_id']
@@ -172,6 +206,12 @@ verifying_key_file = "/h02/verifier"
         cli('/h02/reader.toml','restore','plan',backup_id,'--target',target,'--security','portable',error='NATIVE_OPERATION_FAILED')
         assert sql(f"SELECT count(*) FROM pg_database WHERE datname='{target}'") == '0'
         write('/h02/passfile',passfile(dbs=('postgres',target)))
+        for field,value,code in [('max_scratch_bytes',1,'RESOURCE_LIMIT'),
+                                 ('min_free_bytes',1099511627776,'DISK_RESERVE_LOW')]:
+            write('/h02/limited.toml',limited(reader,field,value))
+            cli('/h02/limited.toml','restore','plan',backup_id,'--target',target,'--security','portable',error=code)
+            assert exec_('find','/h02/store/scratch','-mindepth','1','-print').stdout == ''
+            assert sql(f"SELECT count(*) FROM pg_database WHERE datname='{target}'") == '0'
         result = cli('/h02/reader.toml','restore','plan',backup_id,'--target',target,'--security','portable')
         plan = result['plan']; plan_id = plan['id']
         assert plan['format'] == 'h02-restore-plan-v3' and plan['native_context']['user'] == 'restore_h02'

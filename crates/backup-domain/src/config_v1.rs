@@ -54,6 +54,8 @@ pub struct ConfigV1 {
     pub signing: Option<SigningV1>,
     pub scratch: Option<Scratch>,
     #[serde(default)]
+    pub resources: crate::ResourceLimits,
+    #[serde(default)]
     pub export_globals: bool,
     #[serde(default = "timeout")]
     pub timeout_seconds: u64,
@@ -149,6 +151,7 @@ fn disjoint(a: &Path, b: &Path) -> bool {
 impl ConfigV1 {
     pub fn validate(&self) -> Result<()> {
         ensure!(self.config_version == 1, "unsupported config version");
+        self.resources.validate()?;
         ensure!(
             (1..=3600).contains(&self.timeout_seconds),
             "invalid timeout"

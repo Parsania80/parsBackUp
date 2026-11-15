@@ -483,6 +483,21 @@ impl PostgresAdapter {
             policy: Some(native::NativePolicy::new(config)?),
         })
     }
+    /// Restore must not inspect the writer-only recipient/signing paths, including
+    /// passfile-alias metadata checks. Its context bytes remain otherwise identical.
+    pub fn configured_for_restore(config: &backup_domain::ConfigV1) -> Result<Self> {
+        config.validate()?;
+        let mut reader = config.clone();
+        reader.access = backup_domain::Access::Reader;
+        reader.export_globals = false;
+        if let Some(encryption) = &mut reader.encryption {
+            encryption.recipient_file = None;
+        }
+        if let Some(signing) = &mut reader.signing {
+            signing.signing_key_file = None;
+        }
+        Self::configured(&reader)
+    }
     fn maintenance_source(&self, source: &Source) -> Source {
         let mut maintenance = source.clone();
         if let Some(policy) = &self.policy {

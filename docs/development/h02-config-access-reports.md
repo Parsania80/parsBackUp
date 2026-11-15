@@ -4,6 +4,8 @@ Contract recorded before implementation on 2026-11-15. Implements the first incr
 
 Follow-up on 2026-11-15: the [native authentication and maintenance recovery increment](h02-native-auth-recovery.md) supersedes the native capability refusal below for writable versioned fixture create/dry-run, live profile validation and restore plan/run. It adds fixture restore-plan v3 while preserving this increment's original v1/v2 compatibility claim. Key bootstrap, other authenticated offline reads and snapshot capabilities remain gated; production stays disabled.
 
+Further follow-up on 2026-11-15: [validated key bootstrap and custody](h02-key-bootstrap-custody.md) supersedes the original versioned key-command refusal. Writer generate/publish and role-specific key status are delivered for fixtures; the new contract specifies protected reads, staged create-only publication and partial receipts. Snapshot and other authenticated offline backup operations remain gated. Legacy key result mappings are unchanged.
+
 ## Dispatch boundaries and alternatives
 
 | Choice | Selected behavior and benefit | Alternative and cost |

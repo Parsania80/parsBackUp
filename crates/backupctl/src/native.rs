@@ -9,7 +9,11 @@ use backup_postgres::PostgresAdapter;
 pub(crate) fn run(config: ConfigV1, command: TopCommand, report: &mut Reporter) -> Result<()> {
     let source = config.source.as_ref().ok_or(Refusal("CONFIG_INVALID"))?;
     let tools = config.tools.as_ref().ok_or(Refusal("CONFIG_INVALID"))?;
-    let engine = PostgresAdapter::configured(&config)?;
+    let engine = if matches!(command, TopCommand::Restore { .. }) {
+        PostgresAdapter::configured_for_restore(&config)?
+    } else {
+        PostgresAdapter::configured(&config)?
+    };
     // Only service-level fixture fields are projected. Connection policy remains in
     // the adapter; reader keys are opened explicitly and never represented as writer custody.
     let mut fixture = Config {
@@ -92,23 +96,11 @@ pub(crate) fn run(config: ConfigV1, command: TopCommand, report: &mut Reporter) 
                     .clone()
                     .ok_or(Refusal("CONFIG_INVALID"))?,
             });
-            crate::backup::run_with_engine(fixture, command, engine, report)
+            let store = backup_local::open_protected_store(&config, backup_local::KeyUse::Writer)?;
+            crate::backup::run_with_store(fixture, command, engine, Some(store), report)
         }
         TopCommand::Restore { command } => {
-            // Writable readers retain the existing store lock/job domain and need only
-            // identity + verifier. No recipient or signing-secret path is opened.
-            let identity = config
-                .encryption
-                .as_ref()
-                .and_then(|e| e.identity_file.as_ref())
-                .ok_or(Refusal("CONFIG_INVALID"))?;
-            let verifier = config
-                .signing
-                .as_ref()
-                .and_then(|s| s.verifying_key_file.as_ref())
-                .ok_or(Refusal("CONFIG_INVALID"))?;
-            let store =
-                backup_local::LocalStore::for_reading(config.storage.root, identity, verifier)?;
+            let store = backup_local::open_protected_store(&config, backup_local::KeyUse::Reader)?;
             crate::restore(&fixture, command, engine, store, report)
         }
         _ => refuse("CAPABILITY_NOT_ENABLED"),

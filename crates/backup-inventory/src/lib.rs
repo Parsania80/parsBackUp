@@ -157,11 +157,50 @@ pub struct VerificationEvent {
 }
 
 impl Inventory {
+    // SQLite's NOFOLLOW rejects the trusted procfs directory descriptor too.
+    // Permit only an exact live directory fd of this process, after separately
+    // opening the final database with O_NOFOLLOW. Ordinary paths keep SQLite's
+    // full NOFOLLOW behavior. The private-root caller excludes same-UID races.
+    fn sqlite_flags(path: &Path, flags: rusqlite::OpenFlags) -> Result<rusqlite::OpenFlags> {
+        let parent = path.parent().context("inventory has no parent")?;
+        let prefix = format!("/proc/{}/fd", std::process::id());
+        if let Ok(suffix) = parent.strip_prefix(&prefix) {
+            let components = suffix.components().collect::<Vec<_>>();
+            if components.len() == 1
+                && let std::path::Component::Normal(fd) = components[0]
+                && let Some(fd) = fd.to_str().and_then(|s| s.parse::<i32>().ok())
+                && fd >= 0
+            {
+                let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+                // SAFETY: valid output storage; fstat rejects invalid descriptors.
+                ensure!(
+                    unsafe { libc::fstat(fd, stat.as_mut_ptr()) } == 0,
+                    "invalid store descriptor"
+                );
+                // SAFETY: initialized by successful fstat.
+                let stat = unsafe { stat.assume_init() };
+                ensure!(
+                    stat.st_mode & libc::S_IFMT == libc::S_IFDIR,
+                    "store descriptor is not a directory"
+                );
+                let file = std::fs::OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+                    .open(path)?;
+                ensure!(
+                    file.metadata()?.is_file(),
+                    "inventory must be a regular file"
+                );
+                return Ok(flags);
+            }
+        }
+        Ok(flags | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW)
+    }
     pub fn probe_version(path: &Path) -> Result<i64> {
         Self::check_read_header(path)?;
         let conn = Connection::open_with_flags(
             path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
+            Self::sqlite_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?,
         )?;
         Ok(schema::user_version(&conn)?)
     }
@@ -170,7 +209,7 @@ impl Inventory {
     pub fn initialize_staged(path: &Path, estate: &Estate) -> Result<Self> {
         let conn = Connection::open_with_flags(
             path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
+            Self::sqlite_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)?,
         )?;
         ensure!(
             schema::user_version(&conn)? == 0,
@@ -196,11 +235,28 @@ impl Inventory {
     /// history; ADR 0004 moves that into the maintenance pass, where it happens under an exclusive
     /// claim on the store.
     pub fn open(path: &Path, estate: &Estate) -> Result<Self> {
-        // `Connection::open` *creates* a missing file, which is what makes the read-only open
-        // below a separate function rather than a flag: an audit read must never be able to
-        // invent an inventory.
-        let conn = Connection::open(path)
-            .with_context(|| format!("cannot open inventory {}", path.display()))?;
+        // Explicit private creation avoids inheriting a permissive process umask.
+        // Existing files are never chmodded or replaced. SQLite opens without CREATE
+        // so a name disappearing between these operations cannot create a loose file.
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(path)
+        {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("cannot create inventory {}", path.display()));
+            }
+        }
+        let conn = Connection::open_with_flags(
+            path,
+            Self::sqlite_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)?,
+        )
+        .with_context(|| format!("cannot open inventory {}", path.display()))?;
         Self::configure(&conn, path, false)?;
         let version = schema::migrate(&conn)
             .with_context(|| format!("cannot migrate inventory {}", path.display()))?;
@@ -235,7 +291,7 @@ impl Inventory {
         }
         let conn = Connection::open_with_flags(
             path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
+            Self::sqlite_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)?,
         )
         .with_context(|| format!("cannot open inventory {}", path.display()))?;
         Self::configure(&conn, path, false)?;
@@ -271,7 +327,7 @@ impl Inventory {
     pub fn open_existing_current(path: &Path, estate: &Estate) -> Result<Self> {
         let conn = Connection::open_with_flags(
             path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
+            Self::sqlite_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)?,
         )?;
         ensure!(
             schema::user_version(&conn)? == SCHEMA_VERSION,
@@ -293,7 +349,7 @@ impl Inventory {
     pub fn open_existing_upgrade(path: &Path, estate: &Estate) -> Result<Self> {
         let conn = Connection::open_with_flags(
             path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
+            Self::sqlite_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)?,
         )?;
         let version = schema::user_version(&conn)?;
         ensure!(
@@ -374,7 +430,7 @@ impl Inventory {
         Self::check_read_header(path)?;
         let conn = Connection::open_with_flags(
             path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
+            Self::sqlite_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?,
         )
         .with_context(|| format!("cannot open inventory {} read-only", path.display()))?;
         Self::configure(&conn, path, true)

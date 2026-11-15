@@ -403,6 +403,21 @@ impl SigningKeyFile {
         let path = path.as_ref();
         let rules = role.rules();
         let line = read_key_line(path, rules)?;
+        Self::parse(path, role, line)
+    }
+
+    /// Load the inspected file descriptor, without resolving its pathname again.
+    pub fn load_opened(path: &Path, file: &std::fs::File, role: SigningRole) -> Result<Self> {
+        Self::parse(
+            path,
+            role,
+            crate::keystore::read_opened_key_line(path, file, role.rules())?,
+        )
+    }
+
+    fn parse(path: &Path, role: SigningRole, line: String) -> Result<Self> {
+        let line = zeroize::Zeroizing::new(line);
+        let rules = role.rules();
         let (signer, verifier) = match role {
             SigningRole::Signing => {
                 let signer = HybridSigner::from_seed_hex(&line)

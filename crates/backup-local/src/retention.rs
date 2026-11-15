@@ -298,6 +298,9 @@ impl LocalRetention {
             )
         })?;
         let store = LocalStore {
+            resources: None,
+            fs_guard: None,
+            scratch_budget: crate::resources::Budget::new(u64::MAX),
             root: root.clone(),
             keys: Some(keys),
         };

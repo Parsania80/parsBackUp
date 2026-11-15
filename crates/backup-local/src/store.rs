@@ -151,7 +151,7 @@ impl LocalStore {
         })
     }
 
-    fn open(root: PathBuf, keys: Option<StoreKeys>) -> Result<Self> {
+    pub(crate) fn open(root: PathBuf, keys: Option<StoreKeys>) -> Result<Self> {
         if !root.is_absolute() {
             bail!("storage root must be absolute");
         }
@@ -172,7 +172,13 @@ impl LocalStore {
         // and ADR 0004 makes clearing a working directory a decision that requires proof someone
         // else is not using it — which is [`LocalStore::recover`], under the store's exclusive
         // maintenance claim.
-        Ok(Self { root, keys })
+        Ok(Self {
+            root,
+            keys,
+            resources: None,
+            fs_guard: None,
+            scratch_budget: crate::resources::Budget::new(u64::MAX),
+        })
     }
 
     /// Clears working directories this store can prove are abandoned, and corrects the job rows a
@@ -207,6 +213,10 @@ impl LocalStore {
         // The claim drops after the removals, so a competing command cannot create a working
         // directory while this one is still deleting inside it.
         drop(claim);
+        if let Some(guard) = &self.fs_guard {
+            removed = removed.iter().map(|p| guard.display_path(p)).collect();
+            refused = refused.iter().map(|p| guard.display_path(p)).collect();
+        }
         Ok(Recovery {
             claimed: true,
             interrupted,

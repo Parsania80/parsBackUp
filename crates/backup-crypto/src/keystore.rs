@@ -120,6 +120,34 @@ pub(crate) fn read_key_line(path: &Path, rules: &'static KeyFileRules) -> Result
 
     let contents = fs::read_to_string(path)
         .with_context(|| format!("read {} key file {}", rules.label, path.display()))?;
+    parse_key_line(path, rules, &contents)
+}
+
+/// Parse only from an already protected descriptor; callers establish ownership/ancestry.
+pub(crate) fn read_opened_key_line(
+    path: &Path,
+    mut file: &std::fs::File,
+    rules: &'static KeyFileRules,
+) -> Result<String> {
+    use std::io::Read;
+    let meta = file.metadata()?;
+    if !meta.is_file()
+        || meta.len() > MAX_KEY_FILE_BYTES
+        || (rules.secret && meta.permissions().mode() & PRIVATE_FILE_FORBIDDEN_MODE_BITS != 0)
+    {
+        bail!("invalid opened key file");
+    }
+    let mut contents = zeroize::Zeroizing::new(String::new());
+    (&mut file)
+        .take(MAX_KEY_FILE_BYTES + 1)
+        .read_to_string(&mut contents)?;
+    if contents.len() as u64 > MAX_KEY_FILE_BYTES {
+        bail!("opened key file exceeds limit");
+    }
+    parse_key_line(path, rules, &contents)
+}
+
+fn parse_key_line(path: &Path, rules: &'static KeyFileRules, contents: &str) -> Result<String> {
     let mut lines = contents
         .lines()
         .map(str::trim)
@@ -235,6 +263,17 @@ impl KeyFile {
         let path = path.as_ref();
         let rules = role.rules();
         let line = read_key_line(path, rules)?;
+        Self::parse(path, role, line)
+    }
+
+    /// Load the inspected file descriptor, without resolving its pathname again.
+    pub fn load_opened(path: &Path, file: &std::fs::File, role: KeyRole) -> Result<Self> {
+        Self::parse(path, role, read_opened_key_line(path, file, role.rules())?)
+    }
+
+    fn parse(path: &Path, role: KeyRole, line: String) -> Result<Self> {
+        let line = zeroize::Zeroizing::new(line);
+        let rules = role.rules();
         let identity = match role {
             KeyRole::Identity => {
                 let identity = HybridIdentity::from_seed_hex(&line)

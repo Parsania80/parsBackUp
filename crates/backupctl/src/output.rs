@@ -81,6 +81,15 @@ fn safe_failure(error: &anyhow::Error, operation: &str) -> (&'static str, &'stat
     }
     const CODES: &[&str] = &[
         "CONFIG_INVALID",
+        "FILESYSTEM_UNSAFE",
+        "RESOURCE_LIMIT",
+        "DISK_RESERVE_LOW",
+        "KEY_UNSAFE",
+        "KEY_INVALID",
+        "KEY_OCCUPIED",
+        "KEY_BUSY",
+        "KEY_OPERATION_FAILED",
+        "KEY_PARTIAL",
         "NATIVE_CONTEXT_MISMATCH",
         "RETENTION_JOB_DEPENDENCY",
         "RETENTION_LAST_VALID",
@@ -143,6 +152,27 @@ fn message(code: &str) -> &'static str {
     match code {
         "NATIVE_CONTEXT_MISMATCH" => {
             "The restore plan connection context changed; create a new plan."
+        }
+        "KEY_UNSAFE" => "A required key resource or its ancestry is missing, unsafe or aliased.",
+        "KEY_INVALID" => {
+            "Required key material is missing, invalid or does not match its public half."
+        }
+        "KEY_OCCUPIED" => "A key destination is occupied; existing material was preserved.",
+        "KEY_BUSY" => "A required key directory is in use by another key operation.",
+        "KEY_OPERATION_FAILED" => {
+            "Key staging or publication failed; inspect key custody before retrying."
+        }
+        "KEY_PARTIAL" => {
+            "Some key files were published and retained; inspect the receipt and key custody before recovery."
+        }
+        "FILESYSTEM_UNSAFE" => {
+            "The store or required filesystem resource is missing, unsafe or aliases protected key storage."
+        }
+        "RESOURCE_LIMIT" => {
+            "The configured resource limit was exceeded; publication or plaintext release was refused."
+        }
+        "DISK_RESERVE_LOW" => {
+            "The destination filesystem cannot preserve the configured free-space reserve."
         }
         "CONFIG_INVALID" => "invalid configuration; check the documented fields and safety rules.",
         "CONFIG_VERSION_UNSUPPORTED" => "This configuration version is not supported.",

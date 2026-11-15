@@ -9,14 +9,22 @@
 
 mod layout;
 
+mod custody;
 #[cfg(test)]
 mod fixture;
 mod inventory;
 mod keys;
+pub use custody::{
+    KeyMutation, KeyMutationOutcome, KeyUse, mutate_protected_keys, open_protected_store,
+    protected_key_status,
+};
+mod filesystem;
 mod reconcile;
+mod resources;
 mod retention;
 mod rollback;
 mod scratch;
+pub use filesystem::ProtectedRoot;
 mod stage;
 mod store;
 
@@ -32,7 +40,6 @@ pub use backup_crypto::keystore::KeyStatus;
 use backup_crypto::protocol::{DIGEST_BYTES, HYBRID_SIGNATURE_BYTES};
 use backup_crypto::signing::{SigningKeyFile, signature_tuple};
 pub use backup_crypto::signing::{SigningKeyStatus, SigningRole};
-use backup_crypto::stream::EncryptSink;
 use backup_domain::{
     AGE_FORMAT, ArtifactManifest, DevelopmentManifest, GLOBALS_POLICY_EXPORTED,
     GLOBALS_POLICY_SKIPPED, MAX_PUBLIC_JSON_BYTES, PublicHeader, RestorePlan, profile_fingerprint,
@@ -89,6 +96,7 @@ pub struct StoreKeys {
 pub struct ArtifactUse {
     _resource: backup_inventory::ResourceLock,
     activity: ActivityLock,
+    _fs_guard: Option<std::sync::Arc<filesystem::ProtectedRoot>>,
 }
 
 pub struct SignedArtifact {
@@ -104,6 +112,9 @@ pub struct LocalStore {
     /// `None` keeps every artifact plaintext, exactly as the tool did before the
     /// recipient stanza existed: encryption is a property of the configured store.
     keys: Option<StoreKeys>,
+    resources: Option<backup_domain::ResourceLimits>,
+    fs_guard: Option<std::sync::Arc<filesystem::ProtectedRoot>>,
+    scratch_budget: std::sync::Arc<resources::Budget>,
 }
 
 pub struct LocalStage {
@@ -118,6 +129,8 @@ pub struct LocalStage {
     /// The store-wide claim that keeps this directory under a live process. A field rather than a
     /// local, so it drops *after* [`LocalStage`]'s drop has removed the directory — see ADR 0004.
     _claim: ActivityLock,
+    _fs_guard: Option<std::sync::Arc<filesystem::ProtectedRoot>>,
+    quota: Option<std::sync::Arc<resources::Lease>>,
 }
 
 /// A held job, from this store.
@@ -126,26 +139,32 @@ pub struct LocalStage {
 /// `backup_inventory` owns the guard, and neither of them may write an `impl` for the other's
 /// type. This crate is the one place that is allowed to know both, so the seam between a port the
 /// service can call and a row the index can write is stated here rather than in either of them.
-pub struct LocalJob(backup_inventory::JobGuard);
+pub struct LocalJob {
+    guard: backup_inventory::JobGuard,
+    _fs_guard: Option<std::sync::Arc<filesystem::ProtectedRoot>>,
+}
 
-struct LocalRestoreJob(backup_inventory::RestoreGuard);
+struct LocalRestoreJob {
+    guard: backup_inventory::RestoreGuard,
+    _fs_guard: Option<std::sync::Arc<filesystem::ProtectedRoot>>,
+}
 
 impl JobHandle for LocalRestoreJob {
     fn staged(&self) -> Result<()> {
         bail!("restore jobs do not stage artifacts")
     }
     fn complete(&self) -> Result<()> {
-        self.0.complete()
+        self.guard.complete()
     }
 }
 
 impl JobHandle for LocalJob {
     fn staged(&self) -> Result<()> {
-        self.0.staged()
+        self.guard.staged()
     }
 
     fn complete(&self) -> Result<()> {
-        self.0.complete()
+        self.guard.complete()
     }
 }
 
@@ -167,6 +186,8 @@ pub struct LocalPlaintext {
     scratch: Option<PathBuf>,
     /// Scratch ownership lasts through cleanup; artifact-use ownership is held separately.
     _claim: Option<ActivityLock>,
+    _fs_guard: Option<std::sync::Arc<filesystem::ProtectedRoot>>,
+    _quota: Option<std::sync::Arc<resources::Lease>>,
 }
 
 impl Drop for LocalStage {
@@ -225,6 +246,44 @@ impl ArtifactHandle for LocalArtifact {
 }
 
 impl LocalStore {
+    fn hash_resource(&self, path: &Path) -> Result<(u64, String)> {
+        let Some(resources) = &self.resources else {
+            return hash_file(path);
+        };
+        let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+        let plaintext = match name {
+            AGE_MANIFEST_FILE => MAX_MANIFEST_BYTES,
+            AGE_GLOBALS_FILE | GLOBALS_FILE => resources.max_globals_bytes,
+            _ => resources.max_payload_bytes,
+        };
+        let cap = backup_domain::ResourceLimits::ciphertext_limit(plaintext);
+        let file = open_regular(path)?;
+        use std::os::unix::fs::MetadataExt;
+        let meta = file.metadata()?;
+        // SAFETY: geteuid has no preconditions.
+        anyhow::ensure!(
+            meta.uid() == unsafe { libc::geteuid() }
+                && meta.mode() & 0o7777 & !0o600 == 0
+                && meta.nlink() == 1,
+            "FILESYSTEM_UNSAFE"
+        );
+        anyhow::ensure!(meta.len() <= cap, "RESOURCE_LIMIT");
+        let mut reader = file.take(cap + 1);
+        let mut hash = Sha256::new();
+        let mut count = 0_u64;
+        let mut buf = [0; 64 * 1024];
+        loop {
+            let n = reader.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            count += n as u64;
+            anyhow::ensure!(count <= cap, "RESOURCE_LIMIT");
+            hash.update(&buf[..n]);
+        }
+        Ok((count, format!("{:x}", hash.finalize())))
+    }
+
     /// The ids this store's own key files derive, as a v1 manifest and `public.json` must
     /// record them.
     ///
@@ -263,33 +322,52 @@ impl LocalStore {
     /// belongs in a directory that may be copied off-site for disaster recovery. Its
     /// ciphertext digest is what the signature covers, so it has to be a file on disk before
     /// anything is signed.
-    fn seal_to_file(recipient: &HybridRecipient, path: &Path, plaintext: &[u8]) -> Result<()> {
+    fn seal_to_file(
+        &self,
+        stage: &LocalStage,
+        recipient: &HybridRecipient,
+        path: &Path,
+        plaintext: &[u8],
+    ) -> Result<()> {
         let file = OpenOptions::new()
             .write(true)
             .create_new(true)
             .mode(0o600)
             .open(path)
             .with_context(|| format!("create sealed {}", path.display()))?;
-        let mut sink = EncryptSink::new(recipient, file)
+        let file = resources::ResourceWriter::new(
+            file,
+            u64::MAX,
+            self.resources.as_ref().map_or(0, |r| r.min_free_bytes),
+            stage.quota.clone(),
+        );
+        let mut sink = file
+            .encrypt(recipient)
             .with_context(|| format!("open stream for {}", path.display()))?;
         sink.write_all(plaintext)?;
         let (file, _) = sink.finish()?;
-        file.sync_all()?;
+        file.into_inner().sync_all()?;
         Ok(())
     }
 
     /// Creates one file the caller has sized and bounded, with the store's durability
     /// idiom: `create_new` so a second writer can never replace it, then `sync_all` so the
     /// bytes are on disk before the directory that names them is renamed.
-    fn write_private_file(path: &Path, bytes: &[u8]) -> Result<()> {
-        let mut file = OpenOptions::new()
+    fn write_private_file(&self, stage: &LocalStage, path: &Path, bytes: &[u8]) -> Result<()> {
+        let file = OpenOptions::new()
             .write(true)
             .create_new(true)
             .mode(0o600)
             .open(path)
             .with_context(|| format!("create {}", path.display()))?;
+        let mut file = resources::ResourceWriter::new(
+            file,
+            u64::MAX,
+            self.resources.as_ref().map_or(0, |r| r.min_free_bytes),
+            stage.quota.clone(),
+        );
         file.write_all(bytes)?;
-        file.sync_all()?;
+        file.into_inner().sync_all()?;
         Ok(())
     }
 
@@ -371,14 +449,14 @@ impl LocalStore {
         }
         let payload_path = dir.join(payload_name);
         ensure_regular_file(&payload_path)?;
-        let (size, digest) = hash_file(&payload_path)?;
+        let (size, digest) = self.hash_resource(&payload_path)?;
         if size != manifest.size_bytes || digest != manifest.sha256 {
             bail!("payload checksum or size mismatch");
         }
         let globals_path = dir.join(globals_name);
         let globals = if manifest.security_globals {
             ensure_regular_file(&globals_path)?;
-            let (gsize, gdigest) = hash_file(&globals_path)?;
+            let (gsize, gdigest) = self.hash_resource(&globals_path)?;
             if manifest.globals_size_bytes != Some(gsize)
                 || manifest.globals_sha256.as_deref() != Some(&gdigest[..])
             {
@@ -412,6 +490,7 @@ impl ArtifactStore for LocalStore {
         Ok(std::sync::Arc::new(ArtifactUse {
             _resource: resource,
             activity,
+            _fs_guard: self.fs_guard.clone(),
         }))
     }
     type Stage = LocalStage;
@@ -478,6 +557,11 @@ impl ArtifactStore for LocalStore {
             sealed_payload: AtomicBool::new(false),
             sealed_globals: AtomicBool::new(false),
             _claim: claim,
+            _fs_guard: self.fs_guard.clone(),
+            quota: self
+                .resources
+                .as_ref()
+                .map(|r| resources::Budget::new(r.max_stage_bytes).lease()),
         })
     }
 
@@ -490,9 +574,10 @@ impl ArtifactStore for LocalStore {
             profile_fingerprint: profile_fingerprint(&request.profile_name),
             backup_id: request.backup_id,
         };
-        Ok(Box::new(LocalJob(backup_inventory::JobGuard::begin(
-            &self.root, &scope,
-        )?)))
+        Ok(Box::new(LocalJob {
+            guard: backup_inventory::JobGuard::begin(&self.root, &scope)?,
+            _fs_guard: self.fs_guard.clone(),
+        }))
     }
 
     fn begin_restore_job(&self, request: &RestoreJobRequest<'_>) -> Result<Box<dyn JobHandle>> {
@@ -501,13 +586,14 @@ impl ArtifactStore for LocalStore {
         digest.update(request.target_port.to_be_bytes());
         digest.update(request.target_database.as_bytes());
         let fingerprint = format!("{:x}", digest.finalize());
-        Ok(Box::new(LocalRestoreJob(
-            backup_inventory::RestoreGuard::begin(
+        Ok(Box::new(LocalRestoreJob {
+            guard: backup_inventory::RestoreGuard::begin(
                 &self.root,
                 &fingerprint[..16],
                 request.artifact_id,
             )?,
-        )))
+            _fs_guard: self.fs_guard.clone(),
+        }))
     }
 
     fn payload_sink<'a>(&'a self, stage: &'a LocalStage) -> Result<Box<dyn PayloadSink + 'a>> {
@@ -519,7 +605,7 @@ impl ArtifactStore for LocalStore {
     }
 
     fn measure(&self, stage: &Self::Stage) -> Result<(u64, String)> {
-        let (size, hash) = hash_file(&stage.payload)?;
+        let (size, hash) = self.hash_resource(&stage.payload)?;
         if size == 0 {
             bail!("pg_dump produced an empty archive");
         }
@@ -531,7 +617,7 @@ impl ArtifactStore for LocalStore {
             .globals
             .as_ref()
             .context("stage has no globals file")?;
-        let (size, hash) = hash_file(path)?;
+        let (size, hash) = self.hash_resource(path)?;
         if size == 0 {
             bail!("pg_dumpall produced an empty globals file");
         }
@@ -639,6 +725,8 @@ impl ArtifactStore for LocalStore {
                 path: artifact.payload.clone(),
                 scratch: None,
                 _claim: None,
+                _fs_guard: self.fs_guard.clone(),
+                _quota: None,
                 _use: Some(artifact._use.clone()),
             });
         }
@@ -667,6 +755,8 @@ impl ArtifactStore for LocalStore {
                 path: stage.payload.clone(),
                 scratch: None,
                 _claim: None,
+                _fs_guard: self.fs_guard.clone(),
+                _quota: None,
                 _use: None,
             });
         }
@@ -684,6 +774,8 @@ impl ArtifactStore for LocalStore {
                 path: path.clone(),
                 scratch: None,
                 _claim: None,
+                _fs_guard: self.fs_guard.clone(),
+                _quota: None,
                 _use: Some(artifact._use.clone()),
             });
         }
@@ -802,7 +894,7 @@ impl ArtifactStore for LocalStore {
                 if !stage.sealed_globals.load(Ordering::Relaxed) {
                     bail!("globals stream was never finished; staged artifact was not published");
                 }
-                let (bytes, measured) = hash_file(path)?;
+                let (bytes, measured) = self.hash_resource(path)?;
                 if manifest.globals_ciphertext_bytes != Some(bytes) || digest != &measured {
                     bail!("staged globals file changed, or the manifest was not built from it");
                 }
@@ -823,8 +915,13 @@ impl ArtifactStore for LocalStore {
                 manifest_bytes.len()
             );
         }
-        Self::seal_to_file(recipient.recipient(), &manifest_path, &manifest_bytes)?;
-        let (manifest_ciphertext_bytes, manifest_digest) = hash_file(&manifest_path)?;
+        self.seal_to_file(
+            &stage,
+            recipient.recipient(),
+            &manifest_path,
+            &manifest_bytes,
+        )?;
+        let (manifest_ciphertext_bytes, manifest_digest) = self.hash_resource(&manifest_path)?;
         let tuple = signature_tuple(
             stage.id.as_bytes(),
             &digest_bytes(&manifest_digest)?,
@@ -835,7 +932,7 @@ impl ArtifactStore for LocalStore {
             .try_sign(&tuple)
             .context("origin signature failed")?;
         let signature_path = stage.dir.join(SIGNATURE_FILE);
-        Self::write_private_file(&signature_path, signature.as_bytes())?;
+        self.write_private_file(&stage, &signature_path, signature.as_bytes())?;
         // Re-read and checked from the bytes on disk, at exactly the length the reader will
         // require: publishing a signature this store could not verify would produce an
         // artifact that is unreadable by design.
@@ -847,7 +944,8 @@ impl ArtifactStore for LocalStore {
             .verify(&tuple, &written)
             .context("freshly written signature does not verify against this store's key")?;
         let header = PublicHeader::seal(manifest, &manifest_digest, manifest_ciphertext_bytes)?;
-        Self::write_private_file(
+        self.write_private_file(
+            &stage,
             stage.dir.join(PUBLIC_FILE).as_path(),
             header.to_json()?.as_bytes(),
         )?;
@@ -1158,7 +1256,7 @@ impl LocalStore {
         }
         let payload = dir.join(AGE_PAYLOAD_FILE);
         ensure_regular_file(&payload)?;
-        let (payload_bytes, payload_digest) = hash_file(&payload)?;
+        let (payload_bytes, payload_digest) = self.hash_resource(&payload)?;
         if payload_bytes != header.payload_ciphertext_bytes
             || payload_digest != header.payload_sha256
         {
@@ -1168,7 +1266,7 @@ impl LocalStore {
         }
         let manifest_path = dir.join(AGE_MANIFEST_FILE);
         ensure_regular_file(&manifest_path)?;
-        let (manifest_bytes, manifest_digest) = hash_file(&manifest_path)?;
+        let (manifest_bytes, manifest_digest) = self.hash_resource(&manifest_path)?;
         if manifest_bytes != header.manifest_ciphertext_bytes
             || manifest_digest != header.manifest_sha256
         {
@@ -1245,7 +1343,7 @@ impl LocalStore {
         let globals = match manifest.globals_policy.as_str() {
             GLOBALS_POLICY_EXPORTED => {
                 ensure_regular_file(&globals_path)?;
-                let (bytes, digest) = hash_file(&globals_path)?;
+                let (bytes, digest) = self.hash_resource(&globals_path)?;
                 if manifest.globals_sha256.as_deref() != Some(digest.as_str())
                     || manifest.globals_ciphertext_bytes != Some(bytes)
                 {

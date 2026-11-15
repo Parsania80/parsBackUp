@@ -17,8 +17,11 @@ use uuid::Uuid;
 
 impl Drop for LocalPlaintext {
     fn drop(&mut self) {
-        if let Some(dir) = &self.scratch {
-            let _ = fs::remove_dir_all(dir);
+        if let Some(dir) = &self.scratch
+            && fs::remove_dir_all(dir).is_err()
+            && let Some(quota) = &self._quota
+        {
+            quota.keep_charge();
         }
     }
 }
@@ -71,11 +74,14 @@ impl LocalStore {
             .mode(0o700)
             .create(&scratch)
             .context("create private scratch directory")?;
+        let quota = self.resources.as_ref().map(|_| self.scratch_budget.lease());
         let view = LocalPlaintext {
             path: scratch.join(name),
             scratch: Some(scratch),
             _claim: claim,
             _use: None,
+            _fs_guard: self.fs_guard.clone(),
+            _quota: quota.clone(),
         };
         let file = OpenOptions::new()
             .write(true)
@@ -83,6 +89,24 @@ impl LocalStore {
             .mode(0o600)
             .open(&view.path)
             .context("create private scratch file")?;
+        let configured_limit = self.resources.as_ref().map(|r| match name {
+            crate::layout::GLOBALS_FILE => r.max_globals_bytes,
+            MANIFEST_FILE => MAX_MANIFEST_BYTES,
+            _ => r.max_payload_bytes,
+        });
+        let limit = configured_limit.map_or(max_plaintext_bytes, |limit| {
+            Some(max_plaintext_bytes.map_or(limit, |n| n.min(limit)))
+        });
+        let file = crate::resources::ResourceWriter::new(
+            file,
+            if self.resources.is_some() {
+                limit.unwrap_or(u64::MAX)
+            } else {
+                u64::MAX
+            },
+            self.resources.as_ref().map_or(0, |r| r.min_free_bytes),
+            quota,
+        );
         let ciphertext = OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
@@ -91,16 +115,24 @@ impl LocalStore {
         if !ciphertext.metadata()?.is_file() {
             bail!("encrypted payload must be a regular file");
         }
+        let resource_bound = self
+            .resources
+            .as_ref()
+            .map(|_| backup_domain::ResourceLimits::ciphertext_limit(configured_limit.unwrap()));
+        if let Some(bound) = resource_bound {
+            anyhow::ensure!(ciphertext.metadata()?.len() <= bound, "RESOURCE_LIMIT");
+        }
         let bound = match expected_ciphertext {
             Some((bytes, _)) => bytes.checked_add(1).context("ciphertext size overflow")?,
             None => u64::MAX,
         };
+        let bound = resource_bound.map_or(bound, |n| bound.min(n.saturating_add(1)));
         let mut reader = DigestReader {
             inner: ciphertext.take(bound),
             digest: Sha256::new(),
             bytes: 0,
         };
-        match max_plaintext_bytes {
+        match limit {
             Some(limit) => decrypt_with_limit(keys.identity.identity()?, &mut reader, file, limit)?,
             None => decrypt(keys.identity.identity()?, &mut reader, file)?,
         };
