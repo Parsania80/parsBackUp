@@ -1,9 +1,10 @@
 use crate::cli::{InventoryCommand, JobCommand};
+use crate::output::Reporter;
 use anyhow::{Result, bail};
 use backup_application::{InventoryService, JobInfo};
-use backup_domain::Config;
 use backup_local::LocalInventory;
 use serde_json::{Value, json};
+use std::path::Path;
 
 fn job_json(job: &JobInfo) -> Value {
     let mut value = json!({
@@ -42,18 +43,14 @@ fn print_job(job: &JobInfo) {
     );
 }
 
-pub(crate) fn job(config: &Config, command: JobCommand, json_output: bool) -> Result<()> {
-    let service = InventoryService::new(LocalInventory::open(&config.storage.root)?);
+pub(crate) fn job(root: &Path, command: JobCommand, report: &mut Reporter) -> Result<()> {
+    let json_output = report.is_json();
+    let service = InventoryService::new(LocalInventory::open(root)?);
     match command {
         JobCommand::List => {
             let jobs = service.jobs()?;
             if json_output {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(
-                        &json!({"jobs": jobs.iter().map(job_json).collect::<Vec<_>>(), "audit_recorded": false})
-                    )?
-                );
+                report.data(json!({"jobs": jobs.iter().map(job_json).collect::<Vec<_>>(), "audit_recorded": false}))?;
             } else if jobs.is_empty() {
                 println!("no jobs recorded");
             } else {
@@ -65,12 +62,7 @@ pub(crate) fn job(config: &Config, command: JobCommand, json_output: bool) -> Re
         JobCommand::Inspect { id } => {
             let job = service.job(id)?;
             if json_output {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(
-                        &json!({"job": job_json(&job), "audit_recorded": false})
-                    )?
-                );
+                report.data(json!({"job": job_json(&job), "audit_recorded": false}))?;
             } else {
                 print_job(&job);
             }
@@ -83,20 +75,18 @@ pub(crate) fn job(config: &Config, command: JobCommand, json_output: bool) -> Re
 }
 
 pub(crate) fn inventory(
-    config: &Config,
+    root: &Path,
     command: InventoryCommand,
-    json_output: bool,
+    report: &mut Reporter,
 ) -> Result<()> {
+    let json_output = report.is_json();
     match command {
         InventoryCommand::Recover => {
-            let recovery = backup_local::LocalStore::new(config.storage.root.clone())?.recover()?;
+            let recovery = backup_local::LocalStore::new(root.to_path_buf())?.recover()?;
             if json_output {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&json!({"claimed":recovery.claimed,
+                report.data(json!({"claimed":recovery.claimed,
                     "interrupted":recovery.interrupted,"deleted":recovery.deleted,
-                    "removed":recovery.removed,"refused":recovery.refused}))?
-                );
+                    "removed":recovery.removed,"refused":recovery.refused}))?;
             } else {
                 crate::report::print_recovery(&recovery);
             }
@@ -105,16 +95,11 @@ pub(crate) fn inventory(
             }
         }
         InventoryCommand::Verification { id } => {
-            let service = InventoryService::new(LocalInventory::open(&config.storage.root)?);
+            let service = InventoryService::new(LocalInventory::open(root)?);
             let events = service.verification_events(id)?;
             if json_output {
                 let events: Vec<_> = events.iter().map(|e| json!({"backup_id":e.backup_id, "at_utc":e.at_utc, "level":e.level, "outcome":e.outcome, "payload_sha256":e.payload_sha256, "manifest_sha256":e.manifest_sha256, "current":e.current})).collect();
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(
-                        &json!({"events": events, "audit_recorded": false})
-                    )?
-                );
+                report.data(json!({"events": events, "audit_recorded": false}))?;
             } else {
                 for e in events {
                     println!(
@@ -131,20 +116,17 @@ pub(crate) fn inventory(
             }
         }
         InventoryCommand::Check => {
-            let service = InventoryService::new(LocalInventory::open(&config.storage.root)?);
+            let service = InventoryService::new(LocalInventory::open(root)?);
             let check = service.check()?;
             let valid = check.problems.is_empty();
             if json_output {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&json!({
-                        "valid": valid,
-                        "schema_version": check.schema_version,
-                        "source_fingerprint": check.source_fingerprint,
-                        "problems": check.problems,
-                        "audit_recorded": false,
-                    }))?
-                );
+                report.data(json!({
+                    "valid": valid,
+                    "schema_version": check.schema_version,
+                    "source_fingerprint": check.source_fingerprint,
+                    "problems": check.problems,
+                    "audit_recorded": false,
+                }))?;
             } else {
                 println!(
                     "inventory {} (schema {}, source {}; audit not recorded)",
@@ -165,8 +147,8 @@ pub(crate) fn inventory(
             }
         }
         command @ (InventoryCommand::List | InventoryCommand::Reconcile) => {
-            let reader = backup_local::LocalReconciler(config.storage.root.clone());
-            let report = match command {
+            let reader = backup_local::LocalReconciler(root.to_path_buf());
+            let discovery = match command {
                 InventoryCommand::List => backup_application::discover(&reader)?,
                 InventoryCommand::Reconcile => backup_application::reconcile(&reader)?,
                 InventoryCommand::Check | InventoryCommand::Recover => unreachable!(),
@@ -175,7 +157,7 @@ pub(crate) fn inventory(
                 InventoryCommand::Adopt { .. } => unreachable!(),
             };
             if json_output {
-                let entries: Vec<_> = report
+                let entries: Vec<_> = discovery
                     .entries
                     .iter()
                     .map(|entry| {
@@ -188,14 +170,11 @@ pub(crate) fn inventory(
                         })
                     })
                     .collect();
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(
-                        &json!({"entries": entries, "audit_recorded": report.audit_recorded})
-                    )?
-                );
+                report.data(
+                    json!({"entries": entries, "audit_recorded": discovery.audit_recorded}),
+                )?;
             } else {
-                for entry in report.entries {
+                for entry in discovery.entries {
                     println!(
                         "{}  {}  {}  {}  provenance={}",
                         entry
@@ -213,15 +192,9 @@ pub(crate) fn inventory(
             id,
             source_fingerprint,
         } => {
-            backup_local::LocalReconciler(config.storage.root.clone())
-                .adopt(id, &source_fingerprint)?;
+            backup_local::LocalReconciler(root.to_path_buf()).adopt(id, &source_fingerprint)?;
             if json_output {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(
-                        &json!({"backup_id": id, "source_fingerprint": source_fingerprint, "estate_provenance": "unconfirmed", "audit_recorded": true})
-                    )?
-                );
+                report.data(json!({"backup_id": id, "source_fingerprint": source_fingerprint, "estate_provenance": "unconfirmed", "audit_recorded": true}))?;
             } else {
                 println!("adopted {id}; source {source_fingerprint} is unconfirmed");
             }
@@ -233,19 +206,19 @@ pub(crate) fn inventory(
             confirm_rebuild,
             plan_id,
         } => {
-            let scanner = backup_local::LocalReconciler(config.storage.root.clone());
-            let (report, previous_inventory, prepared_plan) = if confirm_rebuild {
-                let (report, previous) =
+            let scanner = backup_local::LocalReconciler(root.to_path_buf());
+            let (discovery, previous_inventory, prepared_plan) = if confirm_rebuild {
+                let (discovery, previous) =
                     scanner.rebuild(&source_fingerprint, plan_id.expect("clap requires a plan"))?;
-                (report, previous, None)
+                (discovery, previous, None)
             } else if prepare_rebuild {
-                let (id, report) = scanner.prepare_rebuild(&source_fingerprint)?;
-                (report, None, Some(id))
+                let (id, discovery) = scanner.prepare_rebuild(&source_fingerprint)?;
+                (discovery, None, Some(id))
             } else {
                 (scanner.preview_rebuild(&source_fingerprint)?, None, None)
             };
             if json_output {
-                let entries: Vec<_> = report
+                let entries: Vec<_> = discovery
                     .entries
                     .iter()
                     .map(|entry| {
@@ -258,25 +231,22 @@ pub(crate) fn inventory(
                         })
                     })
                     .collect();
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&json!({
+                report.data(json!({
                         "source_fingerprint": source_fingerprint,
                         "entries": entries,
                         "estate_provenance": "unconfirmed",
                         "unknown_facts": ["source_provenance", "profile_fingerprint", "completed_at_utc", "verification"],
                         "lost_history": ["jobs", "audit", "protection", "verification", "rollback"],
-                        "audit_recorded": report.audit_recorded,
+                        "audit_recorded": discovery.audit_recorded,
                         "previous_inventory": previous_inventory,
                         "rebuilt": confirm_rebuild,
                         "plan_id": prepared_plan,
-                    }))?
-                );
+                    }))?;
             } else {
                 println!(
                     "source {source_fingerprint} is unconfirmed; rebuild loses job, audit, protection, verification, and local rollback history"
                 );
-                for entry in report.entries {
+                for entry in discovery.entries {
                     println!(
                         "{}  {}  {}  {}",
                         entry

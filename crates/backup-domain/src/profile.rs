@@ -54,14 +54,20 @@ pub struct Profile {
 
 impl Profile {
     pub fn validate(&self) -> Result<()> {
-        if self.name.is_empty() || self.name.chars().any(char::is_whitespace) {
-            bail!("profile name must be non-empty and contain no whitespace");
-        }
         if !self.database.starts_with(FIXTURE_PREFIX) {
             bail!(
                 "profile {} must target a {FIXTURE_PREFIX} database",
                 self.name
             );
+        }
+        self.validate_selection()
+    }
+
+    /// Deployment configuration may describe a production selection without authorizing
+    /// an artifact or native operation. Signed snapshots still call `validate` above.
+    pub(crate) fn validate_selection(&self) -> Result<()> {
+        if self.name.is_empty() || self.name.chars().any(char::is_whitespace) {
+            bail!("profile name must be non-empty and contain no whitespace");
         }
         for list in [&self.schemas, &self.exclude_schemas] {
             for schema in list {

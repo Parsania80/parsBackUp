@@ -63,7 +63,11 @@ pub(crate) fn tool_version(path: &Path, timeout: Duration) -> Result<(u32, Strin
     let mut command = Command::new(path);
     command.arg("--version").env_clear().env("LC_ALL", "C");
     let result = run(command, timeout, None)?;
-    let version = String::from_utf8(result.stdout)?.trim().to_owned();
+    parse_tool_version(result.stdout)
+}
+
+pub(crate) fn parse_tool_version(stdout: Vec<u8>) -> Result<(u32, String)> {
+    let version = String::from_utf8(stdout)?.trim().to_owned();
     let major = version
         .split_whitespace()
         .find_map(|part| part.split('.').next()?.parse::<u32>().ok())

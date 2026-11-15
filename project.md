@@ -1,6 +1,6 @@
 # PostgreSQL Backup Platform — Implementation Roadmap
 
-Latest implementation handoff: §40 (B06, 2026-11-14; acceptance status stated there). The operator authorized B06 implementation and the required status updates. The detailed 2026-10-05 review handoff remains in §34. The 2026-10-03 rewrite was authorized by the operator. It replaces the earlier mixed design/status document with an implementation handoff and adds a dedicated clean-code phase. It changes the work plan; it does not claim that planned behavior is implemented.
+Latest implementation handoff: §42 (H02 configuration/access/report increment, 2026-11-15; verification status stated there). H01 policy is in §41; the last completed full phase remains B06 (§40). The operator authorized H01 definition, this H02 increment and the required status updates. The detailed 2026-10-05 review handoff remains in §34. The 2026-10-03 rewrite was authorized by the operator. It replaces the earlier mixed design/status document with an implementation handoff and adds a dedicated clean-code phase. It changes the work plan; it does not claim that planned behavior is implemented.
 
 ## 1. Project vision and how to use this document
 
@@ -48,6 +48,7 @@ Local artifacts share the host's failure domain. Do not claim host-loss recovery
 | Phase S | Same-scope acquisition is tested mid-dump **and** by two real CLI processes | Opening a store removes nothing; work owns `activity.lock` shared, only `backup create` cleans it exclusively. Continuously busy stores may defer abandoned-work cleanup. |
 | Review corrections R | Consumption-bound signed/encrypted reads; process-group cleanup; overflow refusal; quoted native role exports; restore checks/preparation before mutations | Captured catalog/TOC output above 64 KiB is refused; service isolation remains H02. |
 | Operations/service | None yet | Scheduling, packaging, production hardening, API and UI remain planned. |
+| H01 policy / H02 first increment | Policy defined (§41); separate legacy/versioned parsing, capability gates, safe json-v1 envelopes and writable keyless fixture inventory dispatch implemented (§42) | H02 remains open: native auth/maintenance DB, key custody/bootstrap, resource/filesystem and true snapshot reads are pending. Production operations remain gated until V03. |
 
 Historical review evidence (before the S/C02/R increments): `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo test --workspace` passed; 167 tests passed, zero failed. Existing PostgreSQL 16/17/18 matrices have historical passing records through M4b. They were not rerun in the review or this rewrite. Test counts describe the baseline, not a target future count.
 
@@ -213,7 +214,7 @@ M5a adds restore job/resource ownership and audit. Successful native restore is 
 
 ## 12. CLI contract and planned commands
 
-Implemented commands are defined in [cli.rs](crates/backupctl/src/cli.rs): `config check`, `key generate|publish|status`, `profile list|validate`, `backup create|list|inspect|verify|protect|unprotect`, `restore plan|run`, `job list|inspect`, and `inventory check|list|verification|reconcile|adopt|rebuild|recover`. B03/B04 add `backup prune|delete` previews and digest-confirmed `run`; B05 adds `restore plan --acknowledge-older-snapshot`. Current machine output is JSON, human mode is default. Current runtime result convention is success/failure; Clap has its own usage handling. The older proposed 0–6 error taxonomy is not shipped.
+Implemented commands are defined in [cli.rs](crates/backupctl/src/cli.rs): `config check`, `key generate|publish|status`, `profile list|validate`, `backup create|list|inspect|verify|protect|unprotect`, `restore plan|run`, `job list|inspect`, and `inventory check|list|verification|reconcile|adopt|rebuild|recover`. B03/B04 add `backup prune|delete` previews and digest-confirmed `run`; B05 adds `restore plan --acknowledge-older-snapshot`. Machine output supports legacy bare `json` and the opt-in `json-v1` envelope; human mode is default. Current runtime result convention is success/failure; Clap has its own usage handling. The older proposed 0–6 error taxonomy is not shipped.
 
 Preserve existing command syntax, serialized keys, successful output meaning and asserted refusal text during C1. Correct unsafe behavior in S tasks; improve diagnostics in explicit A/H tasks with matching test/document changes. Avoid raw TOML parser snippets, which may reproduce secret input.
 
@@ -256,11 +257,13 @@ Acceptance includes accessible navigation, XSS/error/loading states, clear parti
 
 ## 15. Configuration and profiles
 
-Current configuration is one `Source`, one local `Storage`, optional encryption/signing blocks, `export_globals`, timeout and `[[profile]]` entries. Examples under [config](config) are the current schema. Do not implement the earlier illustrative profile fields such as `schedule`, `retention`, compression or alternate source references as if they already existed.
+Legacy fixture configuration is one `Source`, one local `Storage`, optional encryption/signing blocks, `export_globals`, timeout and `[[profile]]` entries. Examples under [config](config) retain that schema; versioned deployment config is a separate closed parser. Do not implement the earlier illustrative profile fields such as `schedule`, `retention`, compression or alternate source references as if they already existed.
 
 No key blocks means plaintext development output; encryption only means unsigned age development output; encryption plus signing secret means signed v1 writer. Signing without a signing secret selects the DR reader shape. Normal store constructors eagerly load configured identity/key pairs; A03 discovery, adoption and rebuild use the separate keyless inventory path.
 
-For production, introduce a versioned configuration with explicit local/remote connection security and read/write roles after H01's decision gate. Configuration reload affects only new jobs. Reject unknown fields and incompatible combinations before database or store mutation. Profiles are snapped per job; reusing a name groups retention under the existing name fingerprint, so changed selection must be visible to operators. A content-hash scope redesign is a separate decision.
+The versioned parser describes H01's local-only connection security and explicit access/read-only custody; actual production operations remain gated until V03. Configuration reload affects only new jobs. Reject unknown fields and incompatible combinations before database or store mutation. Profiles are snapped per job; reusing a name groups retention under the existing name fingerprint, so changed selection must be visible to operators. A content-hash scope redesign is a separate decision.
+
+H01 is defined in [h01-production-policy.md](docs/development/h01-production-policy.md): first-release connections remain local-only; remote TLS is deferred. `config_version=1` explicitly separates fixture/production mode, access custody and read-only snapshots. Existing unversioned examples/parser remain fixture-only. The [H02 first increment](docs/development/h02-config-access-reports.md) implements structural checks, capability gates, limited writable keyless fixture commands and `--output json-v1`; native authentication, key custody/bootstrap and true snapshot operations still refuse until their later increments. See §42 for current evidence; V03 owns production enablement.
 
 The initial CLI release can remain local-only. Remote access, separate cross-server target connections, data-only restore and writer-without-identity operation are explicit extensions, not incidental outcomes of removing the fixture-name check.
 
@@ -381,13 +384,13 @@ A new model should be able to resume from status plus contracts without trusting
 | 8 | C1 — clean code and human readability | ✅ Done | Accepted 2026-11-02; module decisions, remaining complexity and final gates are recorded in §34.4. |
 | 9 | A — complete M5a inventory/jobs/recovery | ✅ Done | A01–A08 accepted 2026-11-13, including separate JobLock hardening; evidence in §34.7. |
 | 10 | B — M5b retention/protection/deletion | ✅ Done | B01–B06 accepted; eight PG16/17/18 matrices and destructive/race/crash gates pass (§40). |
-| 11 | H — M6 hardened CLI/systemd/Debian | 🔄 Current | H01 configuration/release policy next; process/permission gates follow. |
+| 11 | H — M6 hardened CLI/systemd/Debian | 🔄 Current | H01 defined (§41); H02 configuration/reports (§42) and native auth/maintenance recovery (§43) implemented; key bootstrap and remaining hardening next. |
 | 12 | V — CLI production validation/release | ⬜ Todo | Original M9 CLI track; precedes API/UI. |
 | 13 | P — M7 API/asynchronous service | ⬜ Todo | Requires hardened core and explicit decisions. |
 | 14 | U — M8 API-backed UI | ⬜ Todo | Requires stable API. |
 | 15 | F — platform validation/release | ⬜ Todo | Original M9 full-platform track. |
 
-### ➡️ Current: #11 - H — H01 production configuration/release policy
+### ➡️ Current: #11 - H — H02 key bootstrap/custody, filesystem/resource hardening and snapshot reads
 ### ⏭️ Next: #12 - V — CLI production validation after H acceptance
 
 Task IDs below remain stable even if a phase is split into several commits. Complete dependent tasks in listed order. Independent documentation can proceed alongside its owning task; later feature coding waits for the phase prerequisites.
@@ -499,8 +502,8 @@ Deletion is non-atomic across several directories. Report partial execution hone
 
 Prerequisites: B acceptance. Implement in reviewable increments; do not enable production data merely because a package installs.
 
-1. **H01 — configuration/release policy.** Record versioned production configuration, allowed connection/target topologies, secure local credential modes and any remote TLS extension. Preserve old fixture configuration for tests. Record error/JSON version policy and public-only/read-only key custody. Decide full/data-only/overwrite support explicitly; excluded behavior stays refused.
-2. **H02 — process/filesystem hardening.** Preserve R02’s delivered process-group timeout/exit cleanup; add explicit cancellation only with its real caller. Revalidate wrappers retaining pipes after their parent exits or times out under service permissions. Verify tool provenance/matching versions, permission/ownership/no-follow paths, disk/scratch bounds and stable safe errors. Resolve key-command partial writes by validation before mutation or a documented transactional creation path. Validate true read-only discovery/verification and explicitly configured private scratch where decryption needs writes.
+1. **H01 — configuration/release policy ✅ Defined.** Completed 2026-11-15 in [h01-production-policy.md](docs/development/h01-production-policy.md): future versioned config/modes, local socket peer or loopback SCRAM/passfile, maintenance DB for lost-source recovery, fresh same-endpoint/same-major targets, explicit custody/read-only roles, versioned JSON and stable exits. Remote TLS, independent targets, data-only/overwrite and writer-without-identity remain excluded. Legacy fixtures/frozen bytes and V03 production gate stay intact; definition-only evidence is in §41.
+2. **H02 — configuration/access/report and process/filesystem hardening.** First increment implemented 2026-11-15 (§42): separate legacy/versioned configuration, capability checks and safe versioned reports while production operations remain disabled. Native auth/maintenance recovery is implemented in §43. Continue with key bootstrap/custody and the remaining hardening in reviewable increments. Record new production plan bytes/context and resource limits before adding their writers. Preserve R02’s delivered process-group timeout/exit cleanup; add explicit cancellation only with its real caller. Revalidate wrappers retaining pipes after their parent exits or times out under service permissions. Verify local auth, lost-source maintenance DB, tool provenance/matching versions, permission/ownership/no-follow paths, disk/scratch bounds and stable safe errors. Resolve key-command partial writes by validation before mutation or a documented transactional creation path. Validate true read-only discovery/verification and explicitly configured private scratch where decryption needs writes. Use H01's acceptance map; do not lift the fixture guard during H02.
 3. **H03 — systemd/package.** Build .deb targets/units under deploy/, install dedicated user and mode-controlled paths, wire profile invocation and chosen timer semantics, preserve data/keys on upgrade/removal. Verify process locks and SQLite migration under actual service permissions/sandbox. Test package reinstall/purge policy.
 4. **H04 — CI and operating guides.** Add pinned fast/matrix/package workflows; document installation, matching clients, credentials, key backup, inventory-copy consistency, recovery, stale alerts and isolated restore drills. A live SQLite database copy must use a consistent backup/export or quiescent maintenance ownership; DELETE journal does not make arbitrary concurrent raw copying safe.
 5. **H05 — clean-code checkpoint.** Review modules introduced by A/B/H against C1 rules, remove redundant adapters/branches and update ownership comments. Keep fixes and refactors distinguishable. Run affected regressions and package lifecycle gates; no global rewrite.
@@ -1031,3 +1034,115 @@ Other scenes cover exact planned/executed sets and receipts, protected/quota/pro
 | [session-log.md](session-log.md) | Modified | Append-only inspection, development and acceptance record. |
 
 T03 remains open: the inventory shares the artifact root's failure domain, and local retention does not prevent host loss or an editor replacing files and inventory. These process-kill tests do not establish power-loss behavior or an independent security audit. The trusted operator-owned root and synthetic-only guard remain required. **Next task: H01**, the configuration/release policy decision: record versioned production configuration, allowed source/target topologies, secure credential modes, error/JSON version policy, public-only/read-only custody and explicit restore support limits before implementation. Eight production CLI tasks remain (H01–H05, V01–V03), followed by four API, four UI and three platform-release tasks. Counts describe scope, not equal effort; production CLI, API and UI remain unfinished.
+
+## 41. H01 production configuration/release policy — 2026-11-15
+
+Defined [h01-production-policy.md](docs/development/h01-production-policy.md) against clean B06 checkpoint `c40a953`. This is a policy task, not a parser/security implementation or production release. Inspected current config/profile validation, CLI parse/output/error dispatch, native environment/credentials/preflight, source fingerprint inputs, restore plans, key custody, read-only working paths and H/V gates. Confirmed PostgreSQL documentation for peer, protected passfiles, client-required SCRAM, libpq environment/database-argument expansion, TLS verification and restore trust. The policy cites those primary sources; it is newly chosen H01 policy, not a retroactive ADR claim.
+
+Decisions: first release stays local-only (protected Unix socket/peer or literal loopback/SCRAM/passfile), with one source/local root and fresh same-endpoint/same-major restores. A maintenance DB must support recovery when the original logical source database is absent without changing its frozen fingerprint. Version-1 config explicitly states mode/access/read-only custody, preserves legacy unversioned fixtures and permits no production operation before V03. Writer/reader/public/inventory capabilities and true snapshot reads/private external scratch are defined. First-release writers retain the identity; remote TLS, independent target endpoints, cross-major, data-only-to-existing-schema, overwrite and writer-without-identity are deferred/refused. Future explicit `json-v1` envelopes preserve legacy fixture JSON and 0/1/2 exits. New production restore-plan bindings need their own recorded version before implementation; frozen v1 and existing plan bytes are untouched.
+
+H01 is **defined**, with documentation/example/link and unchanged-boundary checks recorded in the session log. The current binary still rejects the new TOML and output flag. No runtime, fixture configuration, dependency, schema, artifact/transcript, test harness, flow, deployment file or key material was changed. B06's 266 tests/eight matrices remain historical evidence, not rerun by H01. T03 and the production guard stay open. Seven production CLI tasks remain (H02–H05, V01–V03), followed by the unchanged API/UI/platform tracks.
+
+| File path | Change type | Description |
+|---|---|---|
+| [docs/development/h01-production-policy.md](docs/development/h01-production-policy.md) | Added | Inspected choices, versioned fields, custody/auth/topology/restore/report limits and release acceptance map. |
+| [project.md](project.md) | Modified | H01 definition, H02 ownership/sequencing, status and handoff. |
+| [README.md](README.md) | Modified | Simple policy/status explanation without implying production enablement. |
+| [session-log.md](session-log.md) | Modified | Append-only definition, sources and verification record. |
+
+**Next: H02, first increment.** Implement the legacy/versioned config split, command capability validation and safe report envelope, keeping all production-mode operations except structural config checks gated. Preserve fixture vectors and refuse unsupported combinations before side effects. Then take the native credential/maintenance connection, key bootstrap, filesystem/process, resource-limit and snapshot-read increments with their required synthetic/all-major tests. H01's policy map is authoritative for that work; H03 packaging and V03 release remain separate gates. No commit or push is part of this definition task.
+
+
+## 42. H02 configuration/access/report increment — 2026-11-15
+
+Operator authorized the first H02 increment after H01 definition. Preserved the uncommitted H01/status documentation and inspected the legacy parser, native dispatch, eager key opening, inventory-only services, native test assertions and H01's exact custody/report contracts. Recorded [h02-config-access-reports.md](docs/development/h02-config-access-reports.md) before its writers: exhaustive command/access boundaries, version selection, safe file reads, result-data ownership, errors/exits and deferred capabilities.
+
+Implemented a separate closed `ConfigV1` with explicit mode/access/read-only, source-independent tools, peer/SCRAM topology rules, literal names, profile/custody/path validation and no production enablement. Selection validation is shared without removing the fixture guard used by legacy config and frozen signed manifests. CLI config input is bounded regular/no-follow; versioned files additionally require an absolute protected service-owned mode-0600 file with descriptor-checked ancestry. Legacy relative config paths/permissions remain supported; final symlinks/special files/over-64-KiB inputs now refuse deliberately. The CLI reuses already locked workspace `libc` for open flags/descriptor traversal: one manifest/lock dependency edge, no new package/version.
+
+Authorization is exhaustive and occurs before command resources. Versioned fixtures deliver config/profile reads, empty inventory-key status and writable keyless job/inventory/protection operations; configured keys/source/tools are not opened for inventory work. Config checks do not certify referenced resources. Policy-permitted native, authenticated backup, key custody/bootstrap and snapshot operations explicitly refuse `CAPABILITY_NOT_ENABLED` until their later H02 increment. True read-only store commands never enter the legacy lock path. Every production operation except structural config check still refuses; production bare JSON is unsupported. Old plans/artifacts cannot authorize production.
+
+`--output json-v1` now wraps existing result data in exactly one versioned envelope, with stable generated errors, no parser/native/debug-chain text, preserved retention/older-snapshot codes and honest durable deletion partial partitions. Legacy successful bare JSON and config-check compact formatting remain compatible. A static phrase catalogue preserves established fixture diagnostics without arbitrary values. Legacy native failure receipts without a structured service result remain an explicit later-H02 limitation; null data does not assert zero side effects. No frozen artifact/transcript/fingerprint, plan bytes, inventory schema, PostgreSQL adapter, crypto implementation, existing config example, native harness, flow or production-source guard changed.
+
+Fast acceptance: all **278 workspace tests**, strict locked/offline Clippy and formatting pass. The new process matrix covers six role/read-only combinations across 31 command variants, production gating, strict fields/local auth/selection, protected file/FIFO/size boundaries, missing resource isolation, keyless maintenance/protection and legacy/v1 result equivalence. Existing process scenes verify exact deletion partial receipts and signed signature/checksum/archive read results. Native compatibility results and the final scope audit are recorded below; H02 itself is not complete.
+
+### H02 increment file changes
+
+| File path | Change type | Description |
+|---|---|---|
+| [crates/backup-domain/src/config_v1.rs](crates/backup-domain/src/config_v1.rs) | Added | Separate closed deployment schema and pure validation. |
+| [crates/backup-domain/src/lib.rs](crates/backup-domain/src/lib.rs) | Modified | Expose deployment config/role types. |
+| [crates/backup-domain/src/profile.rs](crates/backup-domain/src/profile.rs) | Modified | Share selection rules while retaining signed/legacy fixture guards. |
+| [crates/backupctl/src/configuration.rs](crates/backupctl/src/configuration.rs) | Added | Version routing and bounded/protected configuration reads. |
+| [crates/backupctl/src/access.rs](crates/backupctl/src/access.rs) | Added | Canonical operations, role/read-only/production gates and limited fixture dispatch. |
+| [crates/backupctl/src/output.rs](crates/backupctl/src/output.rs) | Added | Single report envelope and generated safe diagnostics. |
+| [crates/backupctl/src/main.rs](crates/backupctl/src/main.rs) | Modified | Compose parsing, authorization, legacy dispatch and final reporting. |
+| [crates/backupctl/src/cli.rs](crates/backupctl/src/cli.rs) | Modified | Add explicit json-v1 output choice. |
+| [crates/backupctl/src/backup.rs](crates/backupctl/src/backup.rs) | Modified | Route existing results through reporter; share keyless protection dispatch. |
+| [crates/backupctl/src/inventory.rs](crates/backupctl/src/inventory.rs) | Modified | Root-only keyless calls and existing result reporting. |
+| [crates/backupctl/Cargo.toml](crates/backupctl/Cargo.toml), [Cargo.lock](Cargo.lock) | Modified | Reuse existing locked libc for Unix descriptor flags. |
+| [crates/backupctl/tests/config_reports.rs](crates/backupctl/tests/config_reports.rs) | Added | Full-process configuration/access/file/report tests. |
+| [crates/backupctl/tests/store_concurrency.rs](crates/backupctl/tests/store_concurrency.rs) | Modified | Partial receipt and signed read envelope equivalence. |
+| [docs/development/h02-config-access-reports.md](docs/development/h02-config-access-reports.md) | Added | Precise increment contract and remaining limitations. |
+| [docs/development/h01-production-policy.md](docs/development/h01-production-policy.md) | Updated pending H01 document | Distinguish now implemented parsing/reports from future capabilities. |
+| [project.md](project.md), [README.md](README.md), [session-log.md](session-log.md) | Modified/appended | Implementation status, verification and next handoff. |
+
+**Next H02 increment:** native authentication/maintenance connection contracts and tests, with explicit command resource requirements, lost-source recovery, required SCRAM and trusted tools. Record new production restore-plan bytes before any production writer; preserve all current artifact/plan bytes and production gates. Follow with validated key bootstrap/custody, descriptor/resource hardening and true snapshot reads. H03–H05 and V01–V03 remain separate. Seven production CLI task IDs still remain because H02 has only partially advanced; API/UI/platform counts are unchanged. No commit or push was requested.
+
+
+### H02 increment acceptance
+
+The configuration/access/report increment is accepted on 2026-11-15: **278 workspace tests**, strict locked/offline Clippy, formatting, diff and documentation checks pass. Native compatibility covers all eight existing matrices on PostgreSQL 16/17/18 (**24 script/major combinations**), including M5a's **18 rebuild crash boundaries** and B06's **24 deletion crash boundaries**, authentic native archives, privacy controls, partial results and started-only recovery. No full H02/production release claim follows from these checks.
+
+Evidence sequencing is explicit: M1/M2/M3/M4a/key drill/M4b and full M5a PG16 passed before the final two lifecycle-message categories/direct assertions. Only `crates/backupctl/src/output.rs` differs from that recorded input set; no service, native, crypto, schema, artifact or plan behavior changed. After that correction, all 278 tests/Clippy/formatting and full B06 PG16/17/18 passed. M5a PG17/18 then completed independently using the unchanged Python test body with only the major-loop selection narrowed; both exited 0, including migrations/corruption/read-only-copy and six crash boundaries each. The earlier combined PG17 run was intentionally interrupted and is not acceptance evidence. The per-major completion lines/provenance, not the inherited all-major success banner in each narrowed body, establish what ran.
+
+Logs: `/tmp/parsbackup-h02-config-{workspace,clippy,m1_docker_smoke,m2_docker_smoke,m3_docker_smoke,m4a_docker_smoke,m4a_key_drill,m4b_docker_smoke,m5b_retention_drill}.log`, `/tmp/parsbackup-h02-config-m5a-pg16-before-lifecycle.log`, `/tmp/parsbackup-h02-config-m5a-pg17.log`, `/tmp/parsbackup-h02-config-m5a-pg18.log`. Input provenance: `/tmp/parsbackup-h02-config-before-lifecycle.sha256`, `/tmp/parsbackup-h02-config-inputs.sha256` (84 final runtime/manifest/test inputs), `/tmp/parsbackup-h02-config-m5a-selection.json` (original/selected bodies and executing binary hashes). These are ephemeral local evidence, not shipped artifacts or independent interoperability proof.
+
+Final audit verifies the exact 19-file pending scope (including preserved H01 documentation), original package versions with only the existing-libc dependency edge, unchanged runtime/test fingerprints and executing binary, parseable policy TOML/JSON, protected structural checking of the exact H01 specimen, local document targets/anchors, append-only log, unchanged November archive and test-container cleanup. Pending implementation remains native auth/maintenance DB and plan context, key bootstrap/custody, resource/filesystem/service hardening and true snapshot reads; production operations stay disabled. No commit or push.
+
+
+## 43. H02 native authentication and maintenance recovery — 2026-11-15
+
+Operator authorized the next H02 increment. The [declarative native contract](docs/development/h02-native-auth-recovery.md) was recorded before implementation. Writable versioned fixture writer/reader configurations now support live profile validation, signed create/dry-run and restore plan/run. Production dispatch remains gated before resource access; this does not complete H02 or authorize real databases.
+
+**Native contract:** root-owned non-writable no-symlink ELF client paths opened/executed by descriptor; protected service-owned passfiles, bounded explicit escaped entries and sealed in-memory child snapshots; no inherited libpq environment or interactive passwords. TCP requires actual SCRAM, with SSL/GSS encryption explicitly disabled within the local-only boundary. Peer requires administered HBA and protected socket ancestry; success alone cannot prove the HBA method. Existing capture, streaming, timeout and process-group behavior is retained. Dry-run/profile resolution open no keys/store; real create retains existing writer custody. Restore opens identity/verifier only, with no recipient or signing-secret resource.
+
+**Recovery/compatibility:** backup connects to the original database; restore version/existence/role/global/create operations connect to explicit maintenance DB, then restore applies schema/archive to the fresh target. Original database/endpoint/major retain the frozen source fingerprint. New signed fixture plan `h02-restore-plan-v3` binds mode, literal endpoint, acting user, maintenance DB, auth choice, tools and passfile paths alongside existing target/security/sections and B05 rollback binding. Canonical bytes/digests are pinned independently for v3 and legacy signed v2. Legacy v1/v2 omit the new field and retain their bytes. Legacy/versioned engine context mismatches and downgrade attempts refuse before native probes/jobs/cluster mutation. A production context is rejected; production writer compatibility remains a separate gate.
+
+**Verification accepted:** **283 workspace tests**, strict locked/offline Clippy and formatting pass. The final frozen sequential native run exits 0 for the new H02 drill and existing M2/M3/M4b on PostgreSQL 16/17/18 (**12 script/major combinations**), preserving all 88 runtime/test/manifest/binary input fingerprints. The dedicated drill uses each image's actual PG16/17/18 clients/libpq, with the host-built CLI loaded through its mounted host runtime (this is test infrastructure, not package/service acceptance). It checks successful escaped SCRAM credentials under poisoned inherited environment; actual trust/MD5/clear-password refusal; peer identity/unsafe sockets; symlink/script tool refusal; no keys/store on live resolution; missing target credentials; changed context/downgrade before jobs/target; and signed portable plus full DR recovery after source loss without recipient/signer files, with row/role/ownership/grant assertions. The existing M2/M3/M4b matrices are rerun for shared service, selection and signed/legacy restore compatibility. Full inventory/retention crash matrices are not rerun by this increment; §40/§42 evidence remains historical.
+
+Development-only harness corrections concerned signed-create result shape, serde report-map ordering versus typed canonical bytes, and replacing a failing auto-removed container restart with socket provisioning at startup. Resource tests resolved this host's `/usr/bin/true` symlink deliberately before testing a trusted ELF descriptor. Review tightened passfile owner-execute-bit refusal to exactly 0600-or-stricter, with a regression assertion. The first final driver was intentionally interrupted during its new PG18 scene for that correction; it is excluded from final evidence. No failed/interrupted run is counted as acceptance.
+
+| File path | Change type in this increment | Description |
+|---|---|---|
+| [backup-application/src/lib.rs](crates/backup-application/src/lib.rs) | Modified | Store-free scope resolver, maintenance preflight/context port, v3 writer and execution recheck. |
+| [backup-domain/src/config_v1.rs](crates/backup-domain/src/config_v1.rs) | Modified pending file | Shared literal connection validation and serializable mode/auth enums. |
+| [backup-domain/src/lib.rs](crates/backup-domain/src/lib.rs) | Modified | Exports the native context/connection types and v3 format. |
+| [backup-domain/src/restore.rs](crates/backup-domain/src/restore.rs) | Modified | v3 context/validation and frozen v2/v3 canonical tests. |
+| [backup-domain/src/fixture.rs](crates/backup-domain/src/fixture.rs) | Modified | Existing test plan explicitly has no native context. |
+| [backup-local/src/lib.rs](crates/backup-local/src/lib.rs) | Modified (test only) | Existing plan persistence test explicitly has no context. |
+| [backup-postgres/src/lib.rs](crates/backup-postgres/src/lib.rs) | Modified | Configured adapter, maintenance/target routes and explicit globals/create DB selection. |
+| [backup-postgres/src/tools.rs](crates/backup-postgres/src/tools.rs) | Modified | Shared version parser; legacy subprocess behavior retained. |
+| [backup-postgres/src/native.rs](crates/backup-postgres/src/native.rs) | Added | Protected descriptor resources, SCRAM/peer environment, sealed passfile and safety tests. |
+| [backupctl/src/access.rs](crates/backupctl/src/access.rs) | Modified pending file | Enables only the specified writable fixture native operations. |
+| [backupctl/src/native.rs](crates/backupctl/src/native.rs) | Added | Explicit required resources and reader/writer custody dispatch. |
+| [backupctl/src/main.rs](crates/backupctl/src/main.rs) | Modified | Shared restore dispatcher/report rendering with explicit adapter/store. |
+| [backupctl/src/backup.rs](crates/backupctl/src/backup.rs) | Modified | Adapter injection while preserving legacy defaults. |
+| [backupctl/src/output.rs](crates/backupctl/src/output.rs) | Modified pending file | Static safe native-context refusal. |
+| [backupctl/tests/config_reports.rs](crates/backupctl/tests/config_reports.rs) | Modified pending file | Required-resource refusal within the exhaustive role/mode matrix. |
+| [tests/h02_native_auth_recovery.sh](tests/h02_native_auth_recovery.sh) | Added executable | Actual PG16/17/18 authentication and source-loss recovery acceptance. |
+| [h02-native-auth-recovery.md](docs/development/h02-native-auth-recovery.md) | Added | Precise native/resource/plan compatibility contract. |
+| [h02-config-access-reports.md](docs/development/h02-config-access-reports.md) | Modified pending file | Explicit native follow-up supersedes earlier availability gate. |
+| [README.md](README.md) | Modified | Simple delivered behavior, release limit and handoff. |
+| [project.md](project.md) | Modified | Current status, evidence, scope and next increment. |
+| [session-log.md](session-log.md) | Appended only | Audit and verification outcome. |
+
+**Next logical step:** H02 validated key bootstrap/custody and command-specific key access, followed by descriptor/resource/service hardening and true snapshot reads. H03 packaging, H04 CI/guides, H05 review and V01–V03 remain required. Seven production CLI task IDs still remain because H02 is partial; API/UI/platform counts are unchanged. Production enablement and T03 stay open. All prior H01/H02 uncommitted edits are preserved; no dependency package/version, schema, frozen artifact, flow, config example, deployment file, commit or push change is introduced here.
+
+
+### H02 native increment acceptance
+
+Final native acceptance completed at 11:02 Asia/Tehran on 2026-11-15. The new drill passes all three majors with successful SCRAM/peer, all three refused fallback methods per major, safe resources/context checks and both portable and full DR source-loss recovery. M2/M3/M4b each pass all three majors with legacy plans, selective/section restore, signed authentication/forgery/source binding and DR without signing custody. The pre-correction/interrupted runs are excluded. Existing `rage` locale warnings remain visible in the M4b log; its complete assertions and exit status pass.
+
+Ephemeral evidence: `/tmp/parsbackup-h02-native-{workspace,clippy,build}.log`, `/tmp/parsbackup-h02-native-h02_native_auth_recovery.log`, `/tmp/parsbackup-h02-native-{m2_docker_smoke,m3_docker_smoke,m4b_docker_smoke}.log` and `/tmp/parsbackup-h02-native-inputs.sha256`. These are local test evidence, not package/service, production or independent interoperability certification. The mounted host loader exists only to run this host-built CLI against real image-native clients; it does not change the product's native environment policy.
+
+The increment touches the 21 files listed above. Combined pending H01/H02 work totals **29 files**, with no staging, commit or push. Final checks cover all input fingerprints, canonical vectors, 201 local document targets/fragments, fenced TOML/JSON, nine shell scripts/45 Python blocks, formatting/diff, append-only log, unchanged November archive/package versions and scoped test cleanup. H02 remains partial; next is validated key bootstrap/custody, followed by filesystem/resource/service hardening and true snapshot reads. Full H/V acceptance is still required before production release.

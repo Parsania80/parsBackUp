@@ -11,6 +11,7 @@ pub mod protocol;
 mod artifact;
 mod artifact_v1;
 mod config;
+mod config_v1;
 mod profile;
 mod restore;
 mod retention;
@@ -26,8 +27,11 @@ pub use artifact_v1::{
     ArtifactManifest, PublicHeader, RequestedSelection, profile_fingerprint, source_fingerprint,
 };
 pub use config::{Config, Encryption, Signing, Source, Storage};
+pub use config_v1::{Access, ConfigMode, ConfigV1, LocalAuth, SourceV1, is_literal_database_name};
 pub use profile::{Profile, SelectionMode, is_safe_created_schema_name};
-pub use restore::{RestorePlan, RestoreSections, RestoreSecurityPolicy};
+pub use restore::{
+    NativeRestoreContext, RESTORE_PLAN_V3, RestorePlan, RestoreSections, RestoreSecurityPolicy,
+};
 pub use retention::{
     ArtifactSnapshot, DELETION_FILES, DELETION_PLAN_FORMAT, DELETION_PLAN_MAX_BYTES,
     DELETION_PLAN_TTL_MS, DeletionPlan, FileSnapshot, Protection, RetentionExclusion,

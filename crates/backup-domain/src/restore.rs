@@ -105,6 +105,42 @@ impl RestoreSecurityPolicy {
     }
 }
 
+pub const RESTORE_PLAN_V3: &str = "h02-restore-plan-v3";
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeRestoreContext {
+    pub mode: crate::ConfigMode,
+    pub host: String,
+    pub port: u16,
+    pub user: String,
+    pub maintenance_database: String,
+    pub auth: crate::LocalAuth,
+    pub client_bin_dir: std::path::PathBuf,
+    pub password_file: Option<std::path::PathBuf>,
+}
+impl NativeRestoreContext {
+    pub fn validate(&self) -> Result<()> {
+        // Reuse the closed connection validation rather than introducing a second
+        // accepted endpoint/name grammar. Production has no writer in this increment.
+        let source = crate::SourceV1 {
+            host: self.host.clone(),
+            port: self.port,
+            user: self.user.clone(),
+            database: "backupctl_fixture_context".into(),
+            maintenance_database: self.maintenance_database.clone(),
+            auth: self.auth,
+            password_file: self.password_file.clone(),
+        };
+        anyhow::ensure!(
+            self.mode == crate::ConfigMode::Fixture
+                && crate::config_v1::absolute(&self.client_bin_dir),
+            "invalid native restore context"
+        );
+        source.validate_connection()
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RestorePlan {
@@ -123,17 +159,35 @@ pub struct RestorePlan {
     pub expires_unix_ms: u128,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rollback: Option<crate::RollbackBinding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_context: Option<NativeRestoreContext>,
 }
 
 impl RestorePlan {
     pub fn validate(&self, now_unix_ms: u128) -> Result<()> {
-        if self.format != PLAN_FORMAT && self.format != crate::RESTORE_PLAN_V2 {
+        if self.format != PLAN_FORMAT
+            && self.format != crate::RESTORE_PLAN_V2
+            && self.format != RESTORE_PLAN_V3
+        {
             bail!("unrecognized restore plan format");
         }
         match (&self.rollback, self.format.as_str()) {
             (None, PLAN_FORMAT) => {}
-            (Some(binding), crate::RESTORE_PLAN_V2) => binding.validate()?,
+            (Some(binding), crate::RESTORE_PLAN_V2 | RESTORE_PLAN_V3) => binding.validate()?,
             _ => bail!("restore plan version does not match its rollback binding"),
+        }
+        match (&self.native_context, self.format.as_str()) {
+            (Some(context), RESTORE_PLAN_V3) => {
+                context.validate()?;
+                anyhow::ensure!(
+                    crate::is_literal_database_name(&self.target_database)
+                        && crate::is_literal_database_name(&self.artifact_database)
+                        && self.artifact_database.starts_with(FIXTURE_PREFIX),
+                    "invalid native plan database"
+                );
+            }
+            (None, PLAN_FORMAT | crate::RESTORE_PLAN_V2) => {}
+            _ => bail!("restore plan version does not match its native context"),
         }
         if !self.target_database.starts_with(FIXTURE_PREFIX) {
             bail!("restore target must be a synthetic fixture database");
@@ -149,12 +203,14 @@ impl RestorePlan {
         if now_unix_ms >= self.expires_unix_ms {
             bail!("restore plan has expired; create a new plan");
         }
-        if self.format == crate::RESTORE_PLAN_V2
-            && (now_unix_ms < self.created_unix_ms
-                || self
-                    .created_unix_ms
-                    .checked_add(u128::from(crate::PLAN_TTL_SECONDS) * 1000)
-                    != Some(self.expires_unix_ms))
+        if matches!(
+            self.format.as_str(),
+            crate::RESTORE_PLAN_V2 | RESTORE_PLAN_V3
+        ) && (now_unix_ms < self.created_unix_ms
+            || self
+                .created_unix_ms
+                .checked_add(u128::from(crate::PLAN_TTL_SECONDS) * 1000)
+                != Some(self.expires_unix_ms))
         {
             bail!("invalid restore plan time window");
         }
@@ -252,6 +308,68 @@ mod tests {
         assert!(plan.validate(1500).is_err());
         plan.rollback.as_mut().unwrap().acknowledged = false;
         plan.validate(1500).unwrap();
+    }
+
+    #[test]
+    fn native_plan_and_legacy_signed_plan_have_frozen_canonical_bytes() {
+        let v3 = br#"{"format":"h02-restore-plan-v3","id":"11111111-1111-4111-8111-111111111111","artifact_id":"22222222-2222-4222-8222-222222222222","artifact_database":"backupctl_fixture_m1","source_major":16,"client_version":"pg_restore (PostgreSQL) 16.4","target_database":"backupctl_fixture_dr","security":{"roles":false,"ownership":false,"privileges":false},"sections":{"pre_data":true,"data":true,"post_data":true},"artifact_scope":null,"created_unix_ms":1000,"expires_unix_ms":901000,"rollback":{"source_fingerprint":"aaaaaaaaaaaaaaaa","signer_id":"bbbbbbbbbbbbbbbb","completed_at_utc":"2026-11-01T00:00:00Z","payload_sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","manifest_sha256":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","high_water":null,"acknowledged":false},"native_context":{"mode":"fixture","host":"127.0.0.1","port":5432,"user":"backup","maintenance_database":"postgres","auth":"scram-passfile","client_bin_dir":"/usr/lib/postgresql/16/bin","password_file":"/private/passfile"}}"#;
+        let plan: RestorePlan = serde_json::from_slice(v3).unwrap();
+        plan.validate(1500).unwrap();
+        assert_eq!(serde_json::to_vec(&plan).unwrap(), v3);
+        assert_eq!(
+            plan.digest(),
+            "820c8e6f07924e7b107c4df864913fd940b512349fac01c4186e00f69172f854"
+        );
+        let v2 = br#"{"format":"m5b-restore-plan-v2","id":"11111111-1111-4111-8111-111111111111","artifact_id":"22222222-2222-4222-8222-222222222222","artifact_database":"backupctl_fixture_m1","source_major":16,"client_version":"pg_restore (PostgreSQL) 16.4","target_database":"backupctl_fixture_dr","security":{"roles":false,"ownership":false,"privileges":false},"sections":{"pre_data":true,"data":true,"post_data":true},"artifact_scope":null,"created_unix_ms":1000,"expires_unix_ms":901000,"rollback":{"source_fingerprint":"aaaaaaaaaaaaaaaa","signer_id":"bbbbbbbbbbbbbbbb","completed_at_utc":"2026-11-01T00:00:00Z","payload_sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","manifest_sha256":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","high_water":null,"acknowledged":false}}"#;
+        let legacy: RestorePlan = serde_json::from_slice(v2).unwrap();
+        legacy.validate(1500).unwrap();
+        assert_eq!(serde_json::to_vec(&legacy).unwrap(), v2);
+        assert_eq!(
+            legacy.digest(),
+            "9f9361e5ebc80312749acd990e5bdf668b8eac28d374901ba2e8c3c1ce81e8b6"
+        );
+        for (field, changed) in [
+            ("mode", serde_json::json!("production")),
+            ("host", serde_json::json!("::1")),
+            ("port", serde_json::json!(5433)),
+            ("user", serde_json::json!("restore")),
+            ("maintenance_database", serde_json::json!("template1")),
+            ("auth", serde_json::json!("peer")),
+            ("client_bin_dir", serde_json::json!("/other/bin")),
+            ("password_file", serde_json::json!("/other/passfile")),
+        ] {
+            let mut value = serde_json::to_value(&plan).unwrap();
+            value["native_context"][field] = changed;
+            let changed: RestorePlan = serde_json::from_value(value).unwrap();
+            assert_ne!(plan.digest(), changed.digest(), "{field}");
+        }
+        for (field, changed) in [
+            ("native_context", serde_json::Value::Null),
+            ("rollback", serde_json::Value::Null),
+            ("format", serde_json::json!(crate::RESTORE_PLAN_V2)),
+            (
+                "target_database",
+                serde_json::json!("backupctl_fixture_dr host=elsewhere"),
+            ),
+            ("artifact_database", serde_json::json!("postgres")),
+        ] {
+            let mut value = serde_json::to_value(&plan).unwrap();
+            value[field] = changed;
+            assert!(
+                serde_json::from_value::<RestorePlan>(value)
+                    .unwrap()
+                    .validate(1500)
+                    .is_err()
+            );
+        }
+        let mut invalid = plan.clone();
+        invalid.native_context.as_mut().unwrap().mode = crate::ConfigMode::Production;
+        assert!(invalid.validate(1500).is_err());
+        invalid = plan.clone();
+        invalid.native_context.as_mut().unwrap().client_bin_dir = "/usr/../bin".into();
+        assert!(invalid.validate(1500).is_err());
+        assert!(plan.validate(999).is_err());
+        assert!(plan.validate(901000).is_err());
     }
 
     #[test]

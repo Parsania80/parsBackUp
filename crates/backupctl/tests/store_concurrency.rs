@@ -1198,6 +1198,27 @@ fn cli_partial_failure_prints_durable_partition_and_recovery_never_starts_pendin
         serde_json::json!(&preview["candidates"].as_array().unwrap()[1..])
     );
     assert_eq!(partial["audit_recorded"], true);
+    // H02's opt-in envelope preserves the exact persisted receipt and exit 1.
+    let envelope = scene.run(&[
+        "--output",
+        "json-v1",
+        "backup",
+        "prune",
+        "run",
+        id,
+        "--confirm-digest",
+        digest,
+    ]);
+    assert_eq!(envelope.status.code(), Some(1));
+    assert!(envelope.stderr.is_empty());
+    let envelope: serde_json::Value = serde_json::from_slice(&envelope.stdout).unwrap();
+    assert_eq!(envelope["format"], "backupctl-cli-report-v1");
+    assert_eq!(envelope["operation"], "backup.prune.run");
+    assert_eq!(envelope["status"], "partial");
+    assert_eq!(envelope["error"]["code"], "DELETION_RECOVERY_REQUIRED");
+    let mut expected = partial.clone();
+    expected["audit_recorded"] = serde_json::json!(false);
+    assert_eq!(envelope["data"], expected);
     let first = preview["candidates"][0].as_str().unwrap();
     assert!(!scene.artifacts().join(first).exists());
     let inventory = Inventory::open_read_only_bound(&index).unwrap();
@@ -1256,4 +1277,39 @@ fn cli_partial_failure_prints_durable_partition_and_recovery_never_starts_pendin
         serde_json::json!([])
     );
     assert_eq!(fs::read(&index).unwrap(), before);
+}
+
+#[test]
+fn versioned_reports_wrap_existing_signed_read_results_without_changing_their_data() {
+    let scene = signed_retention_scene("h02-reports", 2);
+    let list = ctl_json(&scene, &["backup", "list"]);
+    let id = list["signed"][0]["backup_id"].as_str().unwrap();
+    for args in [
+        vec!["backup", "list"],
+        vec!["backup", "inspect", id],
+        vec![
+            "backup",
+            "verify",
+            id,
+            "--level",
+            "signature",
+            "--read-only",
+        ],
+        vec!["backup", "verify", id, "--level", "checksum", "--read-only"],
+        vec!["backup", "verify", id, "--level", "archive", "--read-only"],
+        vec!["job", "list"],
+        vec!["inventory", "check"],
+        vec!["inventory", "list"],
+    ] {
+        let bare = ctl_json(&scene, &args);
+        let mut flags = vec!["--output", "json-v1"];
+        flags.extend_from_slice(&args);
+        let output = scene.run(&flags);
+        assert!(output.status.success(), "{}", text(&output));
+        assert!(output.stderr.is_empty());
+        let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(envelope["data"], bare);
+        assert_eq!(envelope["status"], "ok");
+        assert!(envelope["error"].is_null());
+    }
 }

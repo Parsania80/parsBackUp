@@ -3,6 +3,7 @@ use crate::cli::{
     selection_json,
 };
 use crate::open_store;
+use crate::output::Reporter;
 use crate::report::{
     print_backup_created, print_inspect, print_inventory, print_recovery, print_selection,
     print_verify,
@@ -12,7 +13,17 @@ use backup_application::{BackupService, VerifyService};
 use backup_domain::{Config, VERIFY_ARCHIVE, VERIFY_CHECKSUM, VERIFY_SIGNATURE};
 use backup_postgres::PostgresAdapter;
 
-pub(crate) fn run(config: Config, command: BackupCommand, json: bool) -> Result<()> {
+pub(crate) fn run(config: Config, command: BackupCommand, report: &mut Reporter) -> Result<()> {
+    run_with_engine(config, command, PostgresAdapter, report)
+}
+
+pub(crate) fn run_with_engine(
+    config: Config,
+    command: BackupCommand,
+    engine: PostgresAdapter,
+    report: &mut Reporter,
+) -> Result<()> {
+    let json = report.is_json();
     match command {
         BackupCommand::Prune {
             command: Some(command),
@@ -21,7 +32,7 @@ pub(crate) fn run(config: Config, command: BackupCommand, json: bool) -> Result<
             config,
             command,
             backup_domain::RetentionOperation::Prune,
-            json,
+            report,
         )?,
         BackupCommand::Delete {
             command: Some(command),
@@ -30,7 +41,7 @@ pub(crate) fn run(config: Config, command: BackupCommand, json: bool) -> Result<
             config,
             command,
             backup_domain::RetentionOperation::Delete,
-            json,
+            report,
         )?,
         BackupCommand::Prune {
             keep_last,
@@ -45,55 +56,18 @@ pub(crate) fn run(config: Config, command: BackupCommand, json: bool) -> Result<
                 keep_last: keep_last.expect("clap requires quota for preview"),
                 profile_fingerprint: backup_domain::profile_fingerprint(name),
             };
-            retention(config, request, json)?;
+            retention(config, request, report)?;
         }
         BackupCommand::Delete { id, command: None } => retention(
             config,
             backup_domain::RetentionRequest::Delete {
                 backup_id: id.expect("clap requires ID for preview"),
             },
-            json,
+            report,
         )?,
         BackupCommand::Protect { id } | BackupCommand::Unprotect { id } => {
             let protected = matches!(command, BackupCommand::Protect { .. });
-            let report = backup_application::InventoryService::new(backup_local::LocalProtection(
-                config.storage.root.clone(),
-            ))
-            .set_protection(id, protected)?;
-            let state = if report.protected {
-                "protected"
-            } else {
-                "unprotected"
-            };
-            if json {
-                if report.previous.is_none() && !report.protected {
-                    eprintln!(
-                        "prior protection was unknown; explicit unprotect establishes unprotected and cannot recover lost protection history"
-                    );
-                }
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "backup_id": report.backup_id,
-                        "protection": state,
-                        "changed": report.changed,
-                        "audit_recorded": report.changed,
-                    }))?
-                );
-            } else {
-                println!(
-                    "{}: {} -> {} (changed={}, audit_recorded={})",
-                    report.backup_id,
-                    match report.previous {
-                        None => "unknown",
-                        Some(true) => "protected",
-                        Some(false) => "unprotected",
-                    },
-                    state,
-                    report.changed,
-                    report.changed
-                );
-            }
+            protection(&config.storage.root, id, protected, report)?;
         }
         BackupCommand::Create {
             confirm_synthetic,
@@ -108,19 +82,16 @@ pub(crate) fn run(config: Config, command: BackupCommand, json: bool) -> Result<
                     print_recovery(&recovery);
                 }
             }
-            let service = BackupService::new(PostgresAdapter, store);
+            let service = BackupService::new(engine.clone(), store);
             if dry_run {
                 let (info, selection) = service.resolve(&config, profile.as_deref())?;
                 if json {
-                    println!(
-                        "{}",
-                        serde_json::to_string_pretty(&serde_json::json!({
-                            "profile": profile,
-                            "source_major": info.source_major,
-                            "client_version": info.dump_client_version,
-                            "selection": selection_json(&selection),
-                        }))?
-                    );
+                    report.data(serde_json::json!({
+                        "profile": profile,
+                        "source_major": info.source_major,
+                        "client_version": info.dump_client_version,
+                        "selection": selection_json(&selection),
+                    }))?;
                 } else {
                     println!(
                         "resolved scope for source major {} (nothing written)",
@@ -144,26 +115,26 @@ pub(crate) fn run(config: Config, command: BackupCommand, json: bool) -> Result<
             }
             let created = service.create(&config, profile.as_deref())?;
             if json {
-                let report = json_created(&created)?;
-                println!("{}", serde_json::to_string_pretty(&report)?);
+                let value = json_created(&created)?;
+                report.data(value)?;
             } else {
                 print_backup_created(&created);
             }
         }
         BackupCommand::List => {
-            let inventory = BackupService::new(PostgresAdapter, open_store(&config)?).list()?;
+            let inventory = BackupService::new(engine.clone(), open_store(&config)?).list()?;
             if json {
-                let report = json_inventory(&inventory)?;
-                println!("{}", serde_json::to_string_pretty(&report)?);
+                let value = json_inventory(&inventory)?;
+                report.data(value)?;
             } else {
                 print_inventory(&inventory);
             }
         }
         BackupCommand::Inspect { id } => {
-            let record = BackupService::new(PostgresAdapter, open_store(&config)?).inspect(id)?;
+            let record = BackupService::new(engine.clone(), open_store(&config)?).inspect(id)?;
             if json {
-                let report = json_record(&record)?;
-                println!("{}", serde_json::to_string_pretty(&report)?);
+                let value = json_record(&record)?;
+                report.data(value)?;
             } else {
                 print_inspect(&record);
             }
@@ -174,44 +145,46 @@ pub(crate) fn run(config: Config, command: BackupCommand, json: bool) -> Result<
             read_only,
         } => {
             let store = open_store(&config)?;
-            let service = VerifyService::new(PostgresAdapter, store);
+            let service = VerifyService::new(engine.clone(), store);
             let level_name = match level {
                 VerifyLevel::Signature => VERIFY_SIGNATURE,
                 VerifyLevel::Checksum => VERIFY_CHECKSUM,
                 VerifyLevel::Archive => VERIFY_ARCHIVE,
             };
-            let report = if read_only {
+            let verification = if read_only {
                 service.verify_read_only(&config, id, level_name)?
             } else {
                 service.verify(&config, id, level_name)?
             };
             if json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "artifact_id": report.artifact_id,
-                        "level": report.level,
-                        "payload_size_bytes": report.payload_size_bytes,
-                        "payload_sha256": report.payload_sha256,
-                        "globals_size_bytes": report.globals_size_bytes,
-                        "globals_sha256": report.globals_sha256,
-                        "audit_recorded": report.audit_recorded,
-                        "origin": report.origin.as_ref().map(|origin| serde_json::json!({
-                            "signer_id": origin.signer_id,
-                            "recipient_id": origin.recipient_id,
-                            "signature_suite": origin.signature_suite,
-                        })),
-                    }))?
-                );
+                report.data(serde_json::json!({
+                    "artifact_id": verification.artifact_id,
+                    "level": verification.level,
+                    "payload_size_bytes": verification.payload_size_bytes,
+                    "payload_sha256": verification.payload_sha256,
+                    "globals_size_bytes": verification.globals_size_bytes,
+                    "globals_sha256": verification.globals_sha256,
+                    "audit_recorded": verification.audit_recorded,
+                    "origin": verification.origin.as_ref().map(|origin| serde_json::json!({
+                        "signer_id": origin.signer_id,
+                        "recipient_id": origin.recipient_id,
+                        "signature_suite": origin.signature_suite,
+                    })),
+                }))?;
             } else {
-                print_verify(&report);
+                print_verify(&verification);
             }
         }
     }
     Ok(())
 }
 
-fn retention(config: Config, request: backup_domain::RetentionRequest, json: bool) -> Result<()> {
+fn retention(
+    config: Config,
+    request: backup_domain::RetentionRequest,
+    report: &mut Reporter,
+) -> Result<()> {
+    let json = report.is_json();
     let r = backup_application::preview_retention(&backup_local::LocalRetention(config), &request)?;
     let value = serde_json::json!({
         "operation": r.operation, "source_fingerprint": r.source_fingerprint,
@@ -221,7 +194,7 @@ fn retention(config: Config, request: backup_domain::RetentionRequest, json: boo
         "audit_recorded": r.audit_recorded,
     });
     if json {
-        println!("{}", serde_json::to_string_pretty(&value)?);
+        report.data(value)?;
     } else {
         println!("Retention preview (no deletion):");
         println!("{}", serde_json::to_string_pretty(&value)?);
@@ -236,8 +209,9 @@ fn deletion(
     config: Config,
     command: DeletionCommand,
     operation: backup_domain::RetentionOperation,
-    json: bool,
+    report: &mut Reporter,
 ) -> Result<()> {
+    let json = report.is_json();
     let DeletionCommand::Run {
         plan_id,
         confirm_digest,
@@ -250,14 +224,11 @@ fn deletion(
     )?;
     let r = outcome.result;
     if json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
+        report.data(serde_json::json!({
                 "operation": r.operation, "plan_id": r.plan_id, "digest": r.digest, "job_id": r.job_id,
                 "outcome": r.outcome, "completed": r.completed, "deleting": r.deleting, "pending": r.pending,
                 "audit_recorded": r.audit_recorded,
-            }))?
-        );
+            }))?;
     } else {
         println!(
             "{:?} plan={} digest={} job={} outcome={} completed={:?} deleting={:?} pending={:?} audit_recorded={}",
@@ -273,7 +244,53 @@ fn deletion(
         );
     }
     if let Some(code) = outcome.error {
+        report.partial();
         bail!("{code}: run inventory recover for started IDs; pending IDs require a new preview");
+    }
+    Ok(())
+}
+
+pub(crate) fn protection(
+    root: &std::path::Path,
+    id: uuid::Uuid,
+    protected: bool,
+    report: &mut Reporter,
+) -> Result<()> {
+    let json = report.is_json();
+    let protection = backup_application::InventoryService::new(backup_local::LocalProtection(
+        root.to_path_buf(),
+    ))
+    .set_protection(id, protected)?;
+    let state = if protection.protected {
+        "protected"
+    } else {
+        "unprotected"
+    };
+    if json {
+        if protection.previous.is_none() && !protection.protected {
+            eprintln!(
+                "prior protection was unknown; explicit unprotect establishes unprotected and cannot recover lost protection history"
+            );
+        }
+        report.data(serde_json::json!({
+            "backup_id": protection.backup_id,
+            "protection": state,
+            "changed": protection.changed,
+            "audit_recorded": protection.changed,
+        }))?;
+    } else {
+        println!(
+            "{}: {} -> {} (changed={}, audit_recorded={})",
+            protection.backup_id,
+            match protection.previous {
+                None => "unknown",
+                Some(true) => "protected",
+                Some(false) => "unprotected",
+            },
+            state,
+            protection.changed,
+            protection.changed
+        );
     }
     Ok(())
 }

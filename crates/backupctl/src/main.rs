@@ -2,19 +2,24 @@
 //! and print either the human report (see `report`) or the JSON of the same
 //! result. Argument types live in `cli`; nothing here computes domain rules.
 
+mod access;
 mod backup;
 mod cli;
+mod configuration;
 mod inventory;
+mod native;
+mod output;
 mod report;
 
 use crate::cli::{
-    Cli, ConfigCommand, KeyCommand, Output, ProfileCommand, RestoreCommand, SecurityPreset,
-    TopCommand, key_json, sections_from, selection_json, signing_json,
+    Cli, ConfigCommand, KeyCommand, ProfileCommand, RestoreCommand, SecurityPreset, TopCommand,
+    key_json, sections_from, selection_json, signing_json,
 };
+use crate::output::{Refusal, Reporter};
 use crate::report::{
     print_keys, print_plan, print_profile_scope, print_restore, print_selection, print_signing_keys,
 };
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Result, anyhow};
 use backup_application::{BackupService, RestoreService};
 use backup_domain::{AGE_FORMAT, Config, DEV_FORMAT, RestoreSecurityPolicy};
 use backup_local::{
@@ -26,13 +31,18 @@ use clap::Parser;
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
-    match run() {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(error) => {
-            // Full cause chain; engine output is deliberately withheld by the
-            // adapter so this can never carry credentials or SQL data.
-            eprintln!("error: {error:?}");
-            ExitCode::FAILURE
+    let cli = Cli::parse();
+    let mut report = Reporter::new(cli.output, cli.command.operation());
+    let result = run(cli, &mut report);
+    report.finish(result)
+}
+
+fn run(cli: Cli, report: &mut Reporter) -> Result<()> {
+    let path = cli.config.as_ref().ok_or(Refusal("CONFIG_INVALID"))?;
+    match configuration::load(path)? {
+        configuration::Configuration::Legacy(config) => run_legacy(config, cli.command, report),
+        configuration::Configuration::V1(config) => {
+            access::run(config, cli.command, cli.output, report)
         }
     }
 }
@@ -67,17 +77,9 @@ fn open_store(config: &Config) -> Result<LocalStore> {
     }
 }
 
-fn run() -> Result<()> {
-    let cli = Cli::parse();
-    let json = matches!(cli.output, Output::Json);
-    let config_path = cli.config.as_ref().context("--config is required")?;
-    let content = std::fs::read_to_string(config_path).context("read configuration file")?;
-    // Never render the TOML error: its source snippet repeats field values,
-    // which must not reach CLI output or logs.
-    let config: Config = toml::from_str(&content)
-        .map_err(|_| anyhow!("invalid configuration; expected M3 TOML fields"))?;
-    config.validate()?;
-    match cli.command {
+fn run_legacy(config: Config, command: TopCommand, report: &mut Reporter) -> Result<()> {
+    let json = report.is_json();
+    match command {
         TopCommand::Config {
             command: ConfigCommand::Check,
         } => {
@@ -98,9 +100,8 @@ fn run() -> Result<()> {
                 DEV_FORMAT
             };
             if json {
-                println!(
-                    "{{\"valid\":true,\"mode\":\"synthetic-only\",\"encryption\":{encrypted},\"signing\":{signed},\"shape\":\"{shape}\"}}"
-                );
+                report.data(serde_json::json!({"valid":true,"mode":"synthetic-only",
+                    "encryption":encrypted,"signing":signed,"shape":shape}))?;
             } else {
                 println!("configuration valid (synthetic-only mode)");
                 println!("active blocks: {blocks}; this store writes: {shape}");
@@ -149,15 +150,15 @@ fn run() -> Result<()> {
                 }
             };
             if json {
-                let mut report = serde_json::json!({
+                let mut value = serde_json::json!({
                     "identity": key_json("identity", &identity),
                     "recipient": key_json("recipient", &recipient),
                 });
                 if let Some(statuses) = &signing {
-                    report["signing"] =
+                    value["signing"] =
                         serde_json::Value::Array(statuses.iter().map(signing_json).collect());
                 }
-                println!("{}", serde_json::to_string_pretty(&report)?);
+                report.data(value)?;
             } else {
                 print_keys(&identity, &recipient);
                 if let Some(statuses) = &signing {
@@ -168,7 +169,7 @@ fn run() -> Result<()> {
         TopCommand::Profile { command } => match command {
             ProfileCommand::List => {
                 if json {
-                    println!("{}", serde_json::to_string_pretty(&config.profiles)?);
+                    report.data(serde_json::to_value(&config.profiles)?)?;
                 } else if config.profiles.is_empty() {
                     println!("no profiles configured");
                 } else {
@@ -185,14 +186,11 @@ fn run() -> Result<()> {
                 let service = BackupService::new(PostgresAdapter, store);
                 let (info, selection) = service.resolve(&config, Some(&name))?;
                 if json {
-                    println!(
-                        "{}",
-                        serde_json::to_string_pretty(&serde_json::json!({
-                            "profile": profile,
-                            "source_major": info.source_major,
-                            "selection": selection_json(&selection),
-                        }))?
-                    );
+                    report.data(serde_json::json!({
+                        "profile": profile,
+                        "source_major": info.source_major,
+                        "selection": selection_json(&selection),
+                    }))?;
                 } else {
                     print_profile_scope(profile);
                     println!("resolves against source major {}", info.source_major);
@@ -200,67 +198,75 @@ fn run() -> Result<()> {
                 }
             }
         },
-        TopCommand::Backup { command } => backup::run(config, command, json)?,
-        TopCommand::Job { command } => inventory::job(&config, command, json)?,
-        TopCommand::Inventory { command } => inventory::inventory(&config, command, json)?,
+        TopCommand::Backup { command } => backup::run(config, command, report)?,
+        TopCommand::Job { command } => inventory::job(&config.storage.root, command, report)?,
+        TopCommand::Inventory { command } => {
+            inventory::inventory(&config.storage.root, command, report)?
+        }
         TopCommand::Restore { command } => {
             let store = open_store(&config)?;
-            let service = RestoreService::new(PostgresAdapter, store);
-            match command {
-                RestoreCommand::Plan {
-                    id,
-                    target,
-                    security,
-                    sections,
-                    acknowledge_older_snapshot,
-                } => {
-                    let policy = match security {
-                        SecurityPreset::Dr => RestoreSecurityPolicy::dr_full(),
-                        SecurityPreset::Portable => RestoreSecurityPolicy::portable(),
-                    };
-                    let plan = service.plan_with_acknowledgement(
-                        &config,
-                        id,
-                        &target,
-                        policy,
-                        sections_from(&sections),
-                        acknowledge_older_snapshot,
-                    )?;
-                    if json {
-                        println!(
-                            "{}",
-                            serde_json::to_string_pretty(&serde_json::json!({
-                                "plan": plan,
-                                "digest": plan.digest(),
-                            }))?
-                        );
-                    } else {
-                        print_plan(&plan);
-                    }
-                }
-                RestoreCommand::Run {
-                    plan,
-                    confirm_target,
-                } => {
-                    let executed = service.run(&config, plan, &confirm_target)?;
-                    if json {
-                        println!(
-                            "{}",
-                            serde_json::to_string_pretty(&serde_json::json!({
-                                "plan_id": executed.plan.id,
-                                "digest": executed.plan.digest(),
-                                "artifact_id": executed.plan.artifact_id,
-                                "target_database": executed.plan.target_database,
-                                "sections": executed.plan.sections,
-                                "security": executed.plan.security,
-                                "verification_level": executed.verification_level,
-                                "recorded_in_artifact": executed.recorded_in_artifact,
-                            }))?
-                        );
-                    } else {
-                        print_restore(&executed);
-                    }
-                }
+            restore(&config, command, PostgresAdapter, store, report)?;
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn restore(
+    config: &Config,
+    command: RestoreCommand,
+    engine: PostgresAdapter,
+    store: LocalStore,
+    report: &mut Reporter,
+) -> Result<()> {
+    let json = report.is_json();
+    let service = RestoreService::new(engine, store);
+    match command {
+        RestoreCommand::Plan {
+            id,
+            target,
+            security,
+            sections,
+            acknowledge_older_snapshot,
+        } => {
+            let policy = match security {
+                SecurityPreset::Dr => RestoreSecurityPolicy::dr_full(),
+                SecurityPreset::Portable => RestoreSecurityPolicy::portable(),
+            };
+            let plan = service.plan_with_acknowledgement(
+                config,
+                id,
+                &target,
+                policy,
+                sections_from(&sections),
+                acknowledge_older_snapshot,
+            )?;
+            if json {
+                report.data(serde_json::json!({
+                    "plan": plan,
+                    "digest": plan.digest(),
+                }))?;
+            } else {
+                print_plan(&plan);
+            }
+        }
+        RestoreCommand::Run {
+            plan,
+            confirm_target,
+        } => {
+            let executed = service.run(config, plan, &confirm_target)?;
+            if json {
+                report.data(serde_json::json!({
+                    "plan_id": executed.plan.id,
+                    "digest": executed.plan.digest(),
+                    "artifact_id": executed.plan.artifact_id,
+                    "target_database": executed.plan.target_database,
+                    "sections": executed.plan.sections,
+                    "security": executed.plan.security,
+                    "verification_level": executed.verification_level,
+                    "recorded_in_artifact": executed.recorded_in_artifact,
+                }))?;
+            } else {
+                print_restore(&executed);
             }
         }
     }

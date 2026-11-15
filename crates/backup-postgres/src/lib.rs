@@ -14,6 +14,7 @@
 mod catalog;
 mod dump;
 mod globals;
+mod native;
 mod tools;
 
 use crate::catalog::{
@@ -44,7 +45,13 @@ use std::time::Duration;
 /// this tool knows how to reason about.
 pub(crate) const MAX_GLOBALS_BYTES: u64 = 8 * 1024 * 1024;
 
-pub struct PostgresAdapter;
+#[derive(Clone, Default)]
+pub struct PostgresAdapter {
+    policy: Option<native::NativePolicy>,
+}
+// Preserve the legacy unit-style constructor in the value namespace.
+#[allow(non_upper_case_globals)]
+pub const PostgresAdapter: PostgresAdapter = PostgresAdapter { policy: None };
 
 impl DatabaseAdapter for PostgresAdapter {
     fn preflight(&self, source: &Source, timeout: Duration) -> Result<EngineInfo> {
@@ -59,16 +66,16 @@ impl DatabaseAdapter for PostgresAdapter {
                 );
             }
         }
-        let dump = tool(source, PG_DUMP)?;
-        let restore = tool(source, PG_RESTORE)?;
-        let psql = tool(source, PSQL)?;
-        let dumpall = tool(source, PG_DUMPALL)?;
-        let createdb = tool(source, CREATEDB)?;
-        let dump_version = tool_version(&dump, timeout)?;
-        let restore_version = tool_version(&restore, timeout)?;
-        let psql_version = tool_version(&psql, timeout)?;
-        let dumpall_version = tool_version(&dumpall, timeout)?;
-        let createdb_version = tool_version(&createdb, timeout)?;
+        let dump = self.tool(source, PG_DUMP)?;
+        let restore = self.tool(source, PG_RESTORE)?;
+        let psql = self.tool(source, PSQL)?;
+        let dumpall = self.tool(source, PG_DUMPALL)?;
+        let createdb = self.tool(source, CREATEDB)?;
+        let dump_version = self.tool_version(&dump, timeout)?;
+        let restore_version = self.tool_version(&restore, timeout)?;
+        let psql_version = self.tool_version(&psql, timeout)?;
+        let dumpall_version = self.tool_version(&dumpall, timeout)?;
+        let createdb_version = self.tool_version(&createdb, timeout)?;
         let majors = [
             dump_version.0,
             restore_version.0,
@@ -79,7 +86,7 @@ impl DatabaseAdapter for PostgresAdapter {
         if majors.windows(2).any(|pair| pair[0] != pair[1]) {
             bail!("PostgreSQL client tools are from different major versions");
         }
-        let mut command = base_command(&psql, source);
+        let mut command = self.base_command(&psql, source)?;
         command.args(PSQL_QUERY_ARGS);
         command.arg("--command=SHOW server_version_num");
         let result = run(command, timeout, None).context("query PostgreSQL server version")?;
@@ -101,6 +108,25 @@ impl DatabaseAdapter for PostgresAdapter {
         })
     }
 
+    fn restore_context(&self) -> Option<backup_domain::NativeRestoreContext> {
+        self.policy.as_ref().map(|p| p.context.clone())
+    }
+    fn restore_preflight(
+        &self,
+        source: &Source,
+        target: &str,
+        timeout: Duration,
+    ) -> Result<EngineInfo> {
+        if let Some(policy) = &self.policy {
+            anyhow::ensure!(
+                backup_domain::is_literal_database_name(target),
+                "invalid native target"
+            );
+            policy.validate_database(target)?;
+        }
+        self.preflight(&self.maintenance_source(source), timeout)
+    }
+
     fn dump_stream(
         &self,
         source: &Source,
@@ -108,8 +134,8 @@ impl DatabaseAdapter for PostgresAdapter {
         timeout: Duration,
         consume: &mut dyn FnMut(&mut dyn Read) -> Result<()>,
     ) -> Result<()> {
-        let dump = tool(source, PG_DUMP)?;
-        let mut command = base_command(&dump, source);
+        let dump = self.tool(source, PG_DUMP)?;
+        let mut command = self.base_command(&dump, source)?;
         for argument in dump_arguments(options)? {
             command.arg(argument);
         }
@@ -234,8 +260,11 @@ impl DatabaseAdapter for PostgresAdapter {
         timeout: Duration,
         consume: &mut dyn FnMut(&mut dyn Read) -> Result<()>,
     ) -> Result<()> {
-        let dumpall = tool(source, PG_DUMPALL)?;
-        let mut command = cluster_command(&dumpall, source);
+        let dumpall = self.tool(source, PG_DUMPALL)?;
+        let mut command = self.cluster_command(&dumpall, source)?;
+        if self.policy.is_some() {
+            command.arg(format!("--database={}", source.database));
+        }
         // --no-role-passwords is what keeps password verifiers out of the artifact; it
         // is the reason in both modes, encrypted or not.
         // --roles-only avoids tablespaces and database attributes, which
@@ -250,8 +279,8 @@ impl DatabaseAdapter for PostgresAdapter {
         archive: &Path,
         timeout: Duration,
     ) -> Result<Vec<String>> {
-        let restore = tool(source, PG_RESTORE)?;
-        let mut command = isolated_command(&restore, source);
+        let restore = self.tool(source, PG_RESTORE)?;
+        let mut command = self.offline_command(&restore, source)?;
         command.arg("--list").arg(archive);
         let result = run(command, timeout, None).context("inspect pg_dump archive")?;
         let text = String::from_utf8(result.stdout).context("decode archive table of contents")?;
@@ -267,8 +296,10 @@ impl DatabaseAdapter for PostgresAdapter {
     }
 
     fn database_exists(&self, source: &Source, database: &str, timeout: Duration) -> Result<bool> {
-        let psql = tool(source, PSQL)?;
-        let mut command = base_command(&psql, source);
+        let maintenance = self.maintenance_source(source);
+        let source = &maintenance;
+        let psql = self.tool(source, PSQL)?;
+        let mut command = self.base_command(&psql, source)?;
         let statement = format!(
             "SELECT 1 FROM pg_catalog.pg_database WHERE datname = {}",
             sql_literal(database)
@@ -286,6 +317,8 @@ impl DatabaseAdapter for PostgresAdapter {
         globals: &Path,
         timeout: Duration,
     ) -> Result<Vec<String>> {
+        let maintenance = self.maintenance_source(source);
+        let source = &maintenance;
         let statements = parse_role_statements(globals)?;
         let names = exported_role_names(&statements);
         if names.is_empty() {
@@ -304,6 +337,8 @@ impl DatabaseAdapter for PostgresAdapter {
     }
 
     fn apply_globals(&self, source: &Source, globals: &Path, timeout: Duration) -> Result<()> {
+        let maintenance = self.maintenance_source(source);
+        let source = &maintenance;
         let statements = parse_role_statements(globals)?;
         let text = fs::read_to_string(globals).context("read staged globals file")?;
         if text.len() as u64 > MAX_GLOBALS_BYTES {
@@ -323,8 +358,8 @@ impl DatabaseAdapter for PostgresAdapter {
         let existing = self.existing_roles(source, &names, timeout)?;
         let (script, applied) = build_globals_script(&statements, &existing);
         if applied > 0 {
-            let psql = tool(source, PSQL)?;
-            let mut command = base_command(&psql, source);
+            let psql = self.tool(source, PSQL)?;
+            let mut command = self.base_command(&psql, source)?;
             command.args([
                 "--no-psqlrc",
                 "--quiet",
@@ -352,11 +387,16 @@ impl DatabaseAdapter for PostgresAdapter {
     }
 
     fn create_database(&self, source: &Source, database: &str, timeout: Duration) -> Result<()> {
+        let maintenance = self.maintenance_source(source);
+        let source = &maintenance;
         if !database.starts_with(backup_domain::FIXTURE_PREFIX) {
             bail!("only synthetic fixture databases may be created");
         }
-        let createdb = tool(source, CREATEDB)?;
-        let mut command = cluster_command(&createdb, source);
+        let createdb = self.tool(source, CREATEDB)?;
+        let mut command = self.cluster_command(&createdb, source)?;
+        if self.policy.is_some() {
+            command.arg(format!("--maintenance-db={}", source.database));
+        }
         command.arg("--template=template0");
         command.arg(database);
         run(command, timeout, None).context("create target database")?;
@@ -370,17 +410,20 @@ impl DatabaseAdapter for PostgresAdapter {
         schemas: &[String],
         timeout: Duration,
     ) -> Result<()> {
+        let mut target = source.clone();
+        target.database = database.to_string();
+        let source = &target;
         if !database.starts_with(backup_domain::FIXTURE_PREFIX) {
             bail!("only synthetic fixture databases may receive schemas");
         }
-        let psql = tool(source, PSQL)?;
+        let psql = self.tool(source, PSQL)?;
         for schema in schemas {
             // Names arrive from a manifest scope; refuse anything that is not
             // an exact lower-case non-system identifier before issuing DDL.
             if !backup_domain::is_safe_created_schema_name(schema) {
                 bail!("refusing to create a schema with an unexpected name");
             }
-            let mut command = isolated_command(&psql, source);
+            let mut command = self.isolated_command(&psql, source)?;
             command
                 .arg(ARG_NO_PASSWORD)
                 .arg(format!("{ARG_HOST}{}", source.host))
@@ -404,8 +447,11 @@ impl DatabaseAdapter for PostgresAdapter {
         sections: RestoreSections,
         timeout: Duration,
     ) -> Result<()> {
-        let restore = tool(source, PG_RESTORE)?;
-        let mut command = isolated_command(&restore, source);
+        let mut target = source.clone();
+        target.database = database.to_string();
+        let source = &target;
+        let restore = self.tool(source, PG_RESTORE)?;
+        let mut command = self.isolated_command(&restore, source)?;
         command
             .arg(ARG_NO_PASSWORD)
             .arg(format!("{ARG_HOST}{}", source.host))
@@ -432,6 +478,73 @@ impl DatabaseAdapter for PostgresAdapter {
 }
 
 impl PostgresAdapter {
+    pub fn configured(config: &backup_domain::ConfigV1) -> Result<Self> {
+        Ok(Self {
+            policy: Some(native::NativePolicy::new(config)?),
+        })
+    }
+    fn maintenance_source(&self, source: &Source) -> Source {
+        let mut maintenance = source.clone();
+        if let Some(policy) = &self.policy {
+            maintenance.database = policy.context.maintenance_database.clone();
+        }
+        maintenance
+    }
+    fn tool(&self, source: &Source, name: &str) -> Result<std::path::PathBuf> {
+        tool(source, name)
+    }
+    fn tool_version(&self, path: &Path, timeout: Duration) -> Result<(u32, String)> {
+        if let Some(policy) = &self.policy {
+            let mut command = policy.command(path, None)?;
+            command.arg("--version");
+            tools::parse_tool_version(run(command, timeout, None)?.stdout)
+        } else {
+            tool_version(path, timeout)
+        }
+    }
+    fn offline_command(&self, path: &Path, source: &Source) -> Result<std::process::Command> {
+        match &self.policy {
+            Some(policy) => policy.command(path, None),
+            None => Ok(isolated_command(path, source)),
+        }
+    }
+    fn isolated_command(&self, path: &Path, source: &Source) -> Result<std::process::Command> {
+        match &self.policy {
+            Some(policy) => {
+                anyhow::ensure!(
+                    source.host == policy.context.host
+                        && source.port == policy.context.port
+                        && source.user == policy.context.user
+                        && source.client_bin_dir == policy.context.client_bin_dir
+                        && source.password_file == policy.context.password_file,
+                    "native source context mismatch"
+                );
+                policy.command(path, Some(&source.database))
+            }
+            None => Ok(isolated_command(path, source)),
+        }
+    }
+    fn base_command(&self, path: &Path, source: &Source) -> Result<std::process::Command> {
+        if self.policy.is_none() {
+            return Ok(base_command(path, source));
+        }
+        let mut command = self.cluster_command(path, source)?;
+        command.arg(format!("{ARG_DBNAME}{}", source.database));
+        Ok(command)
+    }
+    fn cluster_command(&self, path: &Path, source: &Source) -> Result<std::process::Command> {
+        if self.policy.is_none() {
+            return Ok(cluster_command(path, source));
+        }
+        let mut command = self.isolated_command(path, source)?;
+        command
+            .arg(ARG_NO_PASSWORD)
+            .arg(format!("{ARG_HOST}{}", source.host))
+            .arg(format!("{ARG_PORT}{}", source.port))
+            .arg(format!("{ARG_USERNAME}{}", source.user));
+        Ok(command)
+    }
+
     /// Run one read-only catalog query and return its single-column result.
     /// Names reach PostgreSQL only through `sql_literal`, never as raw text.
     fn query_column(
@@ -441,8 +554,8 @@ impl PostgresAdapter {
         timeout: Duration,
         context: &str,
     ) -> Result<Vec<String>> {
-        let psql = tool(source, PSQL)?;
-        let mut command = base_command(&psql, source);
+        let psql = self.tool(source, PSQL)?;
+        let mut command = self.base_command(&psql, source)?;
         command.args(PSQL_QUERY_ARGS);
         command.arg(format!("--command={sql}"));
         let result = run(command, timeout, None).with_context(|| context.to_string())?;
@@ -649,8 +762,8 @@ impl PostgresAdapter {
         if names.is_empty() {
             return Ok(Vec::new());
         }
-        let psql = tool(source, PSQL)?;
-        let mut command = base_command(&psql, source);
+        let psql = self.tool(source, PSQL)?;
+        let mut command = self.base_command(&psql, source)?;
         let list = names
             .iter()
             .map(|name| sql_literal(name))

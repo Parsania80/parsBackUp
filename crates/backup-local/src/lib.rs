@@ -1649,6 +1649,7 @@ mod tests {
             created_unix_ms: now,
             expires_unix_ms: now + 900_000,
             rollback: None,
+            native_context: None,
         };
         store.save_plan(&plan).unwrap();
         let loaded = store.load_plan(plan.id).unwrap().unwrap();

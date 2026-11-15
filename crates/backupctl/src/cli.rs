@@ -29,6 +29,7 @@ pub(crate) struct Cli {
 pub(crate) enum Output {
     Human,
     Json,
+    JsonV1,
 }
 
 #[derive(Subcommand)]

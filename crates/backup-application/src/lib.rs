@@ -37,6 +37,18 @@ pub struct EngineInfo {
 
 pub trait DatabaseAdapter {
     fn preflight(&self, source: &Source, timeout: Duration) -> Result<EngineInfo>;
+    fn restore_preflight(
+        &self,
+        source: &Source,
+        _target: &str,
+        timeout: Duration,
+    ) -> Result<EngineInfo> {
+        self.preflight(source, timeout)
+    }
+    fn restore_context(&self) -> Option<backup_domain::NativeRestoreContext> {
+        None
+    }
+
     /// Read the live catalog and turn a profile's requested names into the
     /// exact object set a dump would write, including anything it references
     /// from outside that set.
@@ -535,6 +547,51 @@ fn whole_database_profile(source: &Source) -> Profile {
     }
 }
 
+/// Resolve native scope without opening a store or any configured keys.
+pub fn resolve_backup<E: DatabaseAdapter>(
+    engine: &E,
+    config: &Config,
+    profile_name: Option<&str>,
+) -> Result<(EngineInfo, ResolvedSelection)> {
+    config.validate()?;
+    let timeout = Duration::from_secs(config.timeout_seconds);
+    let info = engine.preflight(&config.source, timeout)?;
+    let profile = match profile_name {
+        Some(name) => Some(config.profile(name)?),
+        None => None,
+    };
+    let resolved = match profile {
+        Some(profile) => engine.resolve_selection(&config.source, profile, timeout)?,
+        None => ResolvedSelection {
+            whole_database: true,
+            ..Default::default()
+        },
+    };
+    if !resolved.dangling.is_empty() {
+        let named = resolved
+            .dangling
+            .iter()
+            .map(|reference| {
+                format!(
+                    "{} depends on {} ({})",
+                    reference.dependent, reference.referenced, reference.kind
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        let who = match profile {
+            Some(profile) => format!("profile {}", profile.name),
+            None => "this selection".to_string(),
+        };
+        bail!(
+            "{who} is not self-contained: {named}. pg_dump does not write objects from outside \
+                 the selection, so this archive could not restore into an empty database on its \
+                 own; widen the selection or restore into a database that already holds those objects"
+        );
+    }
+    Ok((info, resolved))
+}
+
 impl<E: DatabaseAdapter, S: ArtifactStore> BackupService<E, S> {
     pub fn new(engine: E, store: S) -> Self {
         Self { engine, store }
@@ -548,45 +605,7 @@ impl<E: DatabaseAdapter, S: ArtifactStore> BackupService<E, S> {
         config: &Config,
         profile_name: Option<&str>,
     ) -> Result<(EngineInfo, ResolvedSelection)> {
-        config.validate()?;
-        let timeout = Duration::from_secs(config.timeout_seconds);
-        let info = self.engine.preflight(&config.source, timeout)?;
-        let profile = match profile_name {
-            Some(name) => Some(config.profile(name)?),
-            None => None,
-        };
-        let resolved = match profile {
-            Some(profile) => self
-                .engine
-                .resolve_selection(&config.source, profile, timeout)?,
-            None => ResolvedSelection {
-                whole_database: true,
-                ..Default::default()
-            },
-        };
-        if !resolved.dangling.is_empty() {
-            let named = resolved
-                .dangling
-                .iter()
-                .map(|reference| {
-                    format!(
-                        "{} depends on {} ({})",
-                        reference.dependent, reference.referenced, reference.kind
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("; ");
-            let who = match profile {
-                Some(profile) => format!("profile {}", profile.name),
-                None => "this selection".to_string(),
-            };
-            bail!(
-                "{who} is not self-contained: {named}. pg_dump does not write objects from outside \
-                 the selection, so this archive could not restore into an empty database on its \
-                 own; widen the selection or restore into a database that already holds those objects"
-            );
-        }
-        Ok((info, resolved))
+        resolve_backup(&self.engine, config, profile_name)
     }
 
     pub fn create(&self, config: &Config, profile_name: Option<&str>) -> Result<Created> {
@@ -1135,12 +1154,19 @@ impl<E: DatabaseAdapter, S: ArtifactStore> RestoreService<E, S> {
         acknowledge_older_snapshot: bool,
     ) -> Result<RestorePlan> {
         config.validate()?;
+        if self.engine.restore_context().is_some()
+            && !backup_domain::is_literal_database_name(target)
+        {
+            bail!("invalid native restore target");
+        }
         sections.validate()?;
         // Fail on the contradiction between sections and security before any
         // environment probe, so the refusal names the real reason.
         sections.check_security(&security)?;
         let timeout = Duration::from_secs(config.timeout_seconds);
-        let info = self.engine.preflight(&config.source, timeout)?;
+        let info = self
+            .engine
+            .restore_preflight(&config.source, target, timeout)?;
         // A signed store authenticates before it decrypts, so a bad signature is refused
         // here — before a target database exists to be filled with a forgery.
         let artifact = Opened::open(&self.store, artifact_id)?;
@@ -1197,7 +1223,9 @@ impl<E: DatabaseAdapter, S: ArtifactStore> RestoreService<E, S> {
             }
         };
         let plan = RestorePlan {
-            format: if rollback.is_some() {
+            format: if self.engine.restore_context().is_some() {
+                backup_domain::RESTORE_PLAN_V3
+            } else if rollback.is_some() {
                 backup_domain::RESTORE_PLAN_V2
             } else {
                 backup_domain::PLAN_FORMAT
@@ -1217,6 +1245,7 @@ impl<E: DatabaseAdapter, S: ArtifactStore> RestoreService<E, S> {
                 .checked_add(PLAN_TTL.as_millis())
                 .context("restore plan expiry overflow")?,
             rollback,
+            native_context: self.engine.restore_context(),
         };
         plan.validate(now_unix_ms()?)?;
         self.store.save_plan(&plan)?;
@@ -1241,7 +1270,14 @@ impl<E: DatabaseAdapter, S: ArtifactStore> RestoreService<E, S> {
         if plan.artifact_database != config.source.database {
             bail!("plan source database does not match the configuration");
         }
-        let info = self.engine.preflight(&config.source, timeout)?;
+        if plan.native_context != self.engine.restore_context() {
+            bail!(
+                "NATIVE_CONTEXT_MISMATCH: restore plan connection context changed; create a new plan"
+            );
+        }
+        let info = self
+            .engine
+            .restore_preflight(&config.source, &plan.target_database, timeout)?;
         if info.source_major != plan.source_major {
             bail!("client or server major changed since the plan was created");
         }
