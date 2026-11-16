@@ -211,3 +211,16 @@ H05 is committed as `046c22e`. V01 production-readiness validation is underway: 
 V01 checkpoint verification passed 314 tests, strict Clippy/format, eight PG16–18 native suites (24 script-major runs) and both package targets, each preserving 173 source inputs. The selective-public restore correction is locally verified, including safe refusal of populated template schemas. V01 remains open: signed partition-family compatibility, bundled SQLite advisory, unavailable versioned commands/production-plan contracts and incomplete advisory/content coverage still block readiness. The 12-file checkpoint is uncommitted; production stays disabled. See [verified results and open gates](project.md#v01-verified-checkpoint-and-readiness-disposition--2026-11-16).
 
 V01 checkpoint review: the 12-file correction/validation change passes review with no blocking checkpoint findings. Its 173-input fast/native/package records and retained checksums still match. The checkpoint is being committed locally, then the bundled SQLite advisory will receive its own dependency update and verification. Production remains disabled.
+
+V01 checkpoint is committed as `5a1834b`. The SQLite advisory fix is now a separate increment: update the bundled rusqlite/SQLite pair, preserve schema/formats, and rerun migration, read-only snapshot, recovery and package gates. Official registry access works through the existing local proxy; verification is pending. Production stays disabled.
+
+
+V01 is committed as `5a1834b`. Its separate SQLite advisory fix is verified and
+uncommitted: bundled SQLite 3.54.1, 315 tests, five PG16–18 native suites and both
+Debian/Ubuntu package targets pass. Schema and saved formats are unchanged. The full
+dependency scan now runs but still finds two pre-existing cryptography advisories
+and an unmaintained dependency warning. Next: review/commit the SQLite checkpoint,
+then resolve those security findings. V01 remains open and production stays disabled.
+See [SQLite acceptance](project.md#sqlite-remediation-acceptance--2026-11-16).
+
+SQLite checkpoint review passed with no blocking findings. Its dependency/runtime guard, native and package evidence still match. The reviewed eight-file checkpoint is being committed and pushed as requested before cryptography remediation; production remains disabled.

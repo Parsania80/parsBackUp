@@ -43,8 +43,8 @@ def run(args, *, ok=True, input=None, env=None):
     return result
 
 
-def wait_for(probe, label):
-    deadline = time.monotonic() + 25
+def wait_for(probe, label, timeout=25):
+    deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if probe():
             return
@@ -204,7 +204,15 @@ verifying_key_file = "{key_dir}/verifying.key"
                  f"inject=fsync:delay_exit=2s:when={fsync_ordinal}", "-o", str(trace), *command(*args, cfg=cfg)],
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
             try:
-                wait_for(lambda: trace.exists() and "(DELAYED)" in trace.read_text(), "live SQLite journal")
+                # Rebuild authenticates all artifacts before its first write. Give that
+                # preparation the same budget as run(), rather than a 25-second race.
+                wait_for(lambda: (trace.exists() and "(DELAYED)" in trace.read_text())
+                         or child.poll() is not None, "live SQLite journal", timeout=150)
+                if child.poll() is not None:
+                    stdout, stderr = child.communicate(timeout=10)
+                    raise AssertionError(f"journal delay not reached at fsync {fsync_ordinal}: "
+                                         f"exit {child.returncode}\n{stdout}\n{stderr}\n"
+                                         f"{trace.read_text() if trace.exists() else 'no trace'}")
                 delayed = next(line for line in trace.read_text().splitlines() if "(DELAYED)" in line)
                 assert ".db-journal>" in delayed, delayed
                 journal = Path(re.search(r"<([^>]+\.db-journal)>", delayed)[1])

@@ -1197,6 +1197,21 @@ mod tests {
     use std::fs;
     use uuid::Uuid;
 
+    #[test]
+    fn linked_sqlite_contains_the_database_wal_page_size_fix() {
+        // RUSTSEC-2026-0459 is fixed in SQLite 3.54.0. Check the engine
+        // actually serving queries, so a vulnerable linked library fails the gate.
+        let conn = Connection::open_in_memory().unwrap();
+        let (version, source_id): (String, String) = conn
+            .query_row("SELECT sqlite_version(), sqlite_source_id()", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(version, rusqlite::version());
+        assert!(rusqlite::version_number() >= 3_054_000, "{version}");
+        println!("linked SQLite {version}; source ID {source_id}");
+    }
+
     /// anyhow prints only the outermost context with `to_string`; assertions need the whole
     /// chain, because the refusal reason is the cause.
     fn chain(error: anyhow::Error) -> String {

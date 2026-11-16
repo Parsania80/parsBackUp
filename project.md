@@ -1,6 +1,6 @@
 # PostgreSQL Backup Platform — Implementation Roadmap
 
-Latest implementation handoff: §51 (V01 production-readiness validation in progress, 2026-11-16). H05 is committed as `046c22e`; H04 as `6a547e9`, H03 as `cb34f5e` and H02 fixture hardening as `3cc9326`. H fixture foundations are locally accepted; production compatibility/content/security validation and V02/V03 remain required. The historical 2026-10-03 rewrite was operator-authorized; historical results are distinct from current verification.
+Latest implementation handoff: §52 (SQLite advisory remediation verified, 2026-11-16). V01 checkpoint is committed as `5a1834b`; its SQLite follow-up is uncommitted. H05 is committed as `046c22e`; H04 as `6a547e9`, H03 as `cb34f5e` and H02 fixture hardening as `3cc9326`. H fixture foundations are locally accepted; production compatibility/content/security validation and V02/V03 remain required. The historical 2026-10-03 rewrite was operator-authorized; historical results are distinct from current verification.
 
 ## 1. Project vision and how to use this document
 
@@ -64,7 +64,7 @@ Chosen compatibility policy: PostgreSQL 16, 17 and 18 source servers, absolute s
 | Database execution | Native PostgreSQL `pg_dump`, `pg_dumpall`, `pg_restore`, `psql`, `createdb` | Fixed absolute tools and argv vectors; no shell and no custom dump engine. |
 | Configuration | TOML through `toml` and `serde` | Strict fields; secrets referenced by protected paths. |
 | Interchange | JSON through `serde_json` | Versioned artifacts/plans; closed schemas at security boundaries. |
-| Inventory | `rusqlite` = 0.40.2, defaults disabled, bundled SQLite | DELETE journal, FULL synchronous writes, explicit timeout. |
+| Inventory | `rusqlite` = 0.41.1, defaults disabled, bundled SQLite 3.54.1 (`libsqlite3-sys` 0.39.1) | DELETE journal, FULL synchronous writes, explicit timeout. |
 | Encryption | `age` = 0.12.1, `age-core` = 0.12.0, existing custom hybrid recipient | Keep the pinned pair and tested format compatible. |
 | Signatures | `ed25519-dalek` 2.2 line and `ml-dsa` 0.1.1 or reviewed compatible update | Required zeroization features; both signature legs verify. |
 | CLI | `clap` derive | Existing human/JSON modes; parsing/presentation only. |
@@ -1582,3 +1582,104 @@ Final V01 handoff audit passes **401 local reference targets/fragments**, fenced
 ### V01 checkpoint review — 2026-11-16
 
 Reviewed exact 12-file scope: TOC classification and empty-public RESTRICT preparation under existing fresh-target orchestration; target/partial-effect preservation; synthetic isolated actual-role/content/refusal fixtures; pinned CI enumeration; current reference corrections; declarative contracts/security findings and evidence limits. No blocking checkpoint findings or runtime corrections. Re-audit passes 401 local targets/fragments, 52 embedded Python blocks and standalone/script syntax, format/diff, exact scope, all accepted 173-input records except documented handoff/reference edits, immutable schema/dependencies/formats/controlled documents/archive, append-only log, package/H05 checksums and scoped cleanup. Accepted 314-test/eight all-major suite/two-target package evidence is retained unchanged, not rerun for this review. Preparing local exact-scope checkpoint with staged blob and post-commit parent/tree/clean checks; no push. The requested SQLite advisory update follows separately; V01 full acceptance remains open.
+
+## 52. V01 bundled SQLite advisory remediation — 2026-11-16
+
+Operator requested V01 checkpoint review/commit then SQLite advisory fix. V01 committed
+as **5a1834b** after review of all 12 files with no blocking checkpoint findings;
+verified exact staged blobs/tree, parent 046c22e and clean checkout. All accepted
+173-input fast/eight-native/package records and retained package hashes match, except
+stated handoff/reference edits; review does not claim those suites rerun. No push.
+
+Recorded the remediation contract in [V01 security review](docs/security/v01-review.md#sqlite-advisory-remediation-contract--2026-11-16)
+before dependency edits. Target rusqlite 0.41.1/libsqlite3-sys 0.39.1 (bundled SQLite
+3.54.1), retain existing features/toolchain/schema v8 and saved bytes, inspect exact
+lock delta and official registry checksums. Direct index/static endpoints timeout;
+the existing local SOCKS proxy reaches them without changing global network config.
+Earlier V01 artifact/evidence retained under ignored checkpoint-v01 directories.
+Final linked-runtime/version, advisory scan, fast/native/package evidence follows.
+V01's signed-family/command-plan/content gates remain open; no production enablement.
+
+
+### SQLite remediation acceptance — 2026-11-16
+
+**Requested advisory fixed:** rusqlite **0.41.1** / libsqlite3-sys **0.39.1**, bundled
+SQLite **3.54.1**. Only two of 221 lock records changed; other 219 records, feature
+policy, Rust 1.97.1, schema v8/migration SQL, crypto and frozen saved formats remain
+unchanged. Official crate checksums and SQLite amalgamation SHA3 agree with upstream;
+actual SQL version/source ID and isolated old-engine failing control pass. A real
+old-CLI v8 inventory remains byte-identical after a new-CLI read, and a new-CLI rebuild
+is readable by the old CLI. No production API adaptation or schema migration.
+See [security acceptance and remaining findings](docs/security/v01-review.md#sqlite-advisory-remediation-acceptance--2026-11-16).
+
+| Final gate | Accepted evidence |
+|---|---|
+| fast | **315 workspace tests**, strict locked/offline Clippy, format, three workflows semantically linted, two actual CLI report envelopes, references and script syntax. |
+| m5a_docker_smoke | PG16/17/18 native interruption/adoption/rebuild, six crash boundaries per major, populated v1/v2 upgrades/corruption, newer-schema refusal, read-only copy and raw inventory/journal/report privacy. |
+| h02_snapshot_drill | PG16/17/18 non-root true read-only media, signature/checksum/archive, immutable inventory, exact custody, external scratch cleanup/limits and syscall audit. |
+| m5b_retention_drill | PG16/17/18 exact sets/exclusions/protection, competing deleters and both restore/delete contention directions, eight crash boundaries per major, keyless started-only recovery/tombstones and ledger/plan/report privacy. |
+| v01_content_privileges | PG16/17/18 content/privilege/public-schema/refusal/source-loss controls pass; known signed partition-family refusal explicitly reproduced, not accepted as supported. |
+| h02_cancellation_drill | PG16/17/18 captured TERM/streamed INT/partial-restore TERM, child reap, failed jobs, scratch/stage cleanup and source-loss recovery. |
+| package | Ubuntu release/repeat archive/manager-free lifecycle, identical package on actual Ubuntu24.04/systemd255/glibc2.39/PG16 and Debian13/systemd257/glibc2.41/PG17; lifecycle/custody/sandbox/timer/manual overlap/v7 migration/cancellation/escaped-session containment/live upgrade/reader-only source-loss recovery pass. |
+
+All seven final wrappers preserve **173 source inputs** during execution: five native
+suites / **15 script-major combinations**, fast and package. Only README/project/log
+and security-review handoff edits follow. Initial PG17 M5a journal-observation timeout
+is retained, excluded from acceptance; PG17-only diagnostic observed the expected
+sync after 18.43 seconds and was intentionally stopped afterward. Its result does not
+prove the original cause. Recorded a test-only helper adjustment before editing:
+allow the existing 150-second command budget for that observation, detect early child
+exit with diagnostics, retain every journal/privacy/integrity/crash assertion. Final
+full rerun passes; no product timeout or process policy changed.
+
+Current package SHA256 **ae34b0b8095eabe63ca8baa58d81e98c1b27e0cdd436150e661ca67c79c31b02**. V01 package remains under
+checkpoint-v01 with SHA256 b44059d3d1d096e7a40a3f0a0922b88f35bafc3c255596c1a3a38b0364097092;
+H05 remains under checkpoint-h05 with its recorded checksum. Package warnings remain
+visible; containers share the host kernel and repeated archive bytes do not prove
+independent Rust-build reproducibility. No hosted CI/push/host-deployment claim.
+
+Full cargo-audit 0.22.2 before/after scans use official RustSec revision
+`02e2517f457a359fc6d3440ea4560c8ea188fee8`, no ignores/target/severity filters. SQLite finding is
+absent after the update; both scans exit 1 because **crypto-bigint 0.5.5
+(RUSTSEC-2026-0387)** and **ctutils 0.4.2 (RUSTSEC-2026-0385)** remain. basic-toml 0.1.10
+also has unmaintained warning RUSTSEC-2026-0374. Full scan provisioning gap is closed;
+its verdict is not clean. Initial isolated-cache yanked-lookup errors are retained;
+accepted project-cache repeats have empty stderr, using cached yanked metadata.
+Updated pair's official index checks are fresh. Exact tool/DB/lock/args/exit provenance
+and JSON are in target/ci-logs/sqlite-audit-*; details/reachability limits are in the
+security review. No cryptographic pins/transcripts or advisory ignores changed.
+
+| File Path | Change Type | Description |
+|---|---|---|
+| [Cargo.toml](Cargo.toml), [Cargo.lock](Cargo.lock) | Modified | Pin patched bundled pair; exactly two lock entries, same features and other dependencies. |
+| [crates/backup-inventory/src/lib.rs](crates/backup-inventory/src/lib.rs) | Test added | Assert actual linked SQL engine meets patched version floor; production lines unchanged. |
+| [tests/m5a_docker_smoke.sh](tests/m5a_docker_smoke.sh) | Test helper modified | Journal observation budget/early-exit diagnostics; original security/crash assertions retained. |
+| [docs/security/v01-review.md](docs/security/v01-review.md) | Appended/annotated | Pre-edit contract, timeout disposition, source/runtime evidence, full scan and remaining blockers. |
+| [README.md](README.md), [project.md](project.md), [session-log.md](session-log.md) | Modified/appended | Current stack, V01 commit/SQLite acceptance, evidence and handoff. |
+
+V01 checkpoint review found no blocking checkpoint issue and committed **5a1834b**
+locally, parent046c22e, exact 12-file staged tree/clean checkout verified before this
+increment. SQLite's eight-file follow-up is **uncommitted**. Next: review/commit this
+verified checkpoint, then resolve the cryptographic findings with explicit compatible
+feature/version/reachability decisions. Signed-family, versioned writable offline
+commands/retention, canonical production-plan bytes/context and remaining content/
+security obligations still block V01; V02/V03/T03 stay open. Production remains
+disabled. No controlled flow modified, push, hosted dispatch or host deployment.
+Final documentation/scope/fingerprint/checksum/cleanup audit follows.
+
+
+Final handoff audit passes **412 local reference targets/fragments**, fenced TOML/JSON,
+**52 embedded Python blocks** and standalone/shell/maintainer syntax, format/diff,
+exact eight-file scope/HEAD5a1834b/empty index, two-entry lock delta, actual linked
+engine/old control/upstream checksums, unchanged production inventory lines/schema/
+saved formats/controlled documents/archive, append-only log, all seven 173-input
+records except the four stated post-test handoff files, new/retained package hashes,
+full-scan provenance/results and scoped process/container/fixture cleanup. Evidence:
+`/tmp/parsbackup-sqlite-final-audit.py` and matching .log, canonical
+`target/ci-logs/{fast,native-*,package}` logs/input manifests, and
+`target/ci-logs/sqlite-audit-*`. No runtime or test edit follows acceptance.
+
+
+### SQLite checkpoint review — 2026-11-16
+
+Operator requested commit/push first, then cryptographic advisory remediation. Reviewed exact eight-file dependency/test-helper/security/evidence scope; no blocking checkpoint finding or runtime correction. Existing 315-test/five all-major native/two-target package evidence remains unchanged, not rerun for review. Re-audit passes exact two-entry lock delta, registry/amalgamation checksums, linked runtime/old control, protected production code/schema/formats/controlled documents/archive, all seven 173-input manifests except stated handoff docs, 412 references/52 embedded Python blocks/syntax/format/diff, retained package hashes, full scan provenance/findings and scoped cleanup. Preparing exact-scope local commit/staged-blob/parent/tree/clean verification and authorized normal push of main; no force push or production enablement. Cryptography investigation and edits follow the push as a separate increment.
