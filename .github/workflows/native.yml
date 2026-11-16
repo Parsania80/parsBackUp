@@ -1,0 +1,62 @@
+name: Native fixture matrices
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  native:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        suite:
+          - m1_docker_smoke
+          - m2_docker_smoke
+          - m3_docker_smoke
+          - m4a_docker_smoke
+          - m4a_key_drill
+          - m4b_docker_smoke
+          - m5a_docker_smoke
+          - m5b_retention_drill
+          - h02_native_auth_recovery
+          - h02_snapshot_drill
+          - h02_cancellation_drill
+          - h02_key_bootstrap_drill
+    env:
+      SUITE: ${{ matrix.suite }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Provision pinned Rust and locked dependencies
+        run: |
+          rustup toolchain install 1.97.1 --profile minimal --component rustfmt --component clippy
+          cargo fetch --locked
+      - name: Provision syscall tracing and digest-pinned PostgreSQL
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y strace
+          python3 ci/prepare.py native
+      - name: Provision stock rage for the signing interoperability control
+        if: matrix.suite == 'm4b_docker_smoke'
+        run: cargo install rage --version 0.12.1 --locked
+      - name: Run the existing suite with its complete supported-major loop
+        run: bash ci/run.sh native "$SUITE"
+      - name: Retain synthetic verification evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: native-${{ matrix.suite }}
+          path: target/ci-logs/
+          if-no-files-found: error
+          retention-days: 7

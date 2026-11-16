@@ -1,0 +1,45 @@
+{
+  "rust": "1.97.1",
+  "actionlint": "v1.7.7",
+  "rage": "0.12.1",
+  "actions": {
+    "actions/checkout": "11bd71901bbe5b1630ceea73d27597364c9af683",
+    "actions/upload-artifact": "ea165f8d65b6e75b540449e92b4886f43607fa02"
+  },
+  "images": [
+    {
+      "tag": "docker.arvancloud.ir/library/postgres:16-bookworm",
+      "reference": "docker.arvancloud.ir/library/postgres@sha256:efedf3595f1d6f415c08568ba171029bf54052e754cc9f030e3f2412b21f3d67"
+    },
+    {
+      "tag": "docker.arvancloud.ir/library/postgres:17-bookworm",
+      "reference": "docker.arvancloud.ir/library/postgres@sha256:639ab7ceb90e13123085b741fb31ef493fba25463002f6da665352e7b534b652"
+    },
+    {
+      "tag": "docker.arvancloud.ir/library/postgres:18-bookworm",
+      "reference": "docker.arvancloud.ir/library/postgres@sha256:3725f4e2499eef5134592b3b4ab79a543ed7f8e533b05b5b637af926630f6650"
+    },
+    {
+      "tag": "docker.arvancloud.ir/library/ubuntu:24.04",
+      "reference": "docker.arvancloud.ir/library/ubuntu@sha256:2198e4c65076e9cb0b3d695219df667c0e3b0072da64ca3c2648aca17dcecaf5"
+    },
+    {
+      "tag": "docker.arvancloud.ir/library/debian:13-slim",
+      "reference": "docker.arvancloud.ir/library/debian@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2"
+    }
+  ],
+  "native_suites": [
+    "m1_docker_smoke",
+    "m2_docker_smoke",
+    "m3_docker_smoke",
+    "m4a_docker_smoke",
+    "m4a_key_drill",
+    "m4b_docker_smoke",
+    "m5a_docker_smoke",
+    "m5b_retention_drill",
+    "h02_native_auth_recovery",
+    "h02_snapshot_drill",
+    "h02_cancellation_drill",
+    "h02_key_bootstrap_drill"
+  ]
+}

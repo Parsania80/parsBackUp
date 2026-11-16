@@ -1,0 +1,38 @@
+name: Fast checks
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fast:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Provision pinned Rust and locked dependencies
+        run: |
+          rustup toolchain install 1.97.1 --profile minimal --component rustfmt --component clippy
+          cargo fetch --locked
+      - name: Provision pinned workflow linter
+        run: python3 ci/prepare.py lint
+      - name: Verify source, references and real report examples
+        run: bash ci/run.sh fast
+      - name: Retain synthetic verification evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: fast-evidence
+          path: target/ci-logs/
+          if-no-files-found: error
+          retention-days: 7

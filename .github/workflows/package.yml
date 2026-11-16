@@ -1,0 +1,39 @@
+name: Package and service acceptance
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Provision pinned Rust and locked dependencies
+        run: |
+          rustup toolchain install 1.97.1 --profile minimal --component rustfmt --component clippy
+          cargo fetch --locked
+      - name: Provision isolated targets from digest-pinned base images
+        run: python3 ci/prepare.py package
+      - name: Verify the identical package on both target systems
+        run: bash ci/run.sh package
+      - name: Retain synthetic verification evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: fixture-package-evidence
+          path: |
+            target/ci-logs/
+            target/packages/
+          if-no-files-found: error
+          retention-days: 7
