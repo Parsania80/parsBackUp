@@ -44,8 +44,21 @@ fn print_job(job: &JobInfo) {
 }
 
 pub(crate) fn job(root: &Path, command: JobCommand, report: &mut Reporter) -> Result<()> {
+    job_mode(root, command, false, report)
+}
+pub(crate) fn job_snapshot(root: &Path, command: JobCommand, report: &mut Reporter) -> Result<()> {
+    job_mode(root, command, true, report)
+}
+fn reader(root: &Path, snapshot: bool) -> Result<LocalInventory> {
+    if snapshot {
+        LocalInventory::open_snapshot(root)
+    } else {
+        LocalInventory::open(root)
+    }
+}
+fn job_mode(root: &Path, command: JobCommand, snapshot: bool, report: &mut Reporter) -> Result<()> {
     let json_output = report.is_json();
-    let service = InventoryService::new(LocalInventory::open(root)?);
+    let service = InventoryService::new(reader(root, snapshot)?);
     match command {
         JobCommand::List => {
             let jobs = service.jobs()?;
@@ -89,6 +102,23 @@ pub(crate) fn inventory_with_store(
     configured_root: Option<&Path>,
     report: &mut Reporter,
 ) -> Result<()> {
+    inventory_mode(root, command, store, configured_root, false, report)
+}
+pub(crate) fn inventory_snapshot(
+    root: &Path,
+    command: InventoryCommand,
+    report: &mut Reporter,
+) -> Result<()> {
+    inventory_mode(root, command, None, None, true, report)
+}
+fn inventory_mode(
+    root: &Path,
+    command: InventoryCommand,
+    store: Option<backup_local::LocalStore>,
+    configured_root: Option<&Path>,
+    snapshot: bool,
+    report: &mut Reporter,
+) -> Result<()> {
     let json_output = report.is_json();
     match command {
         InventoryCommand::Recover => {
@@ -109,7 +139,7 @@ pub(crate) fn inventory_with_store(
             }
         }
         InventoryCommand::Verification { id } => {
-            let service = InventoryService::new(LocalInventory::open(root)?);
+            let service = InventoryService::new(reader(root, snapshot)?);
             let events = service.verification_events(id)?;
             if json_output {
                 let events: Vec<_> = events.iter().map(|e| json!({"backup_id":e.backup_id, "at_utc":e.at_utc, "level":e.level, "outcome":e.outcome, "payload_sha256":e.payload_sha256, "manifest_sha256":e.manifest_sha256, "current":e.current})).collect();
@@ -130,7 +160,7 @@ pub(crate) fn inventory_with_store(
             }
         }
         InventoryCommand::Check => {
-            let service = InventoryService::new(LocalInventory::open(root)?);
+            let service = InventoryService::new(reader(root, snapshot)?);
             let check = service.check()?;
             let valid = check.problems.is_empty();
             if json_output {
@@ -170,37 +200,7 @@ pub(crate) fn inventory_with_store(
                 InventoryCommand::Rebuild { .. } => unreachable!(),
                 InventoryCommand::Adopt { .. } => unreachable!(),
             };
-            if json_output {
-                let entries: Vec<_> = discovery
-                    .entries
-                    .iter()
-                    .map(|entry| {
-                        json!({
-                            "backup_id": entry.backup_id,
-                            "shape": entry.shape,
-                            "status": entry.status,
-                            "reason": entry.reason,
-                            "provenance": entry.provenance,
-                        })
-                    })
-                    .collect();
-                report.data(
-                    json!({"entries": entries, "audit_recorded": discovery.audit_recorded}),
-                )?;
-            } else {
-                for entry in discovery.entries {
-                    println!(
-                        "{}  {}  {}  {}  provenance={}",
-                        entry
-                            .backup_id
-                            .map_or_else(|| "unknown".to_owned(), |id| id.to_string()),
-                        entry.shape.unwrap_or("unknown"),
-                        entry.status,
-                        entry.reason.unwrap_or("-"),
-                        entry.provenance.unwrap_or("unknown")
-                    );
-                }
-            }
+            report_discovery(discovery, report)?;
         }
         InventoryCommand::Adopt {
             id,
@@ -292,6 +292,43 @@ pub(crate) fn inventory_with_store(
                     println!("rebuild plan: {id}");
                 }
             }
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn report_discovery(
+    discovery: backup_application::ReconcileReport,
+    report: &mut Reporter,
+) -> Result<()> {
+    let json_output = report.is_json();
+    if json_output {
+        let entries: Vec<_> = discovery
+            .entries
+            .iter()
+            .map(|entry| {
+                json!({
+                    "backup_id": entry.backup_id,
+                    "shape": entry.shape,
+                    "status": entry.status,
+                    "reason": entry.reason,
+                    "provenance": entry.provenance,
+                })
+            })
+            .collect();
+        report.data(json!({"entries": entries, "audit_recorded": discovery.audit_recorded}))?;
+    } else {
+        for entry in discovery.entries {
+            println!(
+                "{}  {}  {}  {}  provenance={}",
+                entry
+                    .backup_id
+                    .map_or_else(|| "unknown".to_owned(), |id| id.to_string()),
+                entry.shape.unwrap_or("unknown"),
+                entry.status,
+                entry.reason.unwrap_or("-"),
+                entry.provenance.unwrap_or("unknown")
+            );
         }
     }
     Ok(())

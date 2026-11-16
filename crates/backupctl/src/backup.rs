@@ -169,24 +169,7 @@ pub(crate) fn run_with_store(
             } else {
                 service.verify(&config, id, level_name)?
             };
-            if json {
-                report.data(serde_json::json!({
-                    "artifact_id": verification.artifact_id,
-                    "level": verification.level,
-                    "payload_size_bytes": verification.payload_size_bytes,
-                    "payload_sha256": verification.payload_sha256,
-                    "globals_size_bytes": verification.globals_size_bytes,
-                    "globals_sha256": verification.globals_sha256,
-                    "audit_recorded": verification.audit_recorded,
-                    "origin": verification.origin.as_ref().map(|origin| serde_json::json!({
-                        "signer_id": origin.signer_id,
-                        "recipient_id": origin.recipient_id,
-                        "signature_suite": origin.signature_suite,
-                    })),
-                }))?;
-            } else {
-                print_verify(&verification);
-            }
+            report_verification(&verification, report)?;
         }
     }
     Ok(())
@@ -304,6 +287,32 @@ pub(crate) fn protection(
             protection.changed,
             protection.changed
         );
+    }
+    Ok(())
+}
+
+pub(crate) fn report_verification(
+    verification: &backup_application::VerifyReport,
+    report: &mut Reporter,
+) -> Result<()> {
+    let json = report.is_json();
+    if json {
+        report.data(serde_json::json!({
+            "artifact_id": verification.artifact_id,
+            "level": verification.level,
+            "payload_size_bytes": verification.payload_size_bytes,
+            "payload_sha256": verification.payload_sha256,
+            "globals_size_bytes": verification.globals_size_bytes,
+            "globals_sha256": verification.globals_sha256,
+            "audit_recorded": verification.audit_recorded,
+            "origin": verification.origin.as_ref().map(|origin| serde_json::json!({
+                "signer_id": origin.signer_id,
+                "recipient_id": origin.recipient_id,
+                "signature_suite": origin.signature_suite,
+            })),
+        }))?;
+    } else {
+        print_verify(verification);
     }
     Ok(())
 }

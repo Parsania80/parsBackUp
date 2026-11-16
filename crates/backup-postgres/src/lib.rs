@@ -478,6 +478,22 @@ impl DatabaseAdapter for PostgresAdapter {
 }
 
 impl PostgresAdapter {
+    /// Source-free policy: only protected ELF version/list commands are possible.
+    pub fn offline_for_major(client_bin_dir: &Path, major: u32, timeout: Duration) -> Result<Self> {
+        anyhow::ensure!(
+            backup_domain::SUPPORTED_MAJORS.contains(&major),
+            "unsupported source major"
+        );
+        let engine = Self {
+            policy: Some(native::NativePolicy::offline(client_bin_dir.to_path_buf())),
+        };
+        let restore = client_bin_dir.join(PG_RESTORE);
+        anyhow::ensure!(
+            engine.tool_version(&restore, timeout)?.0 == major,
+            "pg_restore major mismatch"
+        );
+        Ok(engine)
+    }
     pub fn configured(config: &backup_domain::ConfigV1) -> Result<Self> {
         Ok(Self {
             policy: Some(native::NativePolicy::new(config)?),

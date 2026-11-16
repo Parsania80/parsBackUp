@@ -298,6 +298,7 @@ impl LocalRetention {
             )
         })?;
         let store = LocalStore {
+            snapshot: None,
             resources: None,
             fs_guard: None,
             scratch_budget: crate::resources::Budget::new(u64::MAX),
@@ -319,7 +320,7 @@ impl LocalRetention {
                 let dir = open_at(&artifacts, &a.backup_id.to_string(), true)?;
                 let path = descriptor_path(&dir);
                 let before = file_snapshot(&dir)?;
-                let signed = store.open_signed_claimed(a.backup_id, &path, activity)?;
+                let signed = store.open_signed_claimed(a.backup_id, &path, Some(activity))?;
                 let row = rows.iter().find(|r| r.backup_id == a.backup_id).unwrap();
                 ensure!(
                     signed.manifest.source_fingerprint == inventory.estate().source_fingerprint

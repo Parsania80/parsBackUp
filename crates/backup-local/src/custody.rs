@@ -196,7 +196,7 @@ impl Resources {
     }
 }
 
-fn protected_directory(path: &Path) -> Result<File> {
+pub(crate) fn protected_directory(path: &Path) -> Result<File> {
     ensure!(
         path.is_absolute()
             && !path
@@ -369,6 +369,41 @@ pub fn open_protected_store(config: &ConfigV1, usage: KeyUse) -> Result<crate::L
         &resources.parents,
         matches!(usage, KeyUse::Writer),
     )
+}
+
+pub(crate) fn snapshot_keys(
+    config: &ConfigV1,
+    decrypt: bool,
+) -> Result<(Option<crate::StoreKeys>, Option<SigningKeyFile>, Vec<File>)> {
+    // Status on a public projection uses exactly the verifier; no identity probe.
+    let mut projection = config.clone();
+    let usage = if decrypt {
+        KeyUse::Reader
+    } else {
+        projection.access = Access::Public;
+        projection.encryption = None;
+        projection.source = None;
+        projection.tools = None;
+        projection.scratch = None;
+        projection.profiles.clear();
+        KeyUse::Status
+    };
+    let resources = Resources::open(&projection, usage, false)?;
+    let loaded = load_all(&resources)?;
+    let (keys, verifier) = if decrypt {
+        (
+            Some(crate::StoreKeys {
+                identity: loaded.identity.context("KEY_INVALID")?,
+                recipient: None,
+                signing: None,
+                verifying: loaded.verifying,
+            }),
+            None,
+        )
+    } else {
+        (None, loaded.verifying)
+    };
+    Ok((keys, verifier, resources.parents))
 }
 
 /// A multi-file publication receipt. Created names are never removed on failure.

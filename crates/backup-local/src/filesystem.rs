@@ -21,7 +21,10 @@ impl ProtectedRoot {
             config.mode == backup_domain::ConfigMode::Fixture,
             "PRODUCTION_NOT_ENABLED"
         );
-        ensure!(!config.read_only, "READ_ONLY");
+        Self::open_mode(config, create, false)
+    }
+    fn open_mode(config: &ConfigV1, create: bool, snapshot: bool) -> Result<Arc<Self>> {
+        ensure!(!config.read_only || snapshot, "READ_ONLY");
         ensure!(
             !create || config.access == backup_domain::Access::Writer,
             "ACCESS_DENIED"
@@ -68,6 +71,45 @@ impl ProtectedRoot {
         guard.validate_layout()?;
         Ok(guard)
     }
+    pub(crate) fn snapshot(config: &ConfigV1) -> Result<Arc<Self>> {
+        config.validate().context("CONFIG_INVALID")?;
+        ensure!(
+            config.mode == backup_domain::ConfigMode::Fixture,
+            "PRODUCTION_NOT_ENABLED"
+        );
+        ensure!(config.read_only, "READ_ONLY");
+        let guard = Self::open_mode(config, false, true)?;
+        for suffix in ["-journal", "-wal", "-shm"] {
+            ensure!(
+                !exists(
+                    &guard.directory,
+                    &CString::new(format!("inventory.db{suffix}"))?
+                )?,
+                "SNAPSHOT_UNSAFE"
+            );
+        }
+        Ok(guard)
+    }
+    pub(crate) fn external(path: &Path) -> Result<Arc<Self>> {
+        let directory = crate::custody::protected_directory(path).context("FILESYSTEM_UNSAFE")?;
+        private_dir(&directory)?;
+        Ok(Arc::new(Self {
+            path: PathBuf::from(format!(
+                "/proc/{}/fd/{}/.",
+                std::process::id(),
+                directory.as_raw_fd()
+            )),
+            directory,
+            configured: path.to_path_buf(),
+        }))
+    }
+    pub(crate) fn reject_overlap(&self, directory: &File) -> Result<()> {
+        self.reject_key_parent(directory)?;
+        reject_descendant(directory, &self.directory)
+    }
+    pub(crate) fn directory(&self) -> &File {
+        &self.directory
+    }
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -76,6 +118,7 @@ impl ProtectedRoot {
         Ok(crate::LocalStore {
             root: self.path.clone(),
             keys: None,
+            snapshot: None,
             resources: None,
             fs_guard: Some(self.clone()),
             scratch_budget: crate::resources::Budget::new(u64::MAX),
@@ -141,23 +184,26 @@ impl ProtectedRoot {
         Ok(())
     }
     pub(crate) fn reject_key_parent(&self, dir: &File) -> Result<()> {
-        let store = self.directory.metadata().context("FILESYSTEM_UNSAFE")?;
-        let mut current = dir.try_clone().context("FILESYSTEM_UNSAFE")?;
-        for _ in 0..1024 {
-            let meta = current.metadata().context("FILESYSTEM_UNSAFE")?;
-            ensure!(
-                (meta.dev(), meta.ino()) != (store.dev(), store.ino()),
-                "FILESYSTEM_UNSAFE"
-            );
-            let parent = open_dir(&current, c"..")?;
-            let pm = parent.metadata().context("FILESYSTEM_UNSAFE")?;
-            if (pm.dev(), pm.ino()) == (meta.dev(), meta.ino()) {
-                return Ok(());
-            }
-            current = parent;
-        }
-        anyhow::bail!("FILESYSTEM_UNSAFE")
+        reject_descendant(&self.directory, dir)
     }
+}
+fn reject_descendant(root: &File, dir: &File) -> Result<()> {
+    let store = root.metadata().context("FILESYSTEM_UNSAFE")?;
+    let mut current = dir.try_clone().context("FILESYSTEM_UNSAFE")?;
+    for _ in 0..1024 {
+        let meta = current.metadata().context("FILESYSTEM_UNSAFE")?;
+        ensure!(
+            (meta.dev(), meta.ino()) != (store.dev(), store.ino()),
+            "FILESYSTEM_UNSAFE"
+        );
+        let parent = open_dir(&current, c"..")?;
+        let pm = parent.metadata().context("FILESYSTEM_UNSAFE")?;
+        if (pm.dev(), pm.ino()) == (meta.dev(), meta.ino()) {
+            return Ok(());
+        }
+        current = parent;
+    }
+    anyhow::bail!("FILESYSTEM_UNSAFE")
 }
 fn open_dir(parent: &File, name: &std::ffi::CStr) -> Result<File> {
     // SAFETY: valid live parent and C name; no symlink, creation or blocking special file.
@@ -220,6 +266,7 @@ pub(crate) fn open_store(
     Ok(crate::LocalStore {
         root: guard.path().to_path_buf(),
         keys: Some(keys),
+        snapshot: None,
         resources: Some(config.resources.clone()),
         fs_guard: Some(guard),
         scratch_budget: crate::resources::Budget::new(config.resources.max_scratch_bytes),

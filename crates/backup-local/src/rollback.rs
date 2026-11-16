@@ -12,7 +12,7 @@ impl LocalStore {
         match fs::symlink_metadata(&path) {
             Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
             Err(e) => Err(e.into()),
-            Ok(_) => Ok(Some(Inventory::open_read_only_bound(&path)?)),
+            Ok(_) => Ok(Some(self.read_inventory(&path)?)),
         }
     }
 

@@ -82,6 +82,8 @@ fn safe_failure(error: &anyhow::Error, operation: &str) -> (&'static str, &'stat
     const CODES: &[&str] = &[
         "CONFIG_INVALID",
         "FILESYSTEM_UNSAFE",
+        "SNAPSHOT_UNSAFE",
+        "SCRATCH_REQUIRED",
         "RESOURCE_LIMIT",
         "DISK_RESERVE_LOW",
         "KEY_UNSAFE",
@@ -164,6 +166,12 @@ fn message(code: &str) -> &'static str {
         }
         "KEY_PARTIAL" => {
             "Some key files were published and retained; inspect the receipt and key custody before recovery."
+        }
+        "SNAPSHOT_UNSAFE" => {
+            "The snapshot is unsafe, unsupported or requires quiescent SQLite state."
+        }
+        "SCRATCH_REQUIRED" => {
+            "Authenticated snapshot reads require explicit protected external scratch."
         }
         "FILESYSTEM_UNSAFE" => {
             "The store or required filesystem resource is missing, unsafe or aliases protected key storage."

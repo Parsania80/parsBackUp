@@ -157,6 +157,35 @@ pub struct VerificationEvent {
 }
 
 impl Inventory {
+    /// Bound snapshot result materialization without migrating or writing the index.
+    pub fn check_snapshot_limits(&self) -> Result<()> {
+        Self::check_snapshot_connection(&self.conn)
+    }
+    fn check_snapshot_connection(conn: &Connection) -> Result<()> {
+        // Known tables must not resolve to views or virtual table programs. Check
+        // schema before binding or any application row query can execute them.
+        let programs: i64 = conn.query_row("SELECT count(*) FROM sqlite_schema WHERE type IN ('view','trigger') OR (type='table' AND upper(sql) GLOB '*VIRTUAL*')", [], |r|r.get(0))?;
+        ensure!(programs == 0, "SNAPSHOT_UNSAFE");
+        let mut statement = conn.prepare("SELECT name FROM sqlite_schema WHERE type='table' AND name NOT GLOB 'sqlite_*' LIMIT 33")?;
+        let names = statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        ensure!(names.len() <= 32, "RESOURCE_LIMIT");
+        let mut rows = 0_u64;
+        for name in names {
+            let quoted = name.replace('"', "\"\"");
+            let count: i64 = conn.query_row(
+                &format!("SELECT count(*) FROM (SELECT 1 FROM \"{quoted}\" LIMIT 100001)"),
+                [],
+                |row| row.get(0),
+            )?;
+            rows = rows
+                .checked_add(count.try_into().context("RESOURCE_LIMIT")?)
+                .context("RESOURCE_LIMIT")?;
+            ensure!(rows <= 100000, "RESOURCE_LIMIT");
+        }
+        Ok(())
+    }
     // SQLite's NOFOLLOW rejects the trusted procfs directory descriptor too.
     // Permit only an exact live directory fd of this process, after separately
     // opening the final database with O_NOFOLLOW. Ordinary paths keep SQLite's
@@ -399,6 +428,19 @@ impl Inventory {
         })
     }
 
+    /// Quiescent snapshot only: immutable SQLite avoids database locks and sidecars.
+    /// Callers must exclude concurrent mutation and validate protected file ancestry.
+    pub fn open_snapshot_bound(path: &Path) -> Result<Self> {
+        let conn = Self::read_connection(path, true)?;
+        Self::check_snapshot_connection(&conn)?;
+        let found = Self::binding(&conn)?.context("SNAPSHOT_UNSAFE")?;
+        let inventory = Self {
+            conn,
+            estate: Estate::new(found)?,
+        };
+        Ok(inventory)
+    }
+
     // SQLite READONLY can create WAL/SHM files while querying journal_mode.
     fn check_read_header(path: &Path) -> Result<()> {
         let file = std::fs::OpenOptions::new()
@@ -421,17 +463,51 @@ impl Inventory {
     }
 
     fn read_only_connection(path: &Path) -> Result<Connection> {
+        Self::read_connection(path, false)
+    }
+    fn read_connection(path: &Path, snapshot: bool) -> Result<Connection> {
+        if snapshot {
+            for suffix in ["-journal", "-wal", "-shm"] {
+                let mut name = path.as_os_str().to_os_string();
+                name.push(suffix);
+                match std::fs::symlink_metadata(Path::new(&name)) {
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    _ => anyhow::bail!("SNAPSHOT_UNSAFE"),
+                }
+            }
+            ensure!(
+                std::fs::symlink_metadata(path)?.len() <= 64 * 1024 * 1024,
+                "RESOURCE_LIMIT"
+            );
+        }
         ensure!(
             path.is_file(),
             "no inventory at {}: the file does not exist, and a read of the store's history is not \
              the moment to create one",
             path.display()
         );
-        Self::check_read_header(path)?;
-        let conn = Connection::open_with_flags(
-            path,
-            Self::sqlite_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?,
-        )
+        if snapshot {
+            Self::check_read_header(path).context("SNAPSHOT_UNSAFE")?;
+        } else {
+            Self::check_read_header(path)?;
+        }
+        let flags = Self::sqlite_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let conn = if snapshot {
+            use std::os::unix::ffi::OsStrExt;
+            // Encode every path byte so '?' and '#' cannot inject URI parameters.
+            let encoded = path
+                .as_os_str()
+                .as_bytes()
+                .iter()
+                .map(|b| format!("%{b:02X}"))
+                .collect::<String>();
+            Connection::open_with_flags(
+                format!("file:{encoded}?mode=ro&immutable=1"),
+                flags | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+            )
+        } else {
+            Connection::open_with_flags(path, flags)
+        }
         .with_context(|| format!("cannot open inventory {} read-only", path.display()))?;
         Self::configure(&conn, path, true)
             .with_context(|| format!("cannot open inventory {} read-only", path.display()))?;
@@ -2968,6 +3044,69 @@ mod tests {
         assert!(inventory.completion_mark(SOURCE, signer).unwrap().is_none());
         assert_eq!(inventory.audit_events().unwrap(), events);
         drop(inventory);
+        fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn immutable_snapshot_refuses_sidecars_wal_and_bounded_rows_without_changes() {
+        use std::os::unix::fs::symlink;
+        let (dir, original) = created("snapshot");
+        // URI metacharacters must be treated as literal path bytes.
+        let path = original.with_file_name("inventory?#%.db");
+        let inventory = Inventory::open(&path, &estate()).unwrap();
+        inventory.conn.execute_batch("CREATE TABLE sqliteXunbounded(x); WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<100000) INSERT INTO sqliteXunbounded SELECT x FROM n;").unwrap();
+        drop(inventory);
+        let before = fs::read(&path).unwrap();
+        assert!(
+            chain(Inventory::open_snapshot_bound(&path).err().unwrap()).contains("RESOURCE_LIMIT")
+        );
+        assert_eq!(fs::read(&path).unwrap(), before);
+        let conn = Connection::open(&path).unwrap();
+        conn.execute("DELETE FROM sqliteXunbounded WHERE x > 10", [])
+            .unwrap();
+        drop(conn);
+        assert!(Inventory::open_snapshot_bound(&path).is_ok());
+        let conn = Connection::open(&path).unwrap();
+        for i in 0..32 {
+            conn.execute_batch(&format!("CREATE TABLE extra_{i}(x);"))
+                .unwrap();
+        }
+        drop(conn);
+        assert!(
+            chain(Inventory::open_snapshot_bound(&path).err().unwrap()).contains("RESOURCE_LIMIT")
+        );
+        let conn = Connection::open(&path).unwrap();
+        for i in 0..32 {
+            conn.execute_batch(&format!("DROP TABLE extra_{i};"))
+                .unwrap();
+        }
+        drop(conn);
+        for suffix in ["-journal", "-wal", "-shm"] {
+            let sidecar = path.with_file_name(format!("inventory?#%.db{suffix}"));
+            symlink("absent", &sidecar).unwrap();
+            assert!(
+                chain(Inventory::open_snapshot_bound(&path).err().unwrap())
+                    .contains("SNAPSHOT_UNSAFE")
+            );
+            fs::remove_file(sidecar).unwrap();
+        }
+        let mut bytes = fs::read(&path).unwrap();
+        bytes[18] = 2;
+        bytes[19] = 2;
+        fs::write(&path, &bytes).unwrap();
+        assert!(Inventory::open_snapshot_bound(&path).is_err());
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        bytes[18] = 1;
+        bytes[19] = 1;
+        fs::write(&path, &bytes).unwrap();
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "ALTER TABLE meta RENAME TO saved_meta; CREATE VIEW meta AS SELECT * FROM saved_meta;",
+        )
+        .unwrap();
+        drop(conn);
+        assert!(
+            chain(Inventory::open_snapshot_bound(&path).err().unwrap()).contains("SNAPSHOT_UNSAFE")
+        );
         fs::remove_dir_all(dir).unwrap();
     }
 }

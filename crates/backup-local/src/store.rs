@@ -175,6 +175,7 @@ impl LocalStore {
         Ok(Self {
             root,
             keys,
+            snapshot: None,
             resources: None,
             fs_guard: None,
             scratch_budget: crate::resources::Budget::new(u64::MAX),

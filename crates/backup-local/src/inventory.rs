@@ -57,6 +57,12 @@ impl LocalStore {
 pub struct LocalInventory(backup_inventory::Inventory);
 
 impl LocalInventory {
+    pub fn open_snapshot(root: &std::path::Path) -> Result<Self> {
+        Ok(Self(
+            backup_inventory::Inventory::open_snapshot_bound(&root.join(INVENTORY_FILE))
+                .context("INVENTORY_OPEN_FAILED")?,
+        ))
+    }
     pub fn open(root: &std::path::Path) -> Result<Self> {
         Ok(Self(
             backup_inventory::Inventory::open_read_only_bound(&root.join(INVENTORY_FILE))

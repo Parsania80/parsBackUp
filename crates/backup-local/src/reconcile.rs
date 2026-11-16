@@ -506,7 +506,13 @@ impl LocalReconciler {
             backup,
         ))
     }
+    pub(crate) fn discover_snapshot(&self) -> Result<ReconcileReport> {
+        self.scan_mode(false, true)
+    }
     fn scan(&self, write: bool) -> Result<ReconcileReport> {
+        self.scan_mode(write, false)
+    }
+    fn scan_mode(&self, write: bool, snapshot: bool) -> Result<ReconcileReport> {
         let root = &self.0;
         let _claim = if write {
             Some(
@@ -517,7 +523,12 @@ impl LocalReconciler {
             None
         };
         let path = root.join(INVENTORY_FILE);
-        let inventory = Inventory::open_read_only_bound(&path).context("INVENTORY_OPEN_FAILED")?;
+        let inventory = if snapshot {
+            Inventory::open_snapshot_bound(&path)
+        } else {
+            Inventory::open_read_only_bound(&path)
+        }
+        .context("INVENTORY_OPEN_FAILED")?;
         ensure!(
             !write || inventory.schema_version()? == backup_inventory::SCHEMA_VERSION,
             "INVENTORY_OPEN_FAILED: upgrade the inventory before reconciliation"

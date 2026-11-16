@@ -45,13 +45,17 @@ impl LocalStore {
         max_plaintext_bytes: Option<u64>,
         expected_ciphertext: Option<(u64, &str)>,
     ) -> Result<LocalPlaintext> {
-        let claim = ActivityLock::hold(&self.root)?;
+        let claim = if self.snapshot.is_some() {
+            None
+        } else {
+            Some(ActivityLock::hold(&self.root)?)
+        };
         self.decrypt_to_scratch_owned(
             ciphertext,
             name,
             max_plaintext_bytes,
             expected_ciphertext,
-            Some(claim),
+            claim,
         )
     }
 
@@ -68,8 +72,18 @@ impl LocalStore {
             .as_ref()
             .context("artifact is encrypted but no key files are configured")?;
         ensure_regular_file(ciphertext)?;
-        crate::ensure_real_dir(&self.root.join(SCRATCH_DIR))?;
-        let scratch = self.root.join(SCRATCH_DIR).join(Uuid::new_v4().to_string());
+        let scratch_root = if let Some(snapshot) = &self.snapshot {
+            snapshot
+                .scratch
+                .as_ref()
+                .context("SCRATCH_REQUIRED")?
+                .path()
+                .to_path_buf()
+        } else {
+            self.root.join(SCRATCH_DIR)
+        };
+        crate::ensure_real_dir(&scratch_root)?;
+        let scratch = scratch_root.join(Uuid::new_v4().to_string());
         DirBuilder::new()
             .mode(0o700)
             .create(&scratch)
@@ -82,6 +96,7 @@ impl LocalStore {
             _use: None,
             _fs_guard: self.fs_guard.clone(),
             _quota: quota.clone(),
+            _snapshot: self.snapshot.clone(),
         };
         let file = OpenOptions::new()
             .write(true)
@@ -152,7 +167,7 @@ impl LocalStore {
         &self,
         path: &Path,
         header: &PublicHeader,
-        _claim: &ActivityLock,
+        _claim: Option<&ActivityLock>,
     ) -> Result<ArtifactManifest> {
         let view = self.decrypt_to_scratch_owned(
             path,
@@ -221,7 +236,11 @@ mod tests {
         backup_crypto::stream::encrypt(recipient.recipient(), &b""[..], &mut replacement)?;
         fs::write(&path, replacement)?;
         let error = store
-            .authenticated_manifest(&path, &header, &ActivityLock::hold(&store.root).unwrap())
+            .authenticated_manifest(
+                &path,
+                &header,
+                Some(&ActivityLock::hold(&store.root).unwrap()),
+            )
             .unwrap_err();
         let error = format!("{error:#}");
         assert!(

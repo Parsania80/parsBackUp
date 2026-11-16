@@ -1359,3 +1359,241 @@ fn restore_refusals_precede_cluster_mutation() {
     assert!(capture.created().is_empty());
     fixture.remove();
 }
+
+// True snapshot fixtures live under a protected HOME and freeze the store mode.
+fn snapshot_fixture(capture: &Capture) -> (Fixture, backup_domain::ConfigV1) {
+    use std::os::unix::fs::PermissionsExt;
+    let base = PathBuf::from(std::env::var_os("HOME").unwrap())
+        .join(format!(".backupctl-snapshot-{}", Uuid::new_v4()));
+    fs::create_dir(&base).unwrap();
+    fs::set_permissions(&base, fs::Permissions::from_mode(0o700)).unwrap();
+    let fixture = write_signed_in(capture, base).unwrap();
+    fs::set_permissions(fixture.base.join("keys"), fs::Permissions::from_mode(0o700)).unwrap();
+    let scratch = fixture.base.join("external");
+    fs::create_dir(&scratch).unwrap();
+    fs::set_permissions(&scratch, fs::Permissions::from_mode(0o700)).unwrap();
+    fn freeze(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        if path.is_dir() {
+            for entry in fs::read_dir(path).unwrap() {
+                freeze(&entry.unwrap().path());
+            }
+            fs::set_permissions(path, fs::Permissions::from_mode(0o500)).unwrap();
+        } else {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o400)).unwrap();
+        }
+    }
+    freeze(&fixture.store_root);
+    let config = serde_json::from_value(serde_json::json!({
+        "config_version":1, "mode":"fixture", "access":"reader", "read_only":true,
+        "storage":{"root":fixture.store_root},
+        "encryption":{"identity_file":fixture.keys.identity},
+        "signing":{"verifying_key_file":fixture.keys.verifying},
+        "scratch":{"root":scratch}
+    }))
+    .unwrap();
+    (fixture, config)
+}
+fn thaw_snapshot(fixture: Fixture) {
+    use std::os::unix::fs::PermissionsExt;
+    fn thaw(path: &Path) {
+        if path.is_dir() {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+            for entry in fs::read_dir(path).unwrap() {
+                thaw(&entry.unwrap().path());
+            }
+        }
+    }
+    thaw(&fixture.base);
+    fixture.remove();
+}
+
+#[test]
+fn snapshot_reads_are_key_exact_external_and_preserve_frozen_store() {
+    use backup_local::{SnapshotReader, SnapshotUse};
+    let capture = Capture::default();
+    let (fixture, mut config) = snapshot_fixture(&capture);
+    let before = snapshot(&fixture.artifact_dir());
+    let inventory = fs::read(fixture.store_root.join(INVENTORY_FILE)).unwrap();
+    let scratch = config.scratch.as_ref().unwrap().root.clone();
+    fs::write(scratch.join("untouched"), b"owned by another operation").unwrap();
+    // Discovery is key-free; signature checks do not even open an invalid identity.
+    config.encryption.as_mut().unwrap().identity_file = Some(fixture.base.join("absent/identity"));
+    assert_eq!(
+        SnapshotReader::open(&config, SnapshotUse::Discovery)
+            .unwrap()
+            .list()
+            .unwrap()
+            .signed
+            .len(),
+        1
+    );
+    let signed = SnapshotReader::open(&config, SnapshotUse::Signature)
+        .unwrap()
+        .verify(
+            StubEngine { capture: &capture },
+            &fixture.config,
+            fixture.id,
+            VERIFY_SIGNATURE,
+        )
+        .unwrap();
+    assert!(!signed.audit_recorded);
+    config.encryption.as_mut().unwrap().identity_file = Some(fixture.keys.identity.clone());
+    let reader = SnapshotReader::open(&config, SnapshotUse::Authenticated).unwrap();
+    // Held descriptors survive replacement of both configured names.
+    let moved_scratch = fixture.base.join("moved-external");
+    let moved_store = fixture.base.join("moved-store");
+    fs::rename(&scratch, &moved_scratch).unwrap();
+    fs::create_dir(&scratch).unwrap();
+    fs::rename(&fixture.store_root, &moved_store).unwrap();
+    fs::create_dir(&fixture.store_root).unwrap();
+    assert_eq!(reader.inspect(fixture.id).unwrap().backup_id, fixture.id);
+    assert!(!reader.discover_inventory().unwrap().audit_recorded);
+    let report = reader
+        .verify(
+            StubEngine { capture: &capture },
+            &fixture.config,
+            fixture.id,
+            VERIFY_ARCHIVE,
+        )
+        .unwrap();
+    assert!(!report.audit_recorded);
+    assert!(capture.reads().last().unwrap().0.starts_with("/proc"));
+    assert_eq!(fs::read_dir(&scratch).unwrap().count(), 0);
+    assert_eq!(fs::read_dir(&fixture.store_root).unwrap().count(), 0);
+    fs::remove_dir(&scratch).unwrap();
+    fs::remove_dir(&fixture.store_root).unwrap();
+    fs::rename(moved_scratch, &scratch).unwrap();
+    fs::rename(moved_store, &fixture.store_root).unwrap();
+    assert_eq!(fs::read_dir(&scratch).unwrap().count(), 1);
+    assert_eq!(
+        fs::read(scratch.join("untouched")).unwrap(),
+        b"owned by another operation"
+    );
+    assert_eq!(snapshot(&fixture.artifact_dir()), before);
+    assert_eq!(
+        fs::read(fixture.store_root.join(INVENTORY_FILE)).unwrap(),
+        inventory
+    );
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(&fixture.store_root, fs::Permissions::from_mode(0o700)).unwrap();
+    let index = fixture.store_root.join(INVENTORY_FILE);
+    let saved_index = fixture.base.join("saved-inventory.db");
+    fs::rename(&index, &saved_index).unwrap();
+    let reader = SnapshotReader::open(&config, SnapshotUse::Authenticated).unwrap();
+    assert_eq!(reader.list().unwrap().rollback_unknown, vec![fixture.id]);
+    assert_eq!(reader.inspect(fixture.id).unwrap().backup_id, fixture.id);
+    fs::rename(saved_index, index).unwrap();
+    thaw_snapshot(fixture);
+}
+
+#[test]
+fn snapshot_refuses_missing_overlapping_and_exhausted_scratch_and_wrong_keys() {
+    use backup_local::{SnapshotReader, SnapshotUse};
+    let capture = Capture::default();
+    let (fixture, mut config) = snapshot_fixture(&capture);
+    let external = config.scratch.clone();
+    config.scratch = None;
+    assert!(
+        failure(SnapshotReader::open(&config, SnapshotUse::Authenticated))
+            .contains("SCRATCH_REQUIRED")
+    );
+    for path in [
+        &fixture.store_root,
+        &fixture.base,
+        &fixture.base.join("keys"),
+    ] {
+        config.scratch = external.clone();
+        config.scratch.as_mut().unwrap().root = path.clone();
+        assert!(SnapshotReader::open(&config, SnapshotUse::Authenticated).is_err());
+    }
+    config.scratch = external;
+    config.resources.max_scratch_bytes = 1;
+    let reader = SnapshotReader::open(&config, SnapshotUse::Authenticated).unwrap();
+    assert!(failure(reader.inspect(fixture.id)).contains("RESOURCE_LIMIT"));
+    assert_eq!(
+        fs::read_dir(&config.scratch.as_ref().unwrap().root)
+            .unwrap()
+            .count(),
+        0
+    );
+    config.resources = Default::default();
+    let wrong = fixture.base.join("keys/wrong");
+    backup_crypto::keystore::KeyFile::create_identity(&wrong).unwrap();
+    config.encryption.as_mut().unwrap().identity_file = Some(wrong);
+    assert!(
+        SnapshotReader::open(&config, SnapshotUse::Authenticated)
+            .unwrap()
+            .inspect(fixture.id)
+            .is_err()
+    );
+    assert_eq!(
+        fs::read_dir(&config.scratch.as_ref().unwrap().root)
+            .unwrap()
+            .count(),
+        0
+    );
+    thaw_snapshot(fixture);
+}
+
+#[test]
+fn snapshot_refuses_nonquiescent_inventory_aliases_and_unbounded_catalogues() {
+    use backup_local::{SnapshotReader, SnapshotUse};
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    let capture = Capture::default();
+    let (fixture, config) = snapshot_fixture(&capture);
+    fs::set_permissions(&fixture.store_root, fs::Permissions::from_mode(0o700)).unwrap();
+    for suffix in ["-wal", "-shm", "-journal"] {
+        let path = fixture.store_root.join(format!("inventory.db{suffix}"));
+        symlink("missing", &path).unwrap();
+        assert!(SnapshotReader::open(&config, SnapshotUse::Discovery).is_err());
+        fs::remove_file(path).unwrap();
+    }
+    let artifact = fixture.artifact_dir();
+    fs::set_permissions(&artifact, fs::Permissions::from_mode(0o700)).unwrap();
+    let alias = fixture.base.join("outside-payload-alias");
+    fs::hard_link(artifact.join("payload.age"), &alias).unwrap();
+    assert!(
+        SnapshotReader::open(&config, SnapshotUse::Discovery)
+            .unwrap()
+            .list()
+            .is_err()
+    );
+    fs::remove_file(alias).unwrap();
+    let payload = artifact.join("payload.age");
+    let saved_payload = fixture.base.join("saved-payload");
+    fs::rename(&payload, &saved_payload).unwrap();
+    symlink(&saved_payload, &payload).unwrap();
+    assert!(
+        SnapshotReader::open(&config, SnapshotUse::Discovery)
+            .unwrap()
+            .list()
+            .is_err()
+    );
+    fs::remove_file(&payload).unwrap();
+    let name = std::ffi::CString::new(payload.as_os_str().as_encoded_bytes()).unwrap();
+    // SAFETY: valid C name; fixture-owned namespace, no replacement.
+    assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+    assert!(
+        SnapshotReader::open(&config, SnapshotUse::Discovery)
+            .unwrap()
+            .list()
+            .is_err()
+    );
+    fs::remove_file(&payload).unwrap();
+    fs::rename(saved_payload, payload).unwrap();
+    let catalogue = fixture.store_root.join("artifacts");
+    fs::set_permissions(&catalogue, fs::Permissions::from_mode(0o700)).unwrap();
+    for _ in 0..4096 {
+        fs::create_dir(catalogue.join(Uuid::new_v4().to_string())).unwrap();
+    }
+    assert!(
+        failure(
+            SnapshotReader::open(&config, SnapshotUse::Discovery)
+                .unwrap()
+                .list()
+        )
+        .contains("RESOURCE_LIMIT")
+    );
+    thaw_snapshot(fixture);
+}

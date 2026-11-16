@@ -21,6 +21,8 @@ pub use custody::{
 mod filesystem;
 mod reconcile;
 mod resources;
+mod snapshot;
+pub use snapshot::{SnapshotReader, SnapshotUse};
 mod retention;
 mod rollback;
 mod scratch;
@@ -94,8 +96,9 @@ pub struct StoreKeys {
 /// value read off [`SignedArtifactHandle::manifest`] is a claim about bytes written by whoever
 /// holds the signing key, not about bytes an attacker chose.
 pub struct ArtifactUse {
-    _resource: backup_inventory::ResourceLock,
-    activity: ActivityLock,
+    _snapshot: Option<std::sync::Arc<snapshot::SnapshotState>>,
+    _resource: Option<backup_inventory::ResourceLock>,
+    activity: Option<ActivityLock>,
     _fs_guard: Option<std::sync::Arc<filesystem::ProtectedRoot>>,
 }
 
@@ -113,6 +116,7 @@ pub struct LocalStore {
     /// recipient stanza existed: encryption is a property of the configured store.
     keys: Option<StoreKeys>,
     resources: Option<backup_domain::ResourceLimits>,
+    snapshot: Option<std::sync::Arc<snapshot::SnapshotState>>,
     fs_guard: Option<std::sync::Arc<filesystem::ProtectedRoot>>,
     scratch_budget: std::sync::Arc<resources::Budget>,
 }
@@ -181,6 +185,7 @@ pub struct LocalArtifact {
 /// store's scratch directory, and this type owns it: dropping the view removes the
 /// directory, so decrypted bytes do not outlive the operation that needed them.
 pub struct LocalPlaintext {
+    _snapshot: Option<std::sync::Arc<snapshot::SnapshotState>>,
     _use: Option<std::sync::Arc<ArtifactUse>>,
     path: PathBuf,
     scratch: Option<PathBuf>,
@@ -481,6 +486,14 @@ impl LocalStore {
 impl ArtifactStore for LocalStore {
     type Use = std::sync::Arc<ArtifactUse>;
     fn claim_artifact(&self, id: Uuid) -> Result<Self::Use> {
+        if let Some(snapshot) = &self.snapshot {
+            return Ok(std::sync::Arc::new(ArtifactUse {
+                _resource: None,
+                activity: None,
+                _fs_guard: self.fs_guard.clone(),
+                _snapshot: Some(snapshot.clone()),
+            }));
+        }
         let activity = ActivityLock::hold(&self.root)?;
         let resource = backup_inventory::ResourceLock::artifact(&self.root, id, false)?
             .context("RETENTION_BUSY: artifact has an exclusive user")?;
@@ -488,8 +501,9 @@ impl ArtifactStore for LocalStore {
         activity.inherit_in_children()?;
         resource.inherit_in_children()?;
         Ok(std::sync::Arc::new(ArtifactUse {
-            _resource: resource,
-            activity,
+            _resource: Some(resource),
+            activity: Some(activity),
+            _snapshot: None,
             _fs_guard: self.fs_guard.clone(),
         }))
     }
@@ -502,9 +516,11 @@ impl ArtifactStore for LocalStore {
     /// the signed v1 shape. The older shapes stay readable through the other methods; what
     /// changes is that a new artifact gets a sealed manifest and a signature.
     fn is_signed(&self) -> bool {
-        self.keys
-            .as_ref()
-            .is_some_and(|keys| keys.signing.is_some() || keys.verifying.is_some())
+        self.snapshot.is_some()
+            || self
+                .keys
+                .as_ref()
+                .is_some_and(|keys| keys.signing.is_some() || keys.verifying.is_some())
     }
 
     fn signed_key_facts(&self) -> Result<SignedKeyFacts> {
@@ -727,6 +743,7 @@ impl ArtifactStore for LocalStore {
                 _claim: None,
                 _fs_guard: self.fs_guard.clone(),
                 _quota: None,
+                _snapshot: self.snapshot.clone(),
                 _use: Some(artifact._use.clone()),
             });
         }
@@ -757,6 +774,7 @@ impl ArtifactStore for LocalStore {
                 _claim: None,
                 _fs_guard: self.fs_guard.clone(),
                 _quota: None,
+                _snapshot: self.snapshot.clone(),
                 _use: None,
             });
         }
@@ -776,6 +794,7 @@ impl ArtifactStore for LocalStore {
                 _claim: None,
                 _fs_guard: self.fs_guard.clone(),
                 _quota: None,
+                _snapshot: self.snapshot.clone(),
                 _use: Some(artifact._use.clone()),
             });
         }
@@ -976,6 +995,9 @@ impl ArtifactStore for LocalStore {
     /// artifacts are reported by id rather than skipped, because an unsigned artifact that a
     /// signature-first listing hides is the failure mode this function exists to catch.
     fn list_signed(&self) -> Result<StoreListing> {
+        if self.snapshot.is_some() {
+            return self.snapshot_listing();
+        }
         let _activity = ActivityLock::hold(&self.root)?;
         let mut listing = StoreListing {
             signed: Vec::new(),
@@ -1033,6 +1055,10 @@ impl ArtifactStore for LocalStore {
     fn verify_signed(&self, id: Uuid) -> Result<PublicHeader> {
         let _use = self.claim_artifact(id)?;
         let dir = self.artifact_dir(id);
+        if self.snapshot.is_some() {
+            self.check_lifecycle(id)?;
+            self.snapshot_artifact(id, true)?;
+        }
         ensure_real_dir(&dir)?;
         self.verify_signed_in(id, &dir)
     }
@@ -1041,7 +1067,10 @@ impl ArtifactStore for LocalStore {
         let usage = self.claim_artifact(id)?;
         let dir = self.artifact_dir(id);
         ensure_real_dir(&dir)?;
-        let mut artifact = self.open_signed_claimed(id, &dir, &usage.activity)?;
+        if self.snapshot.is_some() {
+            self.snapshot_artifact(id, true)?;
+        }
+        let mut artifact = self.open_signed_claimed(id, &dir, usage.activity.as_ref())?;
         artifact._use = Some(usage);
         Ok(artifact)
     }
@@ -1237,13 +1266,11 @@ fn digest_bytes(value: &str) -> Result<[u8; DIGEST_BYTES]> {
 
 impl LocalStore {
     fn verify_signed_in(&self, id: Uuid, dir: &Path) -> Result<PublicHeader> {
-        let keys = self
+        let verifying = self
             .keys
             .as_ref()
-            .context("artifact is signed but no key files are configured")?;
-        let verifying = keys
-            .verifying
-            .as_ref()
+            .and_then(|k| k.verifying.as_ref())
+            .or_else(|| self.snapshot.as_ref().and_then(|s| s.verifier.as_ref()))
             .context("no verifying key is configured, so no signature can be trusted")?;
         ensure_regular_file(&dir.join(COMPLETE_MARKER))?;
         Self::refuse_split_manifest(dir)?;
@@ -1296,7 +1323,8 @@ impl LocalStore {
         match fs::symlink_metadata(&path) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
             Err(e) => Err(e.into()),
-            Ok(_) => Ok(backup_inventory::Inventory::open_read_only_bound(&path)?
+            Ok(_) => Ok(self
+                .read_inventory(&path)?
                 .artifact(id)?
                 .is_some_and(|r| r.state.is_deletion())),
         }
@@ -1314,7 +1342,7 @@ impl LocalStore {
         &self,
         id: Uuid,
         dir: &Path,
-        claim: &ActivityLock,
+        claim: Option<&ActivityLock>,
     ) -> Result<SignedArtifact> {
         self.check_lifecycle(id)?;
         let header = self.verify_signed_in(id, dir)?;
@@ -1330,7 +1358,7 @@ impl LocalStore {
         let inventory_path = self.root.join(layout::INVENTORY_FILE);
         match fs::symlink_metadata(&inventory_path) {
             Ok(_) => {
-                let inventory = backup_inventory::Inventory::open_read_only_bound(&inventory_path)?;
+                let inventory = self.read_inventory(&inventory_path)?;
                 if inventory.schema_version()? >= 3 {
                     inventory.check_provisional_source(id, &manifest.source_fingerprint)?;
                 }

@@ -11,6 +11,7 @@ mod keys;
 mod native;
 mod output;
 mod report;
+mod snapshot;
 
 use crate::cli::{
     Cli, ConfigCommand, KeyCommand, ProfileCommand, RestoreCommand, SecurityPreset, TopCommand,

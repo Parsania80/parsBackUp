@@ -169,7 +169,7 @@ pub(crate) fn run(
     }
     // Snapshot readers must never enter the legacy lock/scratch path, even for inventory.
     if config.read_only {
-        return refuse("CAPABILITY_NOT_ENABLED");
+        return crate::snapshot::run(config, command, report);
     }
     if matches!(
         command,

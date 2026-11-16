@@ -17,6 +17,7 @@ const PASS_LIMIT: u64 = 64 * 1024;
 pub(crate) struct NativePolicy {
     pub(crate) context: NativeRestoreContext,
     keys: Vec<PathBuf>,
+    offline: bool,
 }
 impl NativePolicy {
     pub(crate) fn new(config: &ConfigV1) -> Result<Self> {
@@ -66,10 +67,31 @@ impl NativePolicy {
                 password_file: source.password_file.clone(),
             },
             keys,
+            offline: false,
         })
     }
 
+    pub(crate) fn offline(client_bin_dir: PathBuf) -> Self {
+        Self {
+            context: NativeRestoreContext {
+                mode: ConfigMode::Fixture,
+                host: "/unused".into(),
+                port: 1,
+                user: "unused".into(),
+                maintenance_database: "unused".into(),
+                auth: LocalAuth::Peer,
+                client_bin_dir,
+                password_file: None,
+            },
+            keys: Vec::new(),
+            offline: true,
+        }
+    }
     pub(crate) fn command(&self, path: &Path, database: Option<&str>) -> Result<Command> {
+        ensure!(
+            !self.offline || database.is_none(),
+            "offline adapter refuses connections"
+        );
         let mut tool = protected_open(path, true, false)?;
         let meta = tool.metadata()?;
         ensure!(
@@ -111,6 +133,7 @@ impl NativePolicy {
     }
 
     pub(crate) fn validate_database(&self, database: &str) -> Result<()> {
+        ensure!(!self.offline, "offline adapter refuses connections");
         if self.context.auth == LocalAuth::ScramPassfile {
             self.passfile(database)?;
         }
@@ -332,6 +355,7 @@ mod tests {
             NativePolicy {
                 context: context(path),
                 keys: vec![],
+                offline: false,
             }
         }
     }
@@ -496,5 +520,17 @@ mod tests {
             ]
         );
         assert_eq!(writer.context, restore.context);
+    }
+    #[test]
+    fn offline_policy_cannot_create_any_database_command_or_read_credentials() {
+        let policy = NativePolicy::offline("/missing-tools".into());
+        assert!(
+            policy
+                .command(Path::new("/missing-tools/psql"), Some("postgres"))
+                .is_err()
+        );
+        assert!(policy.validate_database("postgres").is_err());
+        assert!(policy.keys.is_empty());
+        assert!(policy.context.password_file.is_none());
     }
 }

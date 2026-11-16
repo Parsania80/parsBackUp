@@ -263,8 +263,9 @@ fn fixture_custody_read_only_and_availability_refuse_before_any_resource_open() 
                 scene.envelope(&args, Some("KEY_UNSAFE"));
             } else if native && !read_only {
                 scene.envelope(&args, Some("CONFIG_INVALID"));
-            } else if read_only
-                || args[0] == "key"
+            } else if read_only {
+                scene.envelope(&args, Some("FILESYSTEM_UNSAFE"));
+            } else if args[0] == "key"
                 || matches!(args[1], "list" | "inspect" | "verify" | "prune" | "delete")
                     && args[0] == "backup"
             {
@@ -294,8 +295,15 @@ fn writable_keyless_inventory_works_without_source_tools_or_configured_keys() {
     let job_id = job.id();
     job.complete().unwrap();
     drop(job);
-    for role in ["writer", "reader", "inventory"] {
-        scene.write(&scene.v1(role, false, false));
+    for (role, snapshot) in [
+        ("writer", false),
+        ("reader", false),
+        ("inventory", false),
+        ("reader", true),
+        ("public", true),
+        ("inventory", true),
+    ] {
+        scene.write(&scene.v1(role, snapshot, false));
         let before = fs::read(scene.root().join("inventory.db")).unwrap();
         let check = scene.envelope(&["inventory", "check"], None);
         assert_eq!(check["data"]["valid"], true);
