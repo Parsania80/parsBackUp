@@ -1,0 +1,13 @@
+[Unit]
+Description=Daily signed fixture backup for profile %i
+Documentation=file:/usr/share/doc/backupctl/h03-systemd-package.md
+
+[Timer]
+OnCalendar=*-*-* 02:00:00 UTC
+RandomizedDelaySec=15m
+AccuracySec=1m
+Persistent=true
+Unit=backupctl-backup@%i.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,38 @@
+# Inert fixture example. Install a reviewed copy as service-owned mode 0600.
+# The template instance and profile name must match. Install matching native clients.
+config_version = 1
+mode = "fixture"
+access = "writer"
+read_only = false
+export_globals = false
+timeout_seconds = 300
+
+[storage]
+root = "/var/lib/backupctl/store"
+
+[source]
+host = "127.0.0.1"
+port = 5432
+user = "backup_reader"
+database = "backupctl_fixture_example"
+maintenance_database = "postgres"
+auth = "scram-passfile"
+password_file = "/etc/backupctl/credentials/passfile"
+
+[tools]
+client_bin_dir = "/usr/lib/postgresql/17/bin"
+
+[encryption]
+identity_file = "/etc/backupctl/keys/identity"
+recipient_file = "/etc/backupctl/keys/recipient"
+
+[signing]
+signing_key_file = "/etc/backupctl/keys/signer"
+verifying_key_file = "/etc/backupctl/keys/verifier"
+
+[[profile]]
+name = "daily"
+database = "backupctl_fixture_example"
+# Empty selection includes the whole database, including all large objects.
+schemas = []
+large_objects = true

@@ -1,0 +1,12 @@
+#!/bin/sh
+set -eu
+if [ "$1" = remove ]; then
+    if [ -d /run/systemd/system ]; then
+        # Quoted patterns are resolved by systemd against loaded instances.
+        systemctl stop 'backupctl-backup@*.timer' 'backupctl-backup@*.service'
+    fi
+    # Disabling the template removes all instance links, including unloaded ones.
+    # No reload is needed here; postrm reloads after the unit files are removed.
+    systemctl --no-reload disable backupctl-backup@.timer
+    systemctl --no-reload --runtime disable backupctl-backup@.timer
+fi
