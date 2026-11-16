@@ -40,6 +40,7 @@
     "h02_native_auth_recovery",
     "h02_snapshot_drill",
     "h02_cancellation_drill",
-    "h02_key_bootstrap_drill"
+    "h02_key_bootstrap_drill",
+    "v01_content_privileges"
   ]
 }

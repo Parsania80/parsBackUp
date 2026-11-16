@@ -1,6 +1,6 @@
 # Fixture CLI configuration and report reference
 
-This reference describes the delivered H01–H03 CLI. Production is disabled: a production config may pass structural check, while operations refuse `PRODUCTION_NOT_ENABLED`. The [.deb example](../../deploy/writer.example.toml) is a signed full-database fixture writer. H03 observed a selective `schemas=["public"]` restore conflict on PG16; that case remains a release blocker. The [roadmap](../../project.md) records acceptance and remaining gates. These are reference commands and preconditions, not a new controlled operating flow.
+This reference describes the delivered H01–H03 CLI. Production is disabled: a production config may pass structural check, while operations refuse `PRODUCTION_NOT_ENABLED`. The [.deb example](../../deploy/writer.example.toml) is a signed full-database fixture writer. H03 observed a selective `schemas=["public"]` restore conflict on PG16; V01 now verifies a narrow empty-schema correction on PG16–18. Other production compatibility/security gates remain open. The [roadmap](../../project.md) records acceptance and remaining gates. These are reference commands and preconditions, not a new controlled operating flow.
 
 ## Configuration and access
 
@@ -110,3 +110,5 @@ Create/restore receipts carry actual job_id (nullable for alternate library adap
 | Retention/rollback/stale-plan codes | Preserve exact saved intent/digest and history; require a fresh reviewed plan when stale. No broadening through retries. |
 
 Safe generated messages/codes are owned by the [reporter](../../crates/backupctl/src/output.rs); do not parse human phrasing or assume every code above exhausts all operation-specific failures.
+
+V01 follow-up (2026-11-16): the selective-public collision has a narrow TOC-gated empty-schema preparation correction with local PG16–18 acceptance. Its positive and populated-template refusal evidence is recorded in the [V01 handoff](../../project.md#51-v01-production-readiness-validation--2026-11-16); earlier H03 observations above remain historical. Production readiness still has separate compatibility/security blockers.

@@ -54,6 +54,15 @@ pub struct PostgresAdapter {
 #[allow(non_upper_case_globals)]
 pub const PostgresAdapter: PostgresAdapter = PostgresAdapter { policy: None };
 
+fn archive_creates_public_schema(toc: &[String]) -> bool {
+    toc.iter().any(|line| {
+        let fields = line.split_whitespace().collect::<Vec<_>>();
+        matches!(fields.as_slice(), [id, catalog, oid, "SCHEMA", "-", "public", owner @ ..]
+            if !owner.is_empty() && id.strip_suffix(';').is_some_and(|n| n.parse::<u32>().is_ok())
+                && catalog.parse::<u32>().is_ok() && oid.parse::<u32>().is_ok())
+    })
+}
+
 impl DatabaseAdapter for PostgresAdapter {
     fn preflight(&self, source: &Source, timeout: Duration) -> Result<EngineInfo> {
         if let Some(path) = &source.password_file {
@@ -451,6 +460,25 @@ impl DatabaseAdapter for PostgresAdapter {
         let mut target = source.clone();
         target.database = database.to_string();
         let source = &target;
+        if !database.starts_with(backup_domain::FIXTURE_PREFIX) {
+            bail!("only synthetic fixture databases may receive a restore");
+        }
+        // The application just created this target from template0. Schema-selected
+        // dumps can recreate public, which the template already supplies. Remove
+        // only that empty namespace; RESTRICT preserves any unexpected objects.
+        if sections.pre_data
+            && archive_creates_public_schema(&self.inspect_archive(source, archive, timeout)?)
+        {
+            let psql = self.tool(source, PSQL)?;
+            let mut command = self.base_command(&psql, source)?;
+            command.args([
+                "--no-psqlrc",
+                "--quiet",
+                "--set=ON_ERROR_STOP=1",
+                "--command=DROP SCHEMA IF EXISTS public RESTRICT",
+            ]);
+            run(command, timeout, None).context("prepare empty public schema in fresh target")?;
+        }
         let restore = self.tool(source, PG_RESTORE)?;
         let mut command = self.isolated_command(&restore, source)?;
         command
@@ -811,5 +839,33 @@ impl PostgresAdapter {
         serde_json::from_slice(&result.stdout).map_err(|_| {
             anyhow::anyhow!("cannot decode existing role names; output withheld to protect data")
         })
+    }
+}
+
+#[cfg(test)]
+mod restore_tests {
+    use super::archive_creates_public_schema;
+
+    #[test]
+    fn only_a_public_schema_creation_entry_permits_empty_namespace_preparation() {
+        let entry = |text: &str| vec![text.to_string()];
+        assert!(archive_creates_public_schema(&entry(
+            "6; 2615 2200 SCHEMA - public pg_database_owner"
+        )));
+        assert!(archive_creates_public_schema(&entry(
+            "6; 2615 2200 SCHEMA - public owner with spaces"
+        )));
+        for line in [
+            "; public schema comment",
+            "6; 0 0 COMMENT - SCHEMA public pg_database_owner",
+            "6; 2615 2200 SCHEMA - application owner",
+            "6; 1259 1234 TABLE public evidence owner",
+            "6; 2615 2200 SCHEMA - public_extra owner",
+            "invalid; 2615 2200 SCHEMA - public owner",
+            "6; x 2200 SCHEMA - public owner",
+            "6; 2615 2200 SCHEMA - public",
+        ] {
+            assert!(!archive_creates_public_schema(&entry(line)), "{line}");
+        }
     }
 }

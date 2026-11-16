@@ -31,6 +31,7 @@ assert pins['rage'] in native
 files = [Path('README.md'), Path('project.md')]
 files += sorted(Path('docs/development').glob('h0[1234]-*.md'))
 files += sorted(Path('docs/operations').glob('*.md'))
+files += [Path('docs/development/v01-validation.md'), Path('docs/security/v01-review.md')]
 links = 0
 for file in files:
     text = file.read_text()

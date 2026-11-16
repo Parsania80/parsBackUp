@@ -1,6 +1,6 @@
 # PostgreSQL Backup Platform — Implementation Roadmap
 
-Latest implementation handoff: §49 (H04 CI and operating references locally accepted, 2026-11-16; exact evidence and unrun hosted-job limitations stated there). H03 is committed as `cb34f5e` (§48); H02 fixture hardening is committed as `3cc9326` (§47). H01 policy is in §41; the last completed full phase remains B06 (§40). The operator authorized H01 definition, this H02 increment and the required status updates. The detailed 2026-10-05 review handoff remains in §34. The 2026-10-03 rewrite was authorized by the operator. It replaces the earlier mixed design/status document with an implementation handoff and adds a dedicated clean-code phase. It changes the work plan; it does not claim that planned behavior is implemented.
+Latest implementation handoff: §51 (V01 production-readiness validation in progress, 2026-11-16). H05 is committed as `046c22e`; H04 as `6a547e9`, H03 as `cb34f5e` and H02 fixture hardening as `3cc9326`. H fixture foundations are locally accepted; production compatibility/content/security validation and V02/V03 remain required. The historical 2026-10-03 rewrite was operator-authorized; historical results are distinct from current verification.
 
 ## 1. Project vision and how to use this document
 
@@ -384,14 +384,14 @@ A new model should be able to resume from status plus contracts without trusting
 | 8 | C1 — clean code and human readability | ✅ Done | Accepted 2026-11-02; module decisions, remaining complexity and final gates are recorded in §34.4. |
 | 9 | A — complete M5a inventory/jobs/recovery | ✅ Done | A01–A08 accepted 2026-11-13, including separate JobLock hardening; evidence in §34.7. |
 | 10 | B — M5b retention/protection/deletion | ✅ Done | B01–B06 accepted; eight PG16/17/18 matrices and destructive/race/crash gates pass (§40). |
-| 11 | H — M6 hardened CLI/systemd/Debian | 🔄 Current | H01 defined; H02 fixture hardening accepted through cancellation/process ownership (§47), with explicit production compatibility gates. H03 committed cb34f5e; H04 committed 6a547e9. H05 readability locally accepted (§50), pending checkpoint review/commit. Next V01 includes the retained production compatibility blockers. |
-| 12 | V — CLI production validation/release | ⬜ Todo | Original M9 CLI track; precedes API/UI. |
+| 11 | H — M6 hardened CLI/systemd/Debian | ✅ Fixture scope | H01–H05 fixture foundations accepted (§41–§50); H05 committed 046c22e. Production compatibility remains a V gate. |
+| 12 | V — CLI production validation/release | 🔄 Current | V01 readiness validation/findings in §51; no production enablement. V02/V03 remain. |
 | 13 | P — M7 API/asynchronous service | ⬜ Todo | Requires hardened core and explicit decisions. |
 | 14 | U — M8 API-backed UI | ⬜ Todo | Requires stable API. |
 | 15 | F — platform validation/release | ⬜ Todo | Original M9 full-platform track. |
 
-### ➡️ Current: #11 - H — H05 verified checkpoint review/commit
-### ⏭️ Next: #12 - V — CLI production validation after H acceptance
+### ➡️ Current: #12 - V — V01 production readiness validation
+### ⏭️ Next: V01 blocker resolution, then V02 measurements and V03 release decision
 
 Task IDs below remain stable even if a phase is split into several commits. Complete dependent tasks in listed order. Independent documentation can proceed alongside its owning task; later feature coding waits for the phase prerequisites.
 
@@ -1511,3 +1511,74 @@ Final H05 handoff audit: **383 local reference targets/fragments**, 51 embedded 
 ### H05 checkpoint review — 2026-11-16
 
 Reviewed all seven files: corrected custody/pipe/scratch/lifetime/dispatch comments agree with their implementations; executable lines are unchanged and scope/evidence/release limits are accurate. No blocking findings. The accepted 313-test fast gate and both-target package lifecycle/recovery evidence match unchanged source inputs and retained checksums. Documentation/reference/syntax, source equality, archive/controlled documents, append-only log and scoped cleanup re-audit passes. Preparing the exact seven-file local checkpoint with staged blob/scope and post-commit parent/tree/clean checks; no push. V01 compatibility/content/security/failure validation follows, preserving the production gate.
+
+## 51. V01 production readiness validation — 2026-11-16
+
+H05 review found no blocking issue and was committed as **046c22e**, exact seven-file blobs/tree, parent 6a547e9 and clean checkout verified. Its accepted 313-test/two-target package evidence remains unchanged. Operator requested V01 next. Recorded [validation contract](docs/development/v01-validation.md) before code. Production remains disabled; validation measures synthetic behavior and reports readiness blockers independently of passing test scenes.
+
+Inspection found the existing selective-public collision: template0 supplies public while a schema-selected archive can recreate it. Native restore now reads matching-client TOC and, only for a real public SCHEMA entry with pre-data selected, removes the empty template namespace with static DROP SCHEMA IF EXISTS public RESTRICT. Existing fresh-target checks, conservative partial effects and native refusal remain. No global clean/CASCADE or archive/plan-byte change. A TOC classification unit regression and actual populated-template sentinel scene protect the boundary.
+
+New all-major versioned signed/encrypted CLI content/privilege drill uses protected configs and actual SCRAM tools, separate non-superuser owner/SELECT/pg_read_all_data/CREATEDB-only restorer roles, full and selected content, independent restored SQL/ownership/ACL/sequence/trigger/type assertions, RLS/missing-grant no-publication, target/public-sentinel refusal, extension/publication/subscription/FDW-secret observations and source-loss reader-only recovery. CI enumerates this additional suite and audits both new declarative documents. Initial fixtures exposed native /dev/null fsync and cluster-wide pg_subscription counting mistakes; corrected probes use --no-sync and filter target subdbid. Initial extra rule setup was moved before ownership transfer; these preliminary attempts are excluded from final acceptance.
+
+**Additional compatibility finding:** table-family resolution expands partition children but frozen ArtifactManifest::resolved_selection_validate requires each resolved table to be literally requested. Full-database partitions restore; the signed selective-family writer refuses expanded children even when native dump and profile resolution succeed. The drill records this exact no-publication failure. V01 does not silently relax artifact v1, falsify requested selection or declare this supported. A reviewed compatibility design is needed to close the gap.
+
+**Security findings:** [V01 security review](docs/security/v01-review.md) records frozen transcript/both-leg/consumption/custody review, limits and dependency provenance. Locked bundled libsqlite3-sys 0.38.2 is covered by RUSTSEC-2026-0459 (crafted DB/WAL memory exposure; patched >=0.39.0). Protected snapshot sidecar/WAL refusal reduces exposure but is not a whole-program exemption. Required SQLite update is not performed silently. Full cargo-audit installation failed on registry access, then its isolated retry timed out/aborted; no full-lock advisory verdict or advisory DB revision exists. Targeted primary-source advisory review is recorded separately, not called a clean scan.
+
+### V01 files changed
+
+Exact intended scope: 12 files; no production dependency, schema or artifact/plan byte change.
+
+| File Path | Change Type | Description |
+|---|---|---|
+| [crates/backup-postgres/src/lib.rs](crates/backup-postgres/src/lib.rs) | Modified | Narrow empty-public preparation, fixture target guard and TOC unit regression. |
+| [tests/v01_content_privileges.sh](tests/v01_content_privileges.sh) | Added executable | Actual all-major versioned content/privilege/failure scenes and independent assertions. |
+| [.github/workflows/native.yml](.github/workflows/native.yml), [ci/inputs.json](ci/inputs.json) | Modified | Enumerate V01 suite using existing pinned images/toolchain/security policy. |
+| [ci/check.py](ci/check.py) | Modified | Audit V01 contract/security reference links and fences; existing syntax audit covers new embedded fixture. |
+| [docs/development/v01-validation.md](docs/development/v01-validation.md) | Added | Pre-code acceptance scope, public fix boundary and open release gates. |
+| [docs/security/v01-review.md](docs/security/v01-review.md) | Added | Implementation/transcript/custody review, applicable SQLite advisory and incomplete scan. |
+| [docs/operations/cli-reference.md](docs/operations/cli-reference.md), [docs/operations/recovery-reference.md](docs/operations/recovery-reference.md) | Modified/appended | Distinguish historical H03 public collision from locally verified V01 correction/evidence. |
+| [README.md](README.md), [project.md](project.md), [session-log.md](session-log.md) | Modified/appended | Review/commit, scope, findings and final validation handoff. |
+
+Verification is in progress. The phase cannot be accepted while required compatibility/security/content gates remain open. New native tests do not activate production or certify arbitrary dependencies, security-label providers, database settings/ACL, tablespaces/global parameter grants, host files/WAL or external services. V02/V03 and T03 remain open. No V01 commit/push/host deployment or controlled operating-flow change.
+
+### V01 verified checkpoint and readiness disposition — 2026-11-16
+
+**Locally verified correction:** selective public/schema-only restore now succeeds on **PG16.15, PG17.11 and PG18.6** with actual same-major clients and versioned signed artifacts. The populated-template control refuses DROP RESTRICT, returns a partial receipt and preserves the sentinel. Full/table archives without a public SCHEMA entry preserve the template namespace; occupied targets remain untouched. No saved-format/schema/dependency change.
+
+Final sequential evidence through the existing CI wrapper:
+
+| Gate | New evidence on final inputs |
+|---|---|
+| fast | **314 workspace tests**, strict locked/offline Clippy, format, actual report envelopes, three workflows semantically linted, TOML/JSON/reference/script syntax. |
+| v01_content_privileges | PG16/17/18: non-superuser owner and SELECT backup, CREATEDB-only different-role portable restore, RLS/missing-grant nonpublication, independent rows/constraints/sequence next values/types/generated values/views/materialized data/function/procedure/trigger/rule/comments/collation/text search/RLS/ownership/ACL/default-ACL/large-object assertions; app/aux/public/schema-only; occupied target/nonempty public refusal; hstore; publication/subscription omission; encrypted FDW credential sentinel; untrusted-extension privilege partial failure; signer/recipient removal and source-loss reader-key recovery. Native partition-family success versus signed manifest refusal remains a reproduced blocker. |
+| m2_docker_smoke | PG16/17/18 DR/portable security restore, globals tamper/refusal, plan expiry/source binding and verification. |
+| m3_docker_smoke | PG16/17/18 legacy profiles, exact resolution/dependencies, section-limited restore and TOC binding; not proof that the signed family gap is fixed. |
+| m4a_key_drill | PG16/17/18 rotation, cross-generation refusal, decryption/signing key loss, offline/total-loss/operator-seed recovery. |
+| m4b_docker_smoke | PG16/17/18 signed v1 levels/forgery/foreign-recipient/source binding and DR without signer; existing visible rage locale warnings remain, assertions pass. No independent cryptographic assurance claim. |
+| h02_native_auth_recovery | PG16/17/18 peer/SCRAM fallback refusal, trusted tools/custody/resource controls, lost-source portable/DR recovery, context/downgrade checks. |
+| h02_cancellation_drill | PG16/17/18 actual TERM/INT, native child reap, actual failed jobs, partial DB effects, owned stage/scratch cleanup and subsequent recovery. |
+| m5b_retention_drill | PG16/17/18 exact-set/protection/last-copy/dependency/use exclusions, competing deleters and both restore/deletion directions, eight crash boundaries per major, started-only recovery/tombstones and report/ledger/plan privacy. |
+| package | Locked/offline Ubuntu release build, repeat-byte package, manager-free lifecycle, identical package on Ubuntu24.04/systemd255/glibc2.39/PG16.15 and Debian13/systemd257/glibc2.41/PG17.12. Both actual managers pass preservation/custody/sandbox/timer/manual/scope/v7-migration/graceful cancellation/three escaped-session hard stops/live upgrade/reader-only source-loss recovery and independent row. |
+
+The **eight native suites / 24 script-major combinations**, fast and package each record and verify **173 unchanged source inputs during execution**. Source/code/harness/contract stayed frozen during these final runs; preliminary diagnostic/fixture/cargo-cache-lock attempts are excluded. Other old suites, host bootstrap, read-only-media snapshot syscall matrix and full original M0 content/privilege obligations are not claimed rerun. Package-manager diversion/staging warnings remain visible; both actual installations and runtime/lifecycle gates pass. Managers share the host kernel in private cgroup namespaces, not independent guests or bare metal.
+
+Final package SHA256 **b44059d3d1d096e7a40a3f0a0922b88f35bafc3c255596c1a3a38b0364097092**, with SHA256SUMS, is retained in ignored target/packages. H05 package/evidence is preserved under target/packages/checkpoint-h05 and target/ci-logs/checkpoint-h05; its checksum remains 0b54ee3e1a6c9942ceea3e402fb6be9df48891b8bacfa4ae3419622e2fee6ab0. Repeat archive bytes do not prove independent Rust build reproducibility. No hosted workflow was pushed/run, deployment performed or production guard relaxed.
+
+| Open readiness gate | Required disposition before acceptance |
+|---|---|
+| Applicable bundled SQLite advisory | Reviewed compatible dependency update beyond affected libsqlite3-sys 0.38.2, with inventory migration/snapshot/recovery regressions; no ignore entry. |
+| Signed partition-family request/resolution mismatch | Contract-compatible design or explicit new-format decision, retaining honest requested scope and old v1 readability; no silent validation relaxation. |
+| Versioned writable offline reads/retention dispatch | Implement and verify missing capability owners before claiming the production CLI promise. |
+| Production plan bytes/context | Define canonical format and execution-context binding before adding a production writer; no fixture-plan reuse to bypass mode. |
+| Full current advisory scan | Run and record actual scanner/advisory DB provenance when registry provisioning works; targeted review is not full coverage. |
+| Remaining content/security scope | Complete or explicitly resolve unvalidated matrix cases: security-label providers, absent extension packages/arbitrary dependency/locale environments, database settings/DB ACL, tablespaces/global parameter grants and required privilege combinations. Current exclusions are not silently treated as passing support. |
+
+**V01 is not accepted as a completed phase.** This is a verified correction/validation checkpoint with explicit findings. V02 benchmarks/rehearsal and V03 license/security/support/release decision remain later; production remains disabled and T03 remains open. Next review/commit this exact 12-file checkpoint, then prioritize the SQLite security update and signed-family compatibility decision. No V01 commit/push was requested/performed.
+
+Evidence is target/ci-logs/{fast,native-v01_content_privileges,native-m2_docker_smoke,native-m3_docker_smoke,native-m4a_key_drill,native-m4b_docker_smoke,native-h02_native_auth_recovery,native-h02_cancellation_drill,native-m5b_retention_drill,package}.log and corresponding input manifests, /tmp/parsbackup-v01-{fast,content,m2_docker_smoke,m3_docker_smoke,m4a_key_drill,m4b_docker_smoke,h02_native_auth_recovery,h02_cancellation_drill,m5b_retention_drill,package}.log and /tmp/parsbackup-v01-audit.py. Scanner provisioning failures are in /tmp/parsbackup-v01-audit-install*.log; no successful scan is implied. Only README/project/log handoff additions and two current reference corrections follow final tests; they receive their own link/syntax audit. Exact scope, protected schemas/dependencies/frozen formats/operating flows/archive, append-only audit, empty index/HEAD046c22e, checksums and scoped cleanup pass before those final handoff edits.
+
+Final V01 handoff audit passes **401 local reference targets/fragments**, fenced TOML/JSON, **52 embedded Python blocks** and standalone/shell/maintainer syntax. All 173-input records match except the five explicitly documented post-test handoff/reference files. Exact 12-file scope, unchanged HEAD046c22e/empty index, immutable schemas/dependencies/formats/controlled documents/archive, append-only log, package/H05 hashes and scoped container/fixture/CLI cleanup pass. No additional runtime or test change follows acceptance.
+
+### V01 checkpoint review — 2026-11-16
+
+Reviewed exact 12-file scope: TOC classification and empty-public RESTRICT preparation under existing fresh-target orchestration; target/partial-effect preservation; synthetic isolated actual-role/content/refusal fixtures; pinned CI enumeration; current reference corrections; declarative contracts/security findings and evidence limits. No blocking checkpoint findings or runtime corrections. Re-audit passes 401 local targets/fragments, 52 embedded Python blocks and standalone/script syntax, format/diff, exact scope, all accepted 173-input records except documented handoff/reference edits, immutable schema/dependencies/formats/controlled documents/archive, append-only log, package/H05 checksums and scoped cleanup. Accepted 314-test/eight all-major suite/two-target package evidence is retained unchanged, not rerun for this review. Preparing local exact-scope checkpoint with staged blob and post-commit parent/tree/clean checks; no push. The requested SQLite advisory update follows separately; V01 full acceptance remains open.

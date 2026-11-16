@@ -32,6 +32,7 @@ jobs:
           - h02_snapshot_drill
           - h02_cancellation_drill
           - h02_key_bootstrap_drill
+          - v01_content_privileges
     env:
       SUITE: ${{ matrix.suite }}
     steps:
