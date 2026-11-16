@@ -15,6 +15,7 @@ mod catalog;
 mod dump;
 mod globals;
 mod native;
+mod process;
 mod tools;
 
 use crate::catalog::{

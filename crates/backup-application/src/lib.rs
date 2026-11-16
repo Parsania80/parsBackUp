@@ -1,3 +1,4 @@
+pub mod control;
 mod inventory;
 mod retention;
 pub use retention::{
@@ -148,6 +149,9 @@ pub struct RestoreJobRequest<'a> {
 /// `interrupted` when a process was killed — is decided below this trait, by the store and the
 /// kernel, because a command that dies cannot be trusted to report it.
 pub trait JobHandle {
+    fn id(&self) -> Option<Uuid> {
+        None
+    }
     fn staged(&self) -> Result<()>;
     fn complete(&self) -> Result<()>;
 }
@@ -609,6 +613,7 @@ impl<E: DatabaseAdapter, S: ArtifactStore> BackupService<E, S> {
     }
 
     pub fn create(&self, config: &Config, profile_name: Option<&str>) -> Result<Created> {
+        control::check()?;
         let timeout = Duration::from_secs(config.timeout_seconds);
         let (info, resolved) = self.resolve(config, profile_name)?;
         let profile = match profile_name {
@@ -620,18 +625,12 @@ impl<E: DatabaseAdapter, S: ArtifactStore> BackupService<E, S> {
             Some(profile) => &profile.exclude_extensions,
             None => &none_extensions,
         };
-        let options = DumpOptions {
-            major: info.source_major,
-            mode: profile.map(|profile| profile.mode).unwrap_or_default(),
-            selection: &resolved,
-            large_objects: profile.map(|profile| profile.large_objects),
-            exclude_extensions,
-        };
         let id = Uuid::new_v4();
         // Claimed before anything is staged, so a second dump of the same scope meets a refusal
         // while the first is still writing rather than after it has produced a stage nobody knew
         // about. The whole-database name is what a run that named no profile actually selected.
         let fingerprint = source_fingerprint(&config.source, info.source_major);
+        control::check()?;
         let job = self.store.begin_job(&JobRequest {
             source_fingerprint: fingerprint.clone(),
             profile_name: profile
@@ -640,157 +639,181 @@ impl<E: DatabaseAdapter, S: ArtifactStore> BackupService<E, S> {
                 .unwrap_or_else(|| WHOLE_DATABASE_PROFILE.to_string()),
             backup_id: id,
         })?;
-        // Recorded before the dump runs, because a signed manifest states when the dump
-        // started as well as when it finished, and the pair is inside the signature.
-        let started_unix_ms = now_unix_ms()?;
-        let stage = self.store.begin(
-            id,
-            &WriteOptions {
-                with_globals: config.export_globals,
-            },
-        )?;
-        let staged = {
-            let mut payload_sink = self.store.payload_sink(&stage)?;
-            self.engine
-                .dump_stream(&config.source, &options, timeout, &mut |stream| {
-                    io::copy(stream, &mut payload_sink)?;
-                    Ok(())
-                })
-                .context("PostgreSQL dump failed; staged artifact was not published")?;
-            payload_sink
-                .finish()
-                .context("payload stream was never finished; staged artifact was not published")?
-        };
-        // The published file is the ciphertext, so its size cannot prove the dump
-        // produced anything: an empty archive still encrypts to an age header.
-        if staged.plaintext_bytes == 0 {
-            bail!("pg_dump produced an empty archive");
-        }
-        let inspected = self.store.plaintext_staged_payload(&stage)?;
-        let toc = self
-            .engine
-            .inspect_archive(&config.source, inspected.path(), timeout)
-            .context("PostgreSQL archive inspection failed; artifact was not published")?;
-        let toc_sha256 = toc_digest(&toc)?;
-        let (size_bytes, sha256) = self.store.measure(&stage)?;
-        let mut globals_sha256 = None;
-        let mut globals_size_bytes = None;
-        if config.export_globals {
-            let mut globals_sink = self.store.globals_sink(&stage)?;
-            self.engine
-                .dump_globals_stream(&config.source, timeout, &mut |stream| {
-                    io::copy(stream, &mut globals_sink)?;
-                    Ok(())
-                })
-                .context("PostgreSQL globals export failed; staged artifact was not published")?;
-            let globals_staged = globals_sink
-                .finish()
-                .context("globals stream was never finished; staged artifact was not published")?;
-            if globals_staged.plaintext_bytes == 0 {
-                bail!("pg_dumpall produced an empty globals file");
-            }
-            let (gsize, gsha) = self.store.measure_globals(&stage)?;
-            globals_size_bytes = Some(gsize);
-            globals_sha256 = Some(gsha);
-        }
-        // Whether the artifact is encrypted is a fact the store reported through its
-        // sink, not a flag the service carries: the format tag follows that report.
-        let encrypted = staged.recipient_suite.is_some();
-        let created_unix_ms = now_unix_ms()?;
-        // Every stream this operation sealed is finished, and what remains is publication. Said
-        // here rather than at each store, because the store's own sink cannot tell a payload that
-        // is done from one whose globals are still running.
-        job.staged()?;
-        // A signed store has one shape to write, and it is not this one: the record a v1
-        // artifact publishes is inside `manifest.age`, sealed and signed, and what the writer
-        // gets back is the discovery header the rename left behind.
-        if self.store.is_signed() {
-            let facts = self.store.signed_key_facts()?;
-            let recipient_suite = staged.recipient_suite.context(
-                "a signed store seals its payload, but this one reported a plaintext archive",
-            )?;
-            let snapshot = match profile {
-                Some(profile) => profile.clone(),
-                None => whole_database_profile(&config.source),
+        let effects = std::cell::Cell::new("preparation_only");
+        let result = (|| {
+            control::check()?;
+            let options = DumpOptions {
+                major: info.source_major,
+                mode: profile.map(|profile| profile.mode).unwrap_or_default(),
+                selection: &resolved,
+                large_objects: profile.map(|profile| profile.large_objects),
+                exclude_extensions,
             };
-            let manifest = ArtifactManifest {
-                format_version: ARTIFACT_FORMAT_VERSION,
-                backup_id: id,
-                engine: ENGINE_POSTGRESQL.to_string(),
-                source_server_major: info.source_major,
-                source_server_version: info.source_version.clone(),
-                dump_client_version: info.dump_client_version.clone(),
+            // Recorded before the dump runs, because a signed manifest states when the dump
+            // started as well as when it finished, and the pair is inside the signature.
+            let started_unix_ms = now_unix_ms()?;
+            let stage = self.store.begin(
+                id,
+                &WriteOptions {
+                    with_globals: config.export_globals,
+                },
+            )?;
+            let staged = {
+                let mut payload_sink = self.store.payload_sink(&stage)?;
+                self.engine
+                    .dump_stream(&config.source, &options, timeout, &mut |stream| {
+                        io::copy(stream, &mut payload_sink)?;
+                        Ok(())
+                    })
+                    .context("PostgreSQL dump failed; staged artifact was not published")?;
+                payload_sink.finish().context(
+                    "payload stream was never finished; staged artifact was not published",
+                )?
+            };
+            // The published file is the ciphertext, so its size cannot prove the dump
+            // produced anything: an empty archive still encrypts to an age header.
+            if staged.plaintext_bytes == 0 {
+                bail!("pg_dump produced an empty archive");
+            }
+            let inspected = self.store.plaintext_staged_payload(&stage)?;
+            let toc = self
+                .engine
+                .inspect_archive(&config.source, inspected.path(), timeout)
+                .context("PostgreSQL archive inspection failed; artifact was not published")?;
+            let toc_sha256 = toc_digest(&toc)?;
+            let (size_bytes, sha256) = self.store.measure(&stage)?;
+            let mut globals_sha256 = None;
+            let mut globals_size_bytes = None;
+            if config.export_globals {
+                let mut globals_sink = self.store.globals_sink(&stage)?;
+                self.engine
+                    .dump_globals_stream(&config.source, timeout, &mut |stream| {
+                        io::copy(stream, &mut globals_sink)?;
+                        Ok(())
+                    })
+                    .context(
+                        "PostgreSQL globals export failed; staged artifact was not published",
+                    )?;
+                let globals_staged = globals_sink.finish().context(
+                    "globals stream was never finished; staged artifact was not published",
+                )?;
+                if globals_staged.plaintext_bytes == 0 {
+                    bail!("pg_dumpall produced an empty globals file");
+                }
+                let (gsize, gsha) = self.store.measure_globals(&stage)?;
+                globals_size_bytes = Some(gsize);
+                globals_sha256 = Some(gsha);
+            }
+            // Whether the artifact is encrypted is a fact the store reported through its
+            // sink, not a flag the service carries: the format tag follows that report.
+            let encrypted = staged.recipient_suite.is_some();
+            let created_unix_ms = now_unix_ms()?;
+            // Every stream this operation sealed is finished, and what remains is publication. Said
+            // here rather than at each store, because the store's own sink cannot tell a payload that
+            // is done from one whose globals are still running.
+            job.staged()?;
+            // A signed store has one shape to write, and it is not this one: the record a v1
+            // artifact publishes is inside `manifest.age`, sealed and signed, and what the writer
+            // gets back is the discovery header the rename left behind.
+            if self.store.is_signed() {
+                let facts = self.store.signed_key_facts()?;
+                let recipient_suite = staged.recipient_suite.context(
+                    "a signed store seals its payload, but this one reported a plaintext archive",
+                )?;
+                let snapshot = match profile {
+                    Some(profile) => profile.clone(),
+                    None => whole_database_profile(&config.source),
+                };
+                let manifest = ArtifactManifest {
+                    format_version: ARTIFACT_FORMAT_VERSION,
+                    backup_id: id,
+                    engine: ENGINE_POSTGRESQL.to_string(),
+                    source_server_major: info.source_major,
+                    source_server_version: info.source_version.clone(),
+                    dump_client_version: info.dump_client_version.clone(),
+                    application_version: env!("CARGO_PKG_VERSION").to_string(),
+                    recipient_id: facts.recipient_id,
+                    signer_id: facts.signer_id,
+                    recipient_suite: recipient_suite.to_string(),
+                    signature_suite: facts.signature_suite.to_string(),
+                    started_at_utc: format_utc(started_unix_ms.try_into()?)?,
+                    completed_at_utc: format_utc(created_unix_ms.try_into()?)?,
+                    source_fingerprint: fingerprint.clone(),
+                    profile_snapshot: snapshot.clone(),
+                    requested_selection: RequestedSelection::from_profile(&snapshot),
+                    resolved_selection: resolved,
+                    archive_format: ARCHIVE_FORMAT.to_string(),
+                    compression: ARCHIVE_COMPRESSION.to_string(),
+                    subscription_policy: SUBSCRIPTION_POLICY_DROPPED.to_string(),
+                    globals_policy: if config.export_globals {
+                        GLOBALS_POLICY_EXPORTED.to_string()
+                    } else {
+                        GLOBALS_POLICY_SKIPPED.to_string()
+                    },
+                    globals_sha256,
+                    globals_ciphertext_bytes: globals_size_bytes,
+                    payload_ciphertext_sha256: sha256,
+                    payload_ciphertext_bytes: size_bytes,
+                    archive_plaintext_bytes: staged.plaintext_bytes,
+                    // The table of contents was listed from the staged archive before anything was
+                    // sealed, which is the only moment a signed manifest can learn it: writing a
+                    // later check into these bytes would change what the signature covers.
+                    archive_toc_sha256: Some(toc_sha256),
+                    verification_level: VERIFICATION_NONE.to_string(),
+                    compatibility_notes: Vec::new(),
+                };
+                control::check()?;
+                effects.set("artifact_may_be_published");
+                let header = self.store.publish_signed(stage, &manifest)?;
+                job.complete()?;
+                return Ok(Created::Signed {
+                    header: Box::new(header),
+                    manifest: Box::new(manifest),
+                });
+            }
+            let manifest = DevelopmentManifest {
+                format: if encrypted {
+                    AGE_FORMAT.to_string()
+                } else {
+                    DEV_FORMAT.to_string()
+                },
+                id,
+                synthetic_only: true,
+                database: config.source.database.clone(),
+                source_major: info.source_major,
+                source_version: info.source_version,
+                dump_client_version: info.dump_client_version,
                 application_version: env!("CARGO_PKG_VERSION").to_string(),
-                recipient_id: facts.recipient_id,
-                signer_id: facts.signer_id,
-                recipient_suite: recipient_suite.to_string(),
-                signature_suite: facts.signature_suite.to_string(),
-                started_at_utc: format_utc(started_unix_ms.try_into()?)?,
-                completed_at_utc: format_utc(created_unix_ms.try_into()?)?,
-                source_fingerprint: fingerprint.clone(),
-                profile_snapshot: snapshot.clone(),
-                requested_selection: RequestedSelection::from_profile(&snapshot),
-                resolved_selection: resolved,
                 archive_format: ARCHIVE_FORMAT.to_string(),
                 compression: ARCHIVE_COMPRESSION.to_string(),
-                subscription_policy: SUBSCRIPTION_POLICY_DROPPED.to_string(),
-                globals_policy: if config.export_globals {
-                    GLOBALS_POLICY_EXPORTED.to_string()
-                } else {
-                    GLOBALS_POLICY_SKIPPED.to_string()
-                },
+                created_unix_ms,
+                size_bytes,
+                sha256,
+                status: BACKUP_STATUS.to_string(),
+                security_globals: config.export_globals,
                 globals_sha256,
-                globals_ciphertext_bytes: globals_size_bytes,
-                payload_ciphertext_sha256: sha256,
-                payload_ciphertext_bytes: size_bytes,
-                archive_plaintext_bytes: staged.plaintext_bytes,
-                // The table of contents was listed from the staged archive before anything was
-                // sealed, which is the only moment a signed manifest can learn it: writing a
-                // later check into these bytes would change what the signature covers.
-                archive_toc_sha256: Some(toc_sha256),
-                verification_level: VERIFICATION_NONE.to_string(),
-                compatibility_notes: Vec::new(),
+                globals_size_bytes,
+                verification_level: None,
+                verified_unix_ms: None,
+                scope: profile.map(|profile| ArtifactScope::from_profile(profile, &resolved)),
+                toc_sha256: Some(toc_sha256),
+                recipient_suite: staged.recipient_suite.map(str::to_string),
+                payload_plaintext_bytes: encrypted.then_some(staged.plaintext_bytes),
             };
-            let header = self.store.publish_signed(stage, &manifest)?;
+            manifest.validate_shape()?;
+            control::check()?;
+            effects.set("artifact_may_be_published");
+            self.store.publish(stage, &manifest)?;
             job.complete()?;
-            return Ok(Created::Signed {
-                header: Box::new(header),
-                manifest: Box::new(manifest),
-            });
-        }
-        let manifest = DevelopmentManifest {
-            format: if encrypted {
-                AGE_FORMAT.to_string()
-            } else {
-                DEV_FORMAT.to_string()
-            },
-            id,
-            synthetic_only: true,
-            database: config.source.database.clone(),
-            source_major: info.source_major,
-            source_version: info.source_version,
-            dump_client_version: info.dump_client_version,
-            application_version: env!("CARGO_PKG_VERSION").to_string(),
-            archive_format: ARCHIVE_FORMAT.to_string(),
-            compression: ARCHIVE_COMPRESSION.to_string(),
-            created_unix_ms,
-            size_bytes,
-            sha256,
-            status: BACKUP_STATUS.to_string(),
-            security_globals: config.export_globals,
-            globals_sha256,
-            globals_size_bytes,
-            verification_level: None,
-            verified_unix_ms: None,
-            scope: profile.map(|profile| ArtifactScope::from_profile(profile, &resolved)),
-            toc_sha256: Some(toc_sha256),
-            recipient_suite: staged.recipient_suite.map(str::to_string),
-            payload_plaintext_bytes: encrypted.then_some(staged.plaintext_bytes),
-        };
-        manifest.validate_shape()?;
-        self.store.publish(stage, &manifest)?;
-        job.complete()?;
-        Ok(Created::Development(Box::new(manifest)))
+            Ok(Created::Development(Box::new(manifest)))
+        })();
+        result.map_err(|error: anyhow::Error| {
+            error.context(control::ExecutionFailure {
+                job_id: job.id(),
+                artifact_id: id,
+                effects: effects.get(),
+            })
+        })
     }
 
     /// Lists the store the way it can be trusted: a signed store is discovered from
@@ -1281,66 +1304,75 @@ impl<E: DatabaseAdapter, S: ArtifactStore> RestoreService<E, S> {
         if info.source_major != plan.source_major {
             bail!("client or server major changed since the plan was created");
         }
+        control::check()?;
         let job = self.store.begin_restore_job(&RestoreJobRequest {
             target_database: &plan.target_database,
             target_port: config.source.port,
             artifact_id: plan.artifact_id,
         })?;
-        let artifact = Opened::open(&self.store, plan.artifact_id)?;
-        let facts = artifact.facts();
-        if facts.database != plan.artifact_database {
-            bail!("artifact database identity does not match the plan");
-        }
-        // Re-bound here as well: a plan is a claim about a file that another process may
-        // have swapped out while it sat in the store.
-        Self::check_source(config, &facts, info.source_major)?;
-        self.check_rollback(&artifact, &plan)?;
-        if self
-            .engine
-            .database_exists(&config.source, &plan.target_database, timeout)?
-        {
-            bail!("target database appeared after planning; refusing to touch it");
-        }
-        // Complete decryption and ciphertext binding before any cluster mutation.
-        let payload = artifact.payload(&self.store)?;
-        // Step 1 of the DR order: security metadata validated (digest binding
-        // happened when the artifact was opened); re-check role conflicts at execution time.
-        if plan.security.roles {
-            let globals = artifact.globals(&self.store)?;
-            let conflicts = self
-                .engine
-                .role_conflicts(&config.source, globals.path(), timeout)?;
-            if !conflicts.is_empty() {
-                bail!(
-                    "DR role restore refused: these roles already exist in the cluster: {}",
-                    conflicts.join(", ")
-                );
+        let artifact_id = plan.artifact_id;
+        let effects = std::cell::Cell::new("preparation_only");
+        let result = (|| {
+            control::check()?;
+            let artifact = Opened::open(&self.store, plan.artifact_id)?;
+            let facts = artifact.facts();
+            if facts.database != plan.artifact_database {
+                bail!("artifact database identity does not match the plan");
             }
-            // Step 2: roles, attributes, and memberships before any object
-            // can be owned by or granted to them.
+            // Re-bound here as well: a plan is a claim about a file that another process may
+            // have swapped out while it sat in the store.
+            Self::check_source(config, &facts, info.source_major)?;
             self.check_rollback(&artifact, &plan)?;
+            if self
+                .engine
+                .database_exists(&config.source, &plan.target_database, timeout)?
+            {
+                bail!("target database appeared after planning; refusing to touch it");
+            }
+            // Complete decryption and ciphertext binding before any cluster mutation.
+            let payload = artifact.payload(&self.store)?;
+            // Step 1 of the DR order: security metadata validated (digest binding
+            // happened when the artifact was opened); re-check role conflicts at execution time.
+            if plan.security.roles {
+                let globals = artifact.globals(&self.store)?;
+                let conflicts =
+                    self.engine
+                        .role_conflicts(&config.source, globals.path(), timeout)?;
+                if !conflicts.is_empty() {
+                    bail!(
+                        "DR role restore refused: these roles already exist in the cluster: {}",
+                        conflicts.join(", ")
+                    );
+                }
+                // Step 2: roles, attributes, and memberships before any object
+                // can be owned by or granted to them.
+                self.check_rollback(&artifact, &plan)?;
+                control::check()?;
+                effects.set("database_may_be_modified");
+                self.engine
+                    .apply_globals(&config.source, globals.path(), timeout)
+                    .context("globals restore failed; cluster roles may be partially applied")?;
+            }
+            // Step 3: fresh target database; existence re-checked here.
+            if self
+                .engine
+                .database_exists(&config.source, &plan.target_database, timeout)?
+            {
+                bail!("target database appeared after planning; refusing to touch it");
+            }
+            if !plan.security.roles {
+                self.check_rollback(&artifact, &plan)?;
+            }
+            control::check()?;
+            effects.set("database_may_be_modified");
             self.engine
-                .apply_globals(&config.source, globals.path(), timeout)
-                .context("globals restore failed; cluster roles may be partially applied")?;
-        }
-        // Step 3: fresh target database; existence re-checked here.
-        if self
-            .engine
-            .database_exists(&config.source, &plan.target_database, timeout)?
-        {
-            bail!("target database appeared after planning; refusing to touch it");
-        }
-        if !plan.security.roles {
-            self.check_rollback(&artifact, &plan)?;
-        }
-        self.engine
             .create_database(&config.source, &plan.target_database, timeout)
             .context("target database creation failed; the target may exist and was left for operator inspection")?;
-        // A table-selected archive restores its relations but never creates
-        // their namespaces; prepare them so the restore targets an otherwise
-        // empty database, matching the schema-selection behavior.
-        if !facts.required_schemas.is_empty() {
-            self.engine
+            // A table-selected archive restores its relations but never creates
+            // their namespaces; prepare them so the restore targets an otherwise
+            // empty database, matching the schema-selection behavior.
+            if !facts.required_schemas.is_empty() {
+                self.engine
                 .create_schemas(
                     &config.source,
                     &plan.target_database,
@@ -1348,68 +1380,74 @@ impl<E: DatabaseAdapter, S: ArtifactStore> RestoreService<E, S> {
                     timeout,
                 )
                 .context("target schema preparation failed; the target may be partially modified and was left for operator inspection")?;
-        }
-        // Steps 4-6: schema/data, then ownership and privileges from the
-        // archive's own ALTER OWNER/GRANT entries (skipped per policy). The view is
-        // held for the length of the restore and its plaintext is removed after.
-        let restored = self.engine.restore_to_database(
-            &config.source,
-            &plan.target_database,
-            payload.path(),
-            plan.security,
-            plan.sections,
-            timeout,
-        );
-        if let Err(error) = restored {
-            bail!(
-                "database restore failed: {error:#}; target {} may be partially modified and was left in place for operator inspection",
-                plan.target_database
+            }
+            // Steps 4-6: schema/data, then ownership and privileges from the
+            // archive's own ALTER OWNER/GRANT entries (skipped per policy). The view is
+            // held for the length of the restore and its plaintext is removed after.
+            let restored = self.engine.restore_to_database(
+                &config.source,
+                &plan.target_database,
+                payload.path(),
+                plan.security,
+                plan.sections,
+                timeout,
             );
-        }
-        let recorded = facts
-            .verification_level
-            .clone()
-            .unwrap_or_else(|| VERIFICATION_NONE.to_string());
-        if self.store.is_signed() {
-            // Replaying the archive into a live database is exactly what restore-tested means,
-            // but the fact cannot be added to a signed manifest: that would need the signing
-            // key, which a disaster-recovery host does not hold, and re-signing an artifact
-            // this host produced nothing about would attribute it to one that did.
+            if let Err(error) = restored {
+                return Err(error).with_context(|| format!(
+                "database restore failed; target {} may be partially modified and was left in place for operator inspection", plan.target_database));
+            }
+            let recorded = facts
+                .verification_level
+                .clone()
+                .unwrap_or_else(|| VERIFICATION_NONE.to_string());
+            if self.store.is_signed() {
+                // Replaying the archive into a live database is exactly what restore-tested means,
+                // but the fact cannot be added to a signed manifest: that would need the signing
+                // key, which a disaster-recovery host does not hold, and re-signing an artifact
+                // this host produced nothing about would attribute it to one that did.
+                job.complete()
+                    .context("restore succeeded but recording job completion failed")?;
+                return Ok(RestoreOutcome {
+                    plan,
+                    verification_level: recorded,
+                    recorded_in_artifact: false,
+                });
+            }
+            if !plan.sections.is_full() {
+                // A section-limited restore proves nothing about the rest of the
+                // archive, so the artifact keeps its recorded verification level.
+                job.complete()
+                    .context("restore succeeded but recording job completion failed")?;
+                return Ok(RestoreOutcome {
+                    plan,
+                    verification_level: recorded,
+                    recorded_in_artifact: false,
+                });
+            }
+            // Record restore-tested verification on the artifact (additive field
+            // update; payload and digests are unchanged).
+            let unsigned = artifact.development()?;
+            let mut updated = unsigned.manifest().clone();
+            updated.verification_level = Some(VERIFY_RESTORE_TESTED.to_string());
+            updated.verified_unix_ms = Some(now_unix_ms()?);
+            updated.validate_shape()?;
+            self.store
+                .rewrite_manifest(unsigned, &updated)
+                .context("restore succeeded but verification marking failed")?;
             job.complete()
                 .context("restore succeeded but recording job completion failed")?;
-            return Ok(RestoreOutcome {
+            Ok(RestoreOutcome {
                 plan,
-                verification_level: recorded,
-                recorded_in_artifact: false,
-            });
-        }
-        if !plan.sections.is_full() {
-            // A section-limited restore proves nothing about the rest of the
-            // archive, so the artifact keeps its recorded verification level.
-            job.complete()
-                .context("restore succeeded but recording job completion failed")?;
-            return Ok(RestoreOutcome {
-                plan,
-                verification_level: recorded,
-                recorded_in_artifact: false,
-            });
-        }
-        // Record restore-tested verification on the artifact (additive field
-        // update; payload and digests are unchanged).
-        let unsigned = artifact.development()?;
-        let mut updated = unsigned.manifest().clone();
-        updated.verification_level = Some(VERIFY_RESTORE_TESTED.to_string());
-        updated.verified_unix_ms = Some(now_unix_ms()?);
-        updated.validate_shape()?;
-        self.store
-            .rewrite_manifest(unsigned, &updated)
-            .context("restore succeeded but verification marking failed")?;
-        job.complete()
-            .context("restore succeeded but recording job completion failed")?;
-        Ok(RestoreOutcome {
-            plan,
-            verification_level: VERIFY_RESTORE_TESTED.to_string(),
-            recorded_in_artifact: true,
+                verification_level: VERIFY_RESTORE_TESTED.to_string(),
+                recorded_in_artifact: true,
+            })
+        })();
+        result.map_err(|error: anyhow::Error| {
+            error.context(control::ExecutionFailure {
+                job_id: job.id(),
+                artifact_id,
+                effects: effects.get(),
+            })
         })
     }
 }

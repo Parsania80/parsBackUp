@@ -1313,3 +1313,120 @@ fn versioned_reports_wrap_existing_signed_read_results_without_changing_their_da
         assert!(envelope["error"].is_null());
     }
 }
+
+#[test]
+fn sigint_and_sigterm_stop_native_groups_before_releasing_job_claims() {
+    for signal in [libc::SIGINT, libc::SIGTERM] {
+        let scene = Scene::new("handled-cancel", false, true);
+        let mut child = Command::new(env!("CARGO_BIN_EXE_backupctl"))
+            .arg("--config")
+            .arg(&scene.config)
+            .args([
+                "--output",
+                "json-v1",
+                "backup",
+                "create",
+                "--confirm-synthetic",
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        wait_for(&scene.marker("dump-started"), "signal test dump barrier");
+        let start = Instant::now();
+        // SAFETY: the test owns this live child, synchronized at a post-handler barrier.
+        assert_eq!(unsafe { libc::kill(child.id() as i32, signal) }, 0);
+        while child.try_wait().unwrap().is_none() {
+            assert!(
+                start.elapsed() < Duration::from_secs(5),
+                "cancel did not stop the child"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let output = child.wait_with_output().unwrap();
+        assert_eq!(output.status.code(), Some(1));
+        assert!(output.stderr.is_empty(), "{}", text(&output));
+        let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(result["error"]["code"], "OPERATION_CANCELLED");
+        assert_eq!(result["status"], "error");
+        assert_eq!(result["data"]["effects"], "preparation_only");
+        let job_id = Uuid::parse_str(result["data"]["job_id"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            job_rows(&scene)
+                .iter()
+                .find(|r| r.job_id == job_id)
+                .unwrap()
+                .state,
+            JobState::Failed
+        );
+        assert_eq!(fs::read_dir(scene.staging()).unwrap().count(), 0);
+        assert_eq!(fs::read_dir(scene.artifacts()).unwrap().count(), 0);
+        assert!(
+            backup_inventory::ActivityLock::hold_maintenance(&scene.root)
+                .unwrap()
+                .is_some()
+        );
+        // A next invocation can take exactly the same scope without a stale child claim.
+        fs::remove_file(scene.marker("pause-dump")).unwrap();
+        assert!(
+            scene
+                .run(&["backup", "create", "--confirm-synthetic"])
+                .status
+                .success()
+        );
+    }
+}
+
+#[test]
+fn publication_receipt_survives_failed_job_recording_without_claiming_completion() {
+    let scene = Scene::new("published-job-write-failed", false, true);
+    let mut child = Command::new(env!("CARGO_BIN_EXE_backupctl"))
+        .arg("--config")
+        .arg(&scene.config)
+        .args([
+            "--output",
+            "json-v1",
+            "backup",
+            "create",
+            "--confirm-synthetic",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_for(&scene.marker("dump-started"), "publication failure barrier");
+    let conn = rusqlite::Connection::open(scene.root.join("inventory.db")).unwrap();
+    conn.execute_batch("CREATE TRIGGER refuse_terminal BEFORE UPDATE ON job WHEN NEW.state IN ('complete','failed') BEGIN SELECT RAISE(ABORT,'injected'); END;").unwrap();
+    drop(conn);
+    scene.release();
+    let start = Instant::now();
+    while child.try_wait().unwrap().is_none() {
+        assert!(start.elapsed() < Duration::from_secs(5));
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stderr.is_empty());
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["status"], "partial");
+    assert_eq!(value["data"]["effects"], "artifact_may_be_published");
+    let id = Uuid::parse_str(value["data"]["artifact_id"].as_str().unwrap()).unwrap();
+    assert!(
+        scene
+            .artifacts()
+            .join(id.to_string())
+            .join("complete")
+            .is_file()
+    );
+    let job_id = Uuid::parse_str(value["data"]["job_id"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        job_rows(&scene)
+            .iter()
+            .find(|r| r.job_id == job_id)
+            .unwrap()
+            .state,
+        JobState::Staged
+    );
+    assert!(value["data"].get("job_state").is_none());
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("injected"));
+}

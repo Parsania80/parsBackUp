@@ -143,7 +143,7 @@ impl LocalStore {
         };
         let bound = resource_bound.map_or(bound, |n| bound.min(n.saturating_add(1)));
         let mut reader = DigestReader {
-            inner: ciphertext.take(bound),
+            inner: backup_application::control::Reader(ciphertext.take(bound)),
             digest: Sha256::new(),
             bytes: 0,
         };

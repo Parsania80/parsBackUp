@@ -154,6 +154,9 @@ struct LocalRestoreJob {
 }
 
 impl JobHandle for LocalRestoreJob {
+    fn id(&self) -> Option<Uuid> {
+        Some(self.guard.id())
+    }
     fn staged(&self) -> Result<()> {
         bail!("restore jobs do not stage artifacts")
     }
@@ -163,6 +166,9 @@ impl JobHandle for LocalRestoreJob {
 }
 
 impl JobHandle for LocalJob {
+    fn id(&self) -> Option<Uuid> {
+        Some(self.guard.id())
+    }
     fn staged(&self) -> Result<()> {
         self.guard.staged()
     }
@@ -273,7 +279,7 @@ impl LocalStore {
             "FILESYSTEM_UNSAFE"
         );
         anyhow::ensure!(meta.len() <= cap, "RESOURCE_LIMIT");
-        let mut reader = file.take(cap + 1);
+        let mut reader = backup_application::control::Reader(file.take(cap + 1));
         let mut hash = Sha256::new();
         let mut count = 0_u64;
         let mut buf = [0; 64 * 1024];
@@ -1209,7 +1215,7 @@ fn ensure_regular_file(path: &Path) -> Result<()> {
 }
 
 fn hash_file(path: &Path) -> Result<(u64, String)> {
-    let mut file = open_regular(path)?;
+    let mut file = backup_application::control::Reader(open_regular(path)?);
     let mut hasher = Sha256::new();
     let mut bytes = 0_u64;
     let mut buffer = [0_u8; 64 * 1024];
@@ -1230,7 +1236,9 @@ fn hash_file(path: &Path) -> Result<(u64, String)> {
 /// size an attacker controls is not a bound: the reader has to stop on its own terms.
 fn read_bounded(path: &Path, limit: u64) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
-    open_regular(path)?.take(limit).read_to_end(&mut bytes)?;
+    backup_application::control::Reader(open_regular(path)?)
+        .take(limit)
+        .read_to_end(&mut bytes)?;
     if bytes.len() as u64 > limit {
         bail!(
             "{} is larger than the {limit} byte bound this reader applies",

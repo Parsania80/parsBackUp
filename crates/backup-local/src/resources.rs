@@ -91,6 +91,7 @@ impl ResourceWriter {
             match failure.load(Ordering::SeqCst) {
                 1 => error.context("RESOURCE_LIMIT"),
                 2 => error.context("DISK_RESERVE_LOW"),
+                3 => error.context("OPERATION_CANCELLED"),
                 _ => error,
             }
         })
@@ -109,6 +110,10 @@ impl ResourceWriter {
 }
 impl Write for ResourceWriter {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if backup_application::control::is_cancelled() {
+            self.failure.store(3, Ordering::SeqCst);
+            return Err(io::Error::other("OPERATION_CANCELLED"));
+        }
         if buf.is_empty() {
             return Ok(0);
         }

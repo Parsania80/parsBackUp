@@ -49,7 +49,28 @@ impl Reporter {
     pub(crate) fn partial(&mut self) {
         self.partial = true;
     }
-    pub(crate) fn finish(self, result: Result<()>) -> ExitCode {
+    pub(crate) fn finish(mut self, result: Result<()>) -> ExitCode {
+        if let Some(receipt) = result
+            .as_ref()
+            .err()
+            .and_then(|e| e.downcast_ref::<backup_application::control::ExecutionFailure>())
+        {
+            if matches!(self.output, Output::JsonV1) {
+                self.data = Some(
+                    json!({"job_id":receipt.job_id,"artifact_id":receipt.artifact_id,"effects":receipt.effects}),
+                );
+                self.partial = receipt.effects != "preparation_only";
+            } else {
+                eprintln!(
+                    "inspect job={} artifact={} effects={}",
+                    receipt
+                        .job_id
+                        .map_or_else(|| "unknown".into(), |id| id.to_string()),
+                    receipt.artifact_id,
+                    receipt.effects
+                );
+            }
+        }
         let failure = result
             .as_ref()
             .err()
@@ -80,6 +101,8 @@ fn safe_failure(error: &anyhow::Error, operation: &str) -> (&'static str, &'stat
         return (refusal.0, message(refusal.0));
     }
     const CODES: &[&str] = &[
+        "OPERATION_CANCELLED",
+        "SIGNAL_SETUP_FAILED",
         "CONFIG_INVALID",
         "FILESYSTEM_UNSAFE",
         "SNAPSHOT_UNSAFE",
@@ -152,6 +175,12 @@ fn safe_failure(error: &anyhow::Error, operation: &str) -> (&'static str, &'stat
 }
 fn message(code: &str) -> &'static str {
     match code {
+        "OPERATION_CANCELLED" => {
+            "Cancellation requested; inspect the job and any reported effects before retrying."
+        }
+        "SIGNAL_SETUP_FAILED" => {
+            "Cancellation handlers could not be installed; no operation was started."
+        }
         "NATIVE_CONTEXT_MISMATCH" => {
             "The restore plan connection context changed; create a new plan."
         }

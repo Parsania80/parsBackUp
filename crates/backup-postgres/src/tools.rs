@@ -10,10 +10,12 @@ use std::fs;
 use std::io::{Read, Write};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus, Stdio};
-use std::sync::mpsc;
+use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(test)]
+use std::time::Instant;
 
 /// Capture remains bounded; overflow is drained and refused rather than parsed as complete.
 const MAX_CAPTURE: usize = 64 * 1024;
@@ -118,54 +120,38 @@ pub(crate) fn run(
     timeout: Duration,
     stdin_data: Option<Vec<u8>>,
 ) -> Result<ProcessResult> {
-    command.process_group(0);
-    let mut child = match stdin_data {
-        Some(script) => {
-            command
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped());
-            let mut child = command.spawn().context("spawn PostgreSQL client tool")?;
-            let mut stdin = child.stdin.take().context("capture stdin")?;
-            thread::spawn(move || {
-                let _ = stdin.write_all(&script);
-                let _ = stdin.flush();
-            });
-            child
-        }
-        None => {
-            command
-                .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped());
-            command.spawn().context("spawn PostgreSQL client tool")?
-        }
-    };
-    let stdout = child.stdout.take().context("capture stdout")?;
-    let stderr = child.stderr.take().context("capture stderr")?;
+    backup_application::control::check()?;
+    command
+        .process_group(0)
+        .stdin(if stdin_data.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut group =
+        crate::process::Group::new(command.spawn().context("spawn PostgreSQL client tool")?);
+    let stdin_writer = stdin_data.map(|script| {
+        let mut stdin = group.child.stdin.take().expect("piped stdin");
+        thread::spawn(move || {
+            let _ = stdin.write_all(&script);
+            let _ = stdin.flush();
+        })
+    });
+    let stdout = group.child.stdout.take().context("capture stdout")?;
+    let stderr = group.child.stderr.take().context("capture stderr")?;
     let out_reader = thread::spawn(move || read_bounded(stdout));
     let err_reader = thread::spawn(move || read_bounded(stderr));
-    let started = Instant::now();
-    let status: ExitStatus = loop {
-        if let Some(status) = child.try_wait()? {
-            kill_group(child.id());
-            break status;
-        }
-        if started.elapsed() >= timeout {
-            kill_group(child.id());
-            let _ = child.wait();
-            let _ = out_reader.join();
-            let _ = err_reader.join();
-            bail!("PostgreSQL client tool timed out");
-        }
-        thread::sleep(Duration::from_millis(50));
-    };
-    let stdout = out_reader
-        .join()
-        .map_err(|_| anyhow::anyhow!("stdout reader failed"))??;
-    let stderr = err_reader
-        .join()
-        .map_err(|_| anyhow::anyhow!("stderr reader failed"))??;
+    let status = group.wait(timeout, &AtomicBool::new(false));
+    if let Some(writer) = stdin_writer {
+        let _ = writer.join();
+    }
+    let stdout = out_reader.join();
+    let stderr = err_reader.join();
+    let status = status?;
+    let stdout = stdout.map_err(|_| anyhow::anyhow!("stdout reader failed"))??;
+    let stderr = stderr.map_err(|_| anyhow::anyhow!("stderr reader failed"))??;
     if !status.success() {
         bail!(
             "PostgreSQL client tool failed with status {status}; output withheld to protect data"
@@ -195,79 +181,59 @@ fn read_bounded(mut reader: impl Read) -> Result<Vec<u8>> {
     Ok(captured)
 }
 
-fn kill_group(pid: u32) {
-    // Each tool starts its own group; descendants must release inherited pipes too.
-    unsafe {
-        libc::kill(-(pid as i32), libc::SIGKILL);
+struct StopOnDrop<'a> {
+    stop: &'a AtomicBool,
+    armed: bool,
+}
+impl Drop for StopOnDrop<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.stop.store(true, Ordering::Relaxed);
+        }
     }
 }
 
-/// Runs a tool whose standard output *is* the artifact, streaming it into `consume`.
-///
-/// Unlike [`run`], nothing is buffered: the bytes go straight to a caller-owned sink, so
-/// a dump of any size costs one pipe buffer of memory. The child handle moves to a
-/// watchdog thread because a blocked pipe read cannot be interrupted from the consuming
-/// thread, and only a second thread can kill a tool that has stopped producing output.
-/// Closing the read end once `consume` returns makes a tool that is still writing fail on
-/// its next write instead of waiting out the deadline.
+/// Streams native stdout into the caller's sink. A scoped watchdog observes the
+/// owned process group while the consuming thread can be blocked reading its pipe.
+/// Consumer error/panic requests immediate group cleanup before either thread joins.
 pub(crate) fn run_streaming(
     mut command: Command,
     name: &'static str,
     timeout: Duration,
     consume: &mut dyn FnMut(&mut dyn Read) -> Result<()>,
 ) -> Result<()> {
-    let mut child = command
+    backup_application::control::check()?;
+    let child = command
         .process_group(0)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .with_context(|| format!("spawn {name}"))?;
-    let mut stdout = child.stdout.take().context("capture stdout")?;
-    let stderr = child.stderr.take().context("capture stderr")?;
-    let err_reader = thread::spawn(move || read_bounded(stderr));
-    let (sender, receiver) = mpsc::channel();
-    thread::spawn(move || {
-        let deadline = Instant::now() + timeout;
-        loop {
-            match child.try_wait() {
-                Ok(Some(status)) => {
-                    kill_group(child.id());
-                    let _ = sender.send(Ok(status));
-                    return;
-                }
-                Ok(None) => {
-                    if Instant::now() >= deadline {
-                        kill_group(child.id());
-                        let _ = child.wait();
-                        let _ = sender.send(Err(anyhow::anyhow!(
-                            "{name} timed out; output was not used"
-                        )));
-                        return;
-                    }
-                    thread::sleep(Duration::from_millis(50));
-                }
-                Err(error) => {
-                    kill_group(child.id());
-                    let _ = child.wait();
-                    let _ = sender.send(Err(error).context("wait for PostgreSQL client tool"));
-                    return;
-                }
-            }
-        }
+    let mut group = crate::process::Group::new(child);
+    let stdout = group.child.stdout.take().context("capture stdout")?;
+    let mut stdout = backup_application::control::Reader(stdout);
+    let stderr = group.child.stderr.take().context("capture stderr")?;
+    let stop = AtomicBool::new(false);
+    let (streamed, status, stderr) = thread::scope(|scope| {
+        let err_reader = scope.spawn(move || read_bounded(stderr));
+        let watcher = scope.spawn(|| group.wait(timeout, &stop));
+        let mut cleanup = StopOnDrop {
+            stop: &stop,
+            armed: true,
+        };
+        let streamed = consume(&mut stdout);
+        drop(stdout);
+        cleanup.armed = streamed.is_err();
+        drop(cleanup);
+        let status = watcher.join();
+        let stderr = err_reader.join();
+        (streamed, status, stderr)
     });
-    let streamed = consume(&mut stdout);
-    drop(stdout);
-    let status = receiver
-        .recv()
-        .map_err(|_| anyhow::anyhow!("{name} did not report an exit status"))?;
-    let stderr = err_reader
-        .join()
-        .map_err(|_| anyhow::anyhow!("stderr reader failed"))??;
-    // The sink failing is the operator's problem; the tool exiting on a closed pipe is
-    // its consequence, so the first error is the one worth reporting.
+    backup_application::control::check()?;
     streamed?;
-    let status = status?;
+    let status = status.map_err(|_| anyhow::anyhow!("client watcher failed"))??;
+    let stderr = stderr.map_err(|_| anyhow::anyhow!("stderr reader failed"))??;
     if !status.success() {
         bail!("{name} failed with status {status}; output withheld to protect data");
     }
@@ -398,5 +364,50 @@ mod tests {
             error.contains("emitted a warning; artifact was not published"),
             "{error}"
         );
+    }
+    #[test]
+    fn refusing_consumer_stops_a_stalled_producer_promptly_and_panic_unwinds() {
+        let start = Instant::now();
+        let error = run_streaming(
+            shell("echo x; sleep 20"),
+            "sh",
+            Duration::from_secs(30),
+            &mut |r| {
+                let mut byte = [0];
+                r.read_exact(&mut byte)?;
+                bail!("sink failed");
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), "sink failed");
+        assert!(start.elapsed() < Duration::from_secs(2));
+        let start = Instant::now();
+        let panic = std::panic::catch_unwind(|| {
+            let _ = run_streaming(
+                shell("echo x; sleep 20"),
+                "sh",
+                Duration::from_secs(30),
+                &mut |r| {
+                    let mut byte = [0];
+                    r.read_exact(&mut byte)?;
+                    panic!("consumer panicked");
+                },
+            );
+        });
+        assert!(panic.is_err());
+        assert!(start.elapsed() < Duration::from_secs(2));
+    }
+    #[test]
+    fn deadline_joins_a_blocked_stdin_writer() {
+        let start = Instant::now();
+        let error = run(
+            shell("exec sleep 20"),
+            Duration::from_millis(100),
+            Some(vec![b'x'; 1024 * 1024]),
+        )
+        .err()
+        .unwrap();
+        assert!(error.to_string().contains("timed out"));
+        assert!(start.elapsed() < Duration::from_secs(2));
     }
 }

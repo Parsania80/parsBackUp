@@ -87,7 +87,7 @@ fn component(dir: &File, name: &str) -> std::result::Result<File, Problem> {
 }
 
 fn bytes(dir: &File, name: &str, max: u64) -> std::result::Result<Vec<u8>, Problem> {
-    let file = component(dir, name)?;
+    let file = backup_application::control::Reader(component(dir, name)?);
     let mut out = Vec::new();
     file.take(max + 1).read_to_end(&mut out)?;
     if out.len() as u64 > max {
@@ -110,8 +110,8 @@ fn digest(
     expected_size: u64,
     expected_digest: &str,
 ) -> std::result::Result<bool, Problem> {
-    let file = component(dir, name)?;
-    if file.metadata()?.len() != expected_size {
+    let file = backup_application::control::Reader(component(dir, name)?);
+    if file.0.metadata()?.len() != expected_size {
         return Ok(false);
     }
     let mut reader = file.take(expected_size.saturating_add(1));

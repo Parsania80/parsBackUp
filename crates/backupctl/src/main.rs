@@ -11,6 +11,7 @@ mod keys;
 mod native;
 mod output;
 mod report;
+mod signals;
 mod snapshot;
 
 use crate::cli::{
@@ -35,7 +36,10 @@ use std::process::ExitCode;
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let mut report = Reporter::new(cli.output, cli.command.operation());
-    let result = run(cli, &mut report);
+    let result = signals::install().and_then(|()| {
+        backup_application::control::check()?;
+        run(cli, &mut report)
+    });
     report.finish(result)
 }
 

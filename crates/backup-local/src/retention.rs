@@ -633,9 +633,11 @@ impl backup_application::DeletionExecutor for LocalRetention {
         let estate = backup_inventory::Estate::new(saved.plan.source_fingerprint.clone())?;
         let inventory = Inventory::open_existing_current(&path, &estate)
             .context("RETENTION_INVENTORY_INVALID")?;
+        backup_application::control::check()?;
         let job_id = inventory.begin_deletion(&saved)?;
         let execution = (|| -> Result<()> {
             for candidate in &saved.plan.candidates {
+                backup_application::control::check()?;
                 inventory.mark_deleting(job_id, candidate.backup_id)?;
                 remove_candidate(root, candidate, false)?;
                 inventory.mark_deleted(job_id, candidate.backup_id)?;

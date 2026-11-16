@@ -591,6 +591,9 @@ pub struct RestoreGuard {
 }
 
 impl RestoreGuard {
+    pub fn id(&self) -> Uuid {
+        self.job_id
+    }
     pub fn begin(root: &Path, target: &str, artifact: Uuid) -> Result<Self> {
         let activity = crate::ActivityLock::hold(root)?;
         let target_lock =
