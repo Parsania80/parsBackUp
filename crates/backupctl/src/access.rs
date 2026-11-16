@@ -1,5 +1,6 @@
 //! Exhaustive command classification keeps authorization separate from availability.
-//! A permitted capability is still refused until its native/custody/snapshot owner lands.
+//! Versioned writable offline backup reads and retention dispatch remain unavailable.
+//! Authorized native, custody and snapshot commands dispatch to their explicit owners.
 use crate::cli::*;
 use crate::output::{Reporter, refuse};
 use anyhow::Result;

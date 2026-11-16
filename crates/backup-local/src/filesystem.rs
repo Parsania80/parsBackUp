@@ -1,4 +1,5 @@
-//! Pin writable versioned roots without changing the physical store lock domain.
+//! Pin versioned store and external scratch roots with protected directory descriptors.
+//! Writable stores retain their physical lock domain; snapshot opening creates no layout.
 use anyhow::{Context, Result, ensure};
 use backup_domain::ConfigV1;
 use std::ffi::CString;

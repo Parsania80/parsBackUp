@@ -1,10 +1,10 @@
 //! The storage root itself: how it is opened, what shape the store has, where its files live,
 //! and how work a dead process left behind is cleared.
 //!
-//! These constructors are the only place in the crate that turns configuration into a store: a
-//! root plus the keys named beside it, checked together before the root is touched. Everything
-//! else here assumes that decision was already made, which is why publishing, reading and
-//! recovering never inspect a key file.
+//! These are the legacy constructors. Versioned writable opening uses custody.rs and
+//! filesystem.rs; snapshot.rs builds the read-only facade with external scratch. Each
+//! keyed opening validates its required keys before use; publication, reading and recovery
+//! consume the resulting handles without reopening key paths.
 //!
 //! [`LocalStore::recover`] removes abandoned working directories only under the store's exclusive
 //! maintenance claim; live stage and scratch owners remove their own directories on drop — ADR 0004.

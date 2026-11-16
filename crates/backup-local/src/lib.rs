@@ -1,11 +1,12 @@
-//! The local filesystem store, and the one place in this workspace that touches key
-//! material. It decides whether a staged payload is written as plaintext or as an age
-//! stream, so the application layer can stay crypto-free and the dump tool never learns
-//! a filename: `pg_dump` writes to a pipe, and this crate owns both ends of it.
+//! Local artifact storage, key custody and temporary plaintext ownership.
+//! This crate selects plaintext or encrypted sinks and uses backup-crypto for key parsing,
+//! encryption and signatures. The PostgreSQL adapter owns the dump process and pipe;
+//! the application copies its stream into the sink supplied here.
 //!
-//! Plaintext therefore exists in exactly two places — a staging directory that becomes
-//! the artifact, and a mode-0700 `scratch/` view that exists only while a decrypt is
-//! being read. Neither is ever the published artifact tree.
+//! Legacy development stores may publish plaintext artifacts. Encrypted stores stage
+//! ciphertext and decrypt into owned private scratch views. Writable stores use scratch/
+//! inside the store; read-only snapshots require protected external scratch. Views remove
+//! temporary plaintext on ordinary drop; a hard crash can leave it for explicit recovery.
 
 mod layout;
 
@@ -71,12 +72,10 @@ use uuid::Uuid;
 
 /// The key material a store holds.
 ///
-/// `identity` is set exactly when artifacts are encrypted. The other three are separate
-/// because custody differs by host rather than by command: a backup writer holds
-/// `recipient` plus `signing`, while a disaster-recovery host holds `identity` plus
-/// `verifying` and must be *unable* to do anything else. An artifact is written as signed v1
-/// precisely when this store holds a signing key, so the shape of the store follows from the
-/// keys it was configured with rather than from a flag on the call.
+/// A keyed store always holds a decryption identity. Versioned writers load all four
+/// roles; recovery readers load only identity and verifier. Signature-only snapshot
+/// verification keeps its verifier separately in snapshot state and needs no StoreKeys.
+/// A signing key selects signed v1 publication; legacy encrypted stores can omit it.
 pub struct StoreKeys {
     identity: KeyFile,
     recipient: Option<KeyFile>,
@@ -88,13 +87,8 @@ pub struct StoreKeys {
     verifying: Option<SigningKeyFile>,
 }
 
-/// A v1 artifact whose signature has been checked.
-///
-/// Reaching one of these means both ciphertext digests were recomputed from the files on
-/// disk, the signature over them verified against the configured verifying key, and only
-/// then was `manifest.age` decrypted and compared field by field with `public.json`. So a
-/// value read off [`SignedArtifactHandle::manifest`] is a claim about bytes written by whoever
-/// holds the signing key, not about bytes an attacker chose.
+/// Keeps a reader's claims and root descriptors alive through artifact/plaintext use.
+/// Writable operations hold activity/resource locks; snapshots pin state without store locks.
 pub struct ArtifactUse {
     _snapshot: Option<std::sync::Arc<snapshot::SnapshotState>>,
     _resource: Option<backup_inventory::ResourceLock>,
@@ -102,6 +96,9 @@ pub struct ArtifactUse {
     _fs_guard: Option<std::sync::Arc<filesystem::ProtectedRoot>>,
 }
 
+/// An authenticated v1 artifact: ciphertext digests and signature were checked before
+/// decrypting manifest.age and comparing it with public.json. Manifest fields therefore
+/// describe bytes authenticated by the configured signer.
 pub struct SignedArtifact {
     _use: Option<std::sync::Arc<ArtifactUse>>,
     header: PublicHeader,
