@@ -11,7 +11,6 @@ use std::fmt;
 use age::{DecryptError, Identity, Recipient};
 use age_core::{
     format::{FILE_KEY_BYTES, FileKey, Stanza, is_arbitrary_string},
-    primitives::{hpke_open, hpke_seal},
     secrecy::{ExposeSecret, zeroize::Zeroize},
 };
 use anyhow::{Result, bail};
@@ -72,10 +71,18 @@ impl Recipient for HybridRecipient {
         &self,
         file_key: &FileKey,
     ) -> Result<(Vec<Stanza>, HashSet<String>), age::EncryptError> {
-        // age-core's helper is HPKE base mode with ChaCha20-Poly1305 + HKDF-SHA256 and
-        // empty AAD, which is the only mode this KEM implements.
+        // Preserve age-core 0.12's helper parameters exactly, using the same HPKE
+        // implementation without enabling its unused built-in KEMs.
         let (encapped, ciphertext) =
-            hpke_seal::<Kem, _>(&self.0, HPKE_INFO, file_key.expose_secret(), &mut OsRng);
+            hpke::single_shot_seal::<hpke::aead::ChaCha20Poly1305, hpke::kdf::HkdfSha256, Kem, _>(
+                &hpke::OpModeS::Base,
+                &self.0,
+                HPKE_INFO,
+                file_key.expose_secret(),
+                &[],
+                &mut OsRng,
+            )
+            .expect("no errors should occur with these HPKE parameters");
 
         let stanza = Stanza {
             tag: STANZA_TAG.to_owned(),
@@ -178,7 +185,18 @@ impl Identity for HybridIdentity {
             return Some(Err(DecryptError::InvalidHeader));
         };
 
-        let mut plaintext = match hpke_open::<Kem>(&encapped, &self.key, HPKE_INFO, &stanza.body) {
+        let mut plaintext = match hpke::single_shot_open::<
+            hpke::aead::ChaCha20Poly1305,
+            hpke::kdf::HkdfSha256,
+            Kem,
+        >(
+            &hpke::OpModeR::Base,
+            &self.key,
+            &encapped,
+            HPKE_INFO,
+            &stanza.body,
+            &[],
+        ) {
             Ok(plaintext) => plaintext,
             // Wrong key, tampered stanza, or a forged ML-KEM ciphertext whose
             // implicit-rejection secret does not open the AEAD.

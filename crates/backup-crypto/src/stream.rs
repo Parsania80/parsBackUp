@@ -187,6 +187,27 @@ mod tests {
         format!("{error:#}")
     }
 
+    /// Captured before the dependency change with age 0.12.1/core 0.12.0 and
+    /// HPKE 0.12.0. This public test seed and ciphertext protect old artifacts,
+    /// including the age chunk boundary, independently of a new-writer round trip.
+    #[test]
+    fn published_age_012_multichunk_payload_remains_readable() {
+        let identity = HybridIdentity::from_seed([7; 32]);
+        assert_eq!(
+            format!("{:x}", Sha256::digest(identity.to_recipient().as_bytes())),
+            "74943b4ecd441ec7f92d22c3fb377a29cd7fb96687efda8fae74ae2219a1c279"
+        );
+        let ciphertext = include_bytes!("../tests/fixtures/age-0.12.1-hybrid.age");
+        let mut recovered = Vec::new();
+        let outcome = decrypt(&identity, ciphertext.as_slice(), &mut recovered).unwrap();
+        let expected: Vec<u8> = (0..70_000)
+            .map(|i| ((i * 17 + i / 251) % 256) as u8)
+            .collect();
+        assert_eq!(recovered, expected);
+        assert_eq!(outcome.plaintext_bytes, 70_000);
+        assert_eq!(outcome.suite, SUITE_HYBRID);
+    }
+
     /// Encrypting and decrypting is byte-exact, including the sizes that straddle
     /// age's 64 KiB chunk boundary and the empty payload.
     #[test]

@@ -224,3 +224,22 @@ then resolve those security findings. V01 remains open and production stays disa
 See [SQLite acceptance](project.md#sqlite-remediation-acceptance--2026-11-16).
 
 SQLite checkpoint review passed with no blocking findings. Its dependency/runtime guard, native and package evidence still match. The reviewed eight-file checkpoint is being committed and pushed as requested before cryptography remediation; production remains disabled.
+
+SQLite checkpoint is committed as `d90a3b4`. Automated HTTPS/SSH push attempts could not authenticate; the operator will push it through GitHub Desktop. Cryptography remediation is a separate increment: replace the unused P-256 dependency path, update ctutils, and prove artifact/key compatibility before acceptance. Production stays disabled.
+
+
+SQLite checkpoint `d90a3b4` is committed and its GitHub Desktop push is verified.
+The separate cryptography fix is verified and uncommitted: both advisory findings
+are cleared, with 316 tests, three PG16–18 native suites and both package targets
+passing. Old/new signed artifacts remain mutually readable/restorable; key and
+artifact formats are unchanged. Two dependency maintenance advisories and a future-Rust
+warning remain visible; their release disposition remains open. Next: review/commit this checkpoint, then the remaining V01
+compatibility work. Production stays disabled. See [cryptography acceptance](project.md#cryptography-remediation-acceptance--2026-11-16).
+
+Cryptography checkpoint review passed on 2026-11-17 with no blocking findings; it is
+being committed locally for the operator's GitHub Desktop push. Retained test and
+package evidence still matches the code. The maintenance tradeoff is explicit:
+the patched age 0.11 branch removes the vulnerable dependency path but introduces
+an unmaintained macro dependency and a future-Rust warning. Both maintenance
+advisories remain open release obligations; this checkpoint does not accept them
+for production. Next: remaining V01 signed-family compatibility work.

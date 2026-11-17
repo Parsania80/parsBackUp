@@ -1,6 +1,6 @@
 # PostgreSQL Backup Platform — Implementation Roadmap
 
-Latest implementation handoff: §52 (SQLite advisory remediation verified, 2026-11-16). V01 checkpoint is committed as `5a1834b`; its SQLite follow-up is uncommitted. H05 is committed as `046c22e`; H04 as `6a547e9`, H03 as `cb34f5e` and H02 fixture hardening as `3cc9326`. H fixture foundations are locally accepted; production compatibility/content/security validation and V02/V03 remain required. The historical 2026-10-03 rewrite was operator-authorized; historical results are distinct from current verification.
+Latest implementation handoff: §53 (cryptography advisory remediation verified, 2026-11-16). V01 checkpoint is `5a1834b`; SQLite checkpoint `d90a3b4` is committed and remote push verified. The cryptography follow-up is uncommitted. H05 is committed as `046c22e`; H04 as `6a547e9`, H03 as `cb34f5e` and H02 fixture hardening as `3cc9326`. H fixture foundations are locally accepted; production compatibility/content/security validation and V02/V03 remain required. The historical 2026-10-03 rewrite was operator-authorized; historical results are distinct from current verification.
 
 ## 1. Project vision and how to use this document
 
@@ -65,7 +65,7 @@ Chosen compatibility policy: PostgreSQL 16, 17 and 18 source servers, absolute s
 | Configuration | TOML through `toml` and `serde` | Strict fields; secrets referenced by protected paths. |
 | Interchange | JSON through `serde_json` | Versioned artifacts/plans; closed schemas at security boundaries. |
 | Inventory | `rusqlite` = 0.41.1, defaults disabled, bundled SQLite 3.54.1 (`libsqlite3-sys` 0.39.1) | DELETE journal, FULL synchronous writes, explicit timeout. |
-| Encryption | `age` = 0.12.1, `age-core` = 0.12.0, existing custom hybrid recipient | Keep the pinned pair and tested format compatible. |
+| Encryption | `age` = 0.11.5, `age-core` = 0.11.0, `hpke` = 0.12.0 alloc-only, existing custom hybrid recipient | Security maintenance pair; frozen v1 compatibility verified in §53. |
 | Signatures | `ed25519-dalek` 2.2 line and `ml-dsa` 0.1.1 or reviewed compatible update | Required zeroization features; both signature legs verify. |
 | CLI | `clap` derive | Existing human/JSON modes; parsing/presentation only. |
 | Local coordination | Unix `flock` through `libc` | Kernel ownership; nonblocking scope acquisition; never unlink live lock files. |
@@ -1683,3 +1683,155 @@ full-scan provenance/results and scoped process/container/fixture cleanup. Evide
 ### SQLite checkpoint review — 2026-11-16
 
 Operator requested commit/push first, then cryptographic advisory remediation. Reviewed exact eight-file dependency/test-helper/security/evidence scope; no blocking checkpoint finding or runtime correction. Existing 315-test/five all-major native/two-target package evidence remains unchanged, not rerun for review. Re-audit passes exact two-entry lock delta, registry/amalgamation checksums, linked runtime/old control, protected production code/schema/formats/controlled documents/archive, all seven 173-input manifests except stated handoff docs, 412 references/52 embedded Python blocks/syntax/format/diff, retained package hashes, full scan provenance/findings and scoped cleanup. Preparing exact-scope local commit/staged-blob/parent/tree/clean verification and authorized normal push of main; no force push or production enablement. Cryptography investigation and edits follow the push as a separate increment.
+
+
+## 53. V01 cryptography advisory remediation — 2026-11-16
+
+SQLite review passed without blocking checkpoint findings; committed **d90a3b4**
+(parent5a1834b), exact eight staged blobs/tree and clean checkout verified. HTTPS push
+failed with absent credentials; SSH first refused an unknown host, then rejected the
+agent key after its host fingerprint was verified against official GitHub metadata/docs
+in a temporary trust file. No global Git/SSH/network configuration changed or secret
+read/exported. Operator now owns the push through GitHub Desktop; no successful push
+or hosted-green result is claimed. Work continues separately under that instruction.
+
+Before dependency edits, inspected feature graphs, official registry/release/advisory
+metadata and frozen v1/crypto contracts. ctutils0.4.2 has a compatible patched0.4.8;
+age0.12.1 requires p2560.13 unconditionally and enables HPKE P-256, retaining affected
+crypto-bigint0.5.5 even if our direct defaults are disabled. A direct bigint0.7 update
+cannot satisfy the old elliptic-curve constraint. No patched age0.12 release exists in
+the current official index. Choose upstream's security-fixed **age0.11.5/core0.11.0**
+pair for the age-v1 stream we use, with **hpke0.12.0 defaults disabled/alloc only** and
+**ctutils0.4.8**; keep the custom KEM, ML-KEM/X25519, signing implementations, zeroize
+features and exact frozen formats. Detailed pre-code boundary/alternatives/acceptance
+are appended to the security review. This is a dependency choice, not a new format or
+cryptographic primitive; no ignore/backport/fork or contract relaxation. Verify actual
+old/new bytes before accepting the choice. SQLite package/CI evidence preserved under
+ignored checkpoint-sqlite; old CLI/lock preserved for cross-version checks.
+
+
+Pre-gate checks pass: old/new multi-chunk crypto helpers preserve exact public and
+signature bytes; both-direction actual signed CLI PG16 verify/restore checks preserve
+artifact/key hashes and independently restored data. Golden signing vector is
+unchanged. 221->215 lock records: 22 removed/16 added identities (required age/core/
+parser/localization branch plus ctutils); fresh official index/hash/non-yanked/MSRV/
+license checks pass for all16. Same-DB full advisory scan reports two->zero findings,
+exit1->0; basic-toml maintenance warning is retained and the final audit also identifies
+proc-macro-error2 2.0.1 unmaintained warning RUSTSEC-2026-0173. That macro has a
+visible E0365 future-Rust warning; current pinned1.97.1 compiles, future toolchain
+upgrades require revisiting that dependency. No suppression/fork/ignore. Detailed
+zeroization/feature/lock delta and synthetic fixture provenance are in security review;
+final source-frozen fast/native/package gates follow.
+
+
+### Cryptography remediation acceptance — 2026-11-16
+
+**RUSTSEC-2026-0387 and RUSTSEC-2026-0385 resolved:** crypto-bigint/P-256/elliptic-curve
+are absent, ctutils is0.4.8. age0.11.5/core0.11.0 supplies the existing age-v1 stream
+without the unused P-256 dependency; unchanged HPKE0.12.0 is alloc-only and calls its
+same Base/ChaCha20Poly1305/HkdfSha256/HPKE_INFO/empty-AAD implementation directly.
+Custom KEM/seed derivation/combiner/protocol/constants/signing/key IDs/encodings and
+stanza refusal policy remain unchanged, with compiled zeroization obligations. No
+vendor fork/source override/ignore or suite/format/schema change. Exact221->215 lock
+delta (22 removed/16 added identities, six shared dependency-list changes) is reviewed;
+all16 new official registry hashes/non-yanked/MSRV/license checks pass. See
+[security acceptance and remaining warnings](docs/security/v01-review.md#cryptography-advisory-remediation-acceptance--2026-11-16).
+
+| Gate | Accepted final evidence |
+|---|---|
+| fast | **316 workspace tests**, strict locked/offline Clippy, format, three workflow semantic lints, reference/syntax/pin checks and two actual report envelopes. |
+| Cross-version probes | Baseline age0.12.1 two-chunk ciphertext remains readable; independent old/new helpers read each other's streams and preserve exact recipient/verifier/signature encodings. Existing golden signature unchanged. |
+| Actual signed CLI compatibility | Old/new PG16 artifacts verify and restore in both directions, independent row checks, unchanged stored artifact and key hashes; synthetic scene removed. |
+| m4a_key_drill | PG16/17/18 key rotation/loss/offline recovery/total-loss controls, operator-supplied test identity and signing/verifying recovery. |
+| m4b_docker_smoke | PG16/17/18 signed levels/twelve forgeries/foreign key/source binding/reader-only DR restore; existing rage locale warnings visible. |
+| h02_snapshot_drill | PG16/17/18 non-root read-only media, exact custody, immutable inventory, external scratch cleanup/limits and syscall audit. |
+| package | Ubuntu release/repeat archive/manager-free lifecycle; same package on actual Ubuntu24.04/systemd255/glibc2.39/PG16 and Debian13/systemd257/glibc2.41/PG17; full lifecycle/custody/sandbox/timer/manual overlap/v7 migration/cancellation/escaped-session containment/live upgrade/reader-only source-loss restore pass. |
+
+All five final wrappers preserve **174 source inputs** during execution: fast, three
+native suites (**nine script-major combinations**) and package. Only README/project/log
+and security handoff changes follow tests; no runtime/test/fixture edit. Unrelated
+SQLite crash suites were retained, not repeated. New package SHA256
+**87b09cdafcaa3a9f7071b119c5538ee41cb82f65acbf6394212c9610d7d7f35e**; SQLite package retained in checkpoint-sqlite at
+SHA256 ae34b0b8095eabe63ca8baa58d81e98c1b27e0cdd436150e661ca67c79c31b02; V01/H05 remain
+in their prior checkpoint directories. Visible package warnings and shared-host-kernel/
+repeat-archive reproducibility limits remain as documented.
+
+Full audit uses cargo-audit0.22.2 and official DB revision
+`02e2517f457a359fc6d3440ea4560c8ea188fee8`, confirmed still current by fresh remote HEAD.
+Before **2 vulnerabilities/exit1**, after **0/exit0**, empty stderr, no ignores or
+architecture/OS/severity filters. basic-toml maintenance warning remains; the age0.11
+localization branch adds proc-macro-error2 2.0.1 unmaintained warning RUSTSEC-2026-0173
+and its visible future-Rust E0365 warning;
+current pinned1.97.1/strict Clippy and both-target builds pass, but future toolchain
+upgrades must resolve it. The final exact-report audit caught this additional
+maintenance advisory; its original warning expectation was incomplete, with the failed
+check retained. Crypto vulnerability remediation is complete; release acceptance of
+these maintenance findings remains a V03 constraint. No fork or warning/advisory
+suppression was added. No independent constant-time/custom
+composition certification. Provenance and source/feature/zeroization tradeoffs are
+recorded in the security review and target/ci-logs/crypto-*.
+
+| File Path | Change Type | Description |
+|---|---|---|
+| [Cargo.toml](Cargo.toml), [Cargo.lock](Cargo.lock) | Modified | Security-fixed age/core pair, custom-only HPKE and patched ctutils; justified transitive graph, no bigint/P-256. |
+| [crates/backup-crypto/src/recipient.rs](crates/backup-crypto/src/recipient.rs) | Modified | Two equivalent direct HPKE calls; validation, errors and plaintext wiping retained. |
+| [crates/backup-crypto/src/stream.rs](crates/backup-crypto/src/stream.rs) | Test added | Old-format multi-chunk ciphertext/key regression; stream production code unchanged. |
+| [crates/backup-crypto/tests/fixtures/age-0.12.1-hybrid.age](crates/backup-crypto/tests/fixtures/age-0.12.1-hybrid.age) | Added | Immutable pre-edit synthetic ciphertext, explicitly public test seed; golden bytes not regenerated. |
+| [docs/security/v01-review.md](docs/security/v01-review.md) | Appended/annotated | Pre-code decision, exact compatibility/lock/feature/scan evidence and visible warnings. |
+| [README.md](README.md), [project.md](project.md), [session-log.md](session-log.md) | Modified/appended | Commit/push status, updated stack, acceptance/evidence and remaining work. |
+
+**SQLite d90a3b4 committed and pushed:** after automated auth failed, operator used
+GitHub Desktop; a public remote lookup now confirms origin/main equals that exact
+commit. Crypto's nine-file increment is verified and **uncommitted**. Next review/
+commit it, then resolve signed-family/request compatibility and missing versioned
+command/production-plan contracts. V01 remaining content/security, V02/V03/T03 remain
+open; production stays disabled. No controlled flow changed, crypto push, hosted-green
+claim or host deployment. Final exact-scope/source/evidence/document/cleanup audit follows.
+
+
+Final handoff audit passes **423 local reference targets/fragments**, fenced TOML/JSON,
+**52 embedded Python blocks** and standalone/shell/maintainer syntax, format/diff,
+exact nine-file scope/HEADd90a3b4/empty index, justified lock identities/semantic edges,
+equivalent two HPKE calls and otherwise unchanged recipient validation/wiping,
+unchanged stream production code/KEM/signing/protocol/schema/formats/controlled
+operating documents/archive, immutable baseline ciphertext/exact signature/public
+vectors and both-direction CLI restore evidence, all16 registry hashes/licenses,
+full audit zero vulnerabilities with **both** maintenance advisories reported, all
+five 174-input records except four stated post-test handoff files, retained/new package
+hashes and scoped cleanup. The first handoff-audit warning-set assertion omitted
+RUSTSEC-2026-0173; that failed check is retained and the documentation/expectation now
+reflect the actual unfiltered report. No product test was weakened or source changed.
+Evidence: /tmp/parsbackup-crypto-final-audit.py/.log, initial warning-mismatch log,
+/tmp/parsbackup-crypto-{cross-probe,cli-compat,future-incompat}.log and canonical
+CI/input/audit/registry evidence under target/ci-logs. No runtime/test/fixture changes
+follow acceptance. Cryptography findings are resolved; dependency-maintenance release
+disposition remains open. Next review/commit this checkpoint and its recorded tradeoff.
+
+### Cryptography checkpoint review — 2026-11-17
+
+Operator requested review/commit of this checkpoint and its maintenance tradeoff.
+Reviewed the exact nine-file scope with **no blocking findings**. Direct HPKE calls
+match the cached age-core 0.12 helper's parameters, result handling and panic text;
+recipient validation/plaintext wiping and stream production code remain unchanged.
+The old ciphertext fixture is byte-identical to the preserved pre-edit vector; keys,
+signatures and actual signed CLI restore evidence remain compatible in both directions.
+The dependency delta removes the affected unused P-256 path and patches ctutils;
+registry provenance and the unfiltered advisory report match the reviewed lockfile.
+
+The selected patched age 0.11 branch is accepted for this bounded vulnerability
+checkpoint with its recorded maintenance cost: it adds unmaintained proc-macro-error2
+2.0.1 and future-Rust E0365, alongside the existing basic-toml maintenance advisory.
+Pinned Rust 1.97.1 and both package targets pass. This is not release acceptance of
+those maintenance findings: V03 must resolve or explicitly disposition both advisories,
+and any toolchain upgrade must address the macro incompatibility. No warning ignore,
+fork, contract rewrite or production enablement is added to close this review.
+
+Re-audit passes the five 174-input records with only four documented handoff files
+changed, retained 316-test/three PG16–18 native/two-target package results, package and
+baseline hashes, protected contracts/controlled documents/archive, append-only log,
+423 references/52 embedded Python blocks/syntax/format/diff and scoped cleanup.
+Evidence: /tmp/parsbackup-crypto-review-audit-before.log and final review audit.
+Preparing exact nine-file local commit with staged-blob/tree/parent/clean verification;
+operator retains GitHub Desktop push responsibility. Next is remaining V01
+signed-family/request compatibility, then missing versioned command/production-plan
+contracts; V01/V02/V03/T03 remain open and production stays disabled.
