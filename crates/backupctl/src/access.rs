@@ -1,5 +1,5 @@
 //! Exhaustive command classification keeps authorization separate from availability.
-//! Versioned writable offline backup reads and retention dispatch remain unavailable.
+//! Writable offline reads/retention use protected handles without source configuration.
 //! Authorized native, custody and snapshot commands dispatch to their explicit owners.
 use crate::cli::*;
 use crate::output::{Reporter, refuse};
@@ -184,6 +184,17 @@ pub(crate) fn run(
             existing_reader_root(&config)?;
         }
         return crate::native::run(config, command, report);
+    }
+    if let TopCommand::Backup {
+        command:
+            command @ (BackupCommand::List
+            | BackupCommand::Inspect { .. }
+            | BackupCommand::Verify { .. }
+            | BackupCommand::Prune { .. }
+            | BackupCommand::Delete { .. }),
+    } = command
+    {
+        return crate::offline::run(config, command, report);
     }
     let store_command = matches!(
         command,

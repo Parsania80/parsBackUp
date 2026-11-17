@@ -67,3 +67,14 @@ readers retain v1 recovery. The existing authenticated manifest digest binds the
 family graph into restore plans; changing manifest bytes requires a new artifact and
 plan. Schema8's historical v1-signed inventory shape describes the shared file layout,
 not permission to use an old reader. Production recovery/plan policy remains gated.
+
+V01-W1 (2026-11-17): writable versioned reader custody can now inspect/verify and
+prepare/execute retention without a live source, passfile, recipient or signer.
+List is key-free; signature checks need only the independent verifier. Private
+checks/deletion require identity plus verifier; archive alone also needs matching
+protected tools. Keep the existing store root: offline commands never create a
+missing root or silently run recovery. Writable reads may create claims/scratch,
+verification observations and local history; use the existing snapshot configuration
+for a true immutable copied store. Exact deletion intent, current archive evidence,
+protection/last-valid/active exclusions, terminal replay receipts and started-only
+`inventory recover` remain unchanged. See [W1 dispatch rules](../development/v01-w1-offline-dispatch.md).

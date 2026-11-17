@@ -5,7 +5,7 @@ repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$repo_root"
 cargo build -p backupctl --locked --offline
 python3 - "$repo_root" <<'PY'
-import hashlib, json, os, pathlib, secrets, subprocess, sys, time
+import hashlib, json, os, pathlib, secrets, sqlite3, subprocess, sys, tempfile, time
 root = pathlib.Path(sys.argv[1]).resolve()
 binary = root/'target/debug/backupctl'
 old_binary = os.environ.get('BACKUPCTL_COMPAT_OLD_BINARY')
@@ -37,7 +37,8 @@ for major in (16, 17, 18):
         run(['docker', 'run', '-d', '--name', name, '--network', 'none', *old_mount,
              '-e', 'POSTGRES_HOST_AUTH_METHOD=trust',
              '-v', f'{binary}:/backupctl:ro', '-v', f'{libdir}:/host-lib:ro',
-             f'docker.arvancloud.ir/library/postgres:{major}-bookworm'])
+             f'docker.arvancloud.ir/library/postgres:{major}-bookworm',
+             'bash','-c','docker-entrypoint.sh postgres & wait; exec sleep infinity'])
 
         def ex(*args, content=None, ok=True):
             return run(['docker', 'exec', '-i', name, *args], content, ok)
@@ -174,10 +175,10 @@ identity_file="/v01/keys/identity"
         write('/v01/snapshot.toml',config('reader','fixture_restore').replace('read_only=false','read_only=true')+'\n[scratch]\nroot="/external-v01-scratch"\n')
         outputs = []
 
-        def cli(config_name, *args, fail=False, old=False):
-            # Offline reads use the implemented true snapshot contract. Writable
-            # versioned offline dispatch remains a separate production gate.
-            if args[:2] in (('backup','inspect'),('backup','verify'),('backup','list')):
+        def cli(config_name, *args, fail=False, old=False, writable=False):
+            # Keep historical snapshot/cross-build checks; W1 explicitly exercises
+            # writable versioned dispatch after the source server is stopped.
+            if not writable and args[:2] in (('backup','inspect'),('backup','verify'),('backup','list')):
                 config_name = 'snapshot'
             executable = '/backupctl-old' if old else '/backupctl'
             p = ex('/host-lib/ld-linux-x86-64.so.2', '--library-path', '/host-lib', executable,
@@ -408,11 +409,17 @@ identity_file="/v01/keys/identity"
         # A plain keyless store scan cannot reveal the DB-held credential sentinel.
         for secret in (sentinel, password):
             assert ex('grep', '-r', '-l', '-F', '--', secret, '/v01/store', ok=False).returncode == 1
+        # Dedicated scopes isolate W1 retention from prior content/restore history.
+        w1_profiles = f'\n[[profile]]\nname="w1_literal"\ndatabase="{source}"\ntables=["app.partitioned_events","app.partitioned_events_2025","app.partitioned_events_2026"]\n[[profile]]\nname="w1_family"\ndatabase="{source}"\ntables=["app.partitioned_events"]\n'
+        write('/v01/w1_writer.toml', config(user='postgres')+w1_profiles)
+        w1_ids = {name: [create('w1_writer',name) for _ in range(3)] for name in ('w1_literal','w1_family')}
         ex('rm', '/v01/keys/signer', '/v01/keys/recipient')
         sql('DROP SUBSCRIPTION fixture_inert', source)
         sql(f'DROP DATABASE {source}')
         target = targets[target_index]; target_index += 1
-        p = cli('admin_restore', 'restore', 'plan', admin_full, '--target', target, '--security', 'portable')['data']['plan']
+        # The later W1 fixture backups advance local history. Recovery explicitly
+        # acknowledges this older, intentionally selected content snapshot.
+        p = cli('admin_restore', 'restore', 'plan', admin_full, '--target', target, '--security', 'portable', '--acknowledge-older-snapshot')['data']['plan']
         cli('admin_restore', 'restore', 'run', p['id'], '--confirm-target', target)
         count(target, 'SELECT count(*) FROM app.accounts', 2)
         count(target, 'SELECT note FROM public.evidence', 'public recovered')
@@ -421,6 +428,106 @@ identity_file="/v01/keys/identity"
         cli('restore','restore','run',p['id'],'--confirm-target',target)
         count(target,'SELECT id FROM app.nested',7)
         count(target,"SELECT count(*) FROM pg_inherits",2)
+        # Source-free recovery above is complete. W1 now also stops the server and
+        # removes credentials, so no hidden source/tool probe can satisfy these cases.
+        data_dir = sql('SHOW data_directory')
+        ex('gosu','postgres','pg_ctl','-D',data_dir,'-m','fast','-w','stop')
+        assert ex('pg_isready','-h','127.0.0.1','-U','postgres',ok=False).returncode != 0
+        ex('rm','/v01/passfile')
+        offline = 'config_version=1\nmode="fixture"\naccess="reader"\nread_only=false\n[storage]\nroot="/v01/store"\n[encryption]\nidentity_file="/v01/keys/identity"\n[signing]\nverifying_key_file="/v01/keys/verifier"\n'
+        write('/v01/w1_reader.toml',offline)
+        write('/v01/w1_archive.toml',offline+f'[tools]\nclient_bin_dir="/usr/lib/postgresql/{major}/bin"\n')
+        def w1(config_name,*args,code=None):
+            value=cli(config_name,*args,fail=code is not None,writable=True)
+            if code is not None:
+                assert value['error']['code']==code,(args,value)
+            return value.get('data')
+        def inventory_query(statement):
+            with tempfile.TemporaryDirectory(prefix='backupctl-w1-index-') as directory:
+                local=pathlib.Path(directory)/'inventory.db'
+                run(['docker','cp',name+':/v01/store/inventory.db',str(local)])
+                with sqlite3.connect(f'file:{local}?mode=ro',uri=True) as db:
+                    return db.execute(statement).fetchall()
+        for profile_name,ids in w1_ids.items():
+            for artifact in ids:
+                detail=w1('w1_reader','backup','inspect',artifact)
+                assert detail['format_version']==(1 if profile_name=='w1_literal' else 2)
+                w1('w1_reader','backup','verify',artifact,'--level','checksum')
+                w1('w1_archive','backup','verify',artifact,'--level','archive')
+        for config_name in ('w1_reader','w1_writer'):
+            assert set(sum(w1_ids.values(),[])) <= {h['backup_id'] for h in w1(config_name,'backup','list')['signed']}
+            for artifact in (w1_ids['w1_literal'][0],w1_ids['w1_family'][0]):
+                w1(config_name,'backup','inspect',artifact)
+                for level in ('signature','checksum','archive'):
+                    selected='w1_archive' if config_name=='w1_reader' and level=='archive' else config_name
+                    assert w1(selected,'backup','verify',artifact,'--level',level)['audit_recorded'] is True
+        artifact=w1_ids['w1_family'][0]
+        before=ex('sha256sum','/v01/store/inventory.db').stdout
+        assert w1('w1_archive','backup','verify',artifact,'--level','archive','--read-only')['audit_recorded'] is False
+        assert ex('sha256sum','/v01/store/inventory.db').stdout==before
+        ex('mv','/v01/keys/identity','/v01/keys/identity.saved')
+        for config_name in ('w1_writer','w1_reader'):
+            w1(config_name,'backup','list')
+            assert w1(config_name,'backup','verify',artifact,'--level','signature')['audit_recorded'] is True
+            w1(config_name,'backup','inspect',artifact,code='KEY_UNSAFE')
+        ex('mv','/v01/keys/identity.saved','/v01/keys/identity')
+        ex('chmod','666','/v01/keys/verifier')
+        w1('w1_reader','backup','verify',artifact,'--level','signature',code='KEY_UNSAFE')
+        ex('chmod','644','/v01/keys/verifier')
+        # Altering a file is detected even without an audit write; restore exact bytes.
+        payload=f'/v01/store/artifacts/{artifact}/payload.age'
+        ex('cp',payload,'/v01/saved-payload')
+        ex('sh','-c','printf x >> "$1"','w1',payload)
+        cli('w1_reader','backup','verify',artifact,'--level','checksum','--read-only',fail=True,writable=True)
+        ex('cp','/v01/saved-payload',payload)
+        # Both format scopes use unchanged exact plans and marker-first execution.
+        for profile_name,ids in w1_ids.items():
+            protected=ids[0]
+            w1('w1_writer','backup','protect',protected)
+            preview=w1('w1_writer','backup','prune','--profile',profile_name,'--keep-last','1')
+            assert protected not in preview['candidates']
+            assert any(e['backup_id']==protected and 'protected' in e['reasons'] for e in preview['excluded'])
+            w1('w1_writer','backup','delete',protected,code='RETENTION_PROTECTED')
+            w1('w1_writer','backup','unprotect',protected)
+            preview=w1('w1_writer','backup','prune','--profile',profile_name,'--keep-last','1')
+            candidate=preview['candidates'][0]
+            w1('w1_reader','backup','delete',candidate)
+            # Protection changes inventory binding; the earlier exact plan must refuse.
+            w1('w1_writer','backup','protect',preview['retained'][0])
+            w1('w1_reader','backup','prune','run',preview['plan_id'],'--confirm-digest',preview['digest'],code='RETENTION_PLAN_STALE')
+            w1('w1_writer','backup','unprotect',preview['retained'][0])
+            # A separate process holds the physical artifact lock. Descriptor-pinned
+            # writable dispatch must contend in that same lock domain.
+            ex('rm','-f','/v01/w1-lock-ready','/v01/w1-lock-release')
+            held=subprocess.Popen(['docker','exec',name,'flock','-s',f'/v01/store/locks/artifact-{candidate}.lock','sh','-c','touch /v01/w1-lock-ready; while test ! -f /v01/w1-lock-release; do sleep 0.05; done'],stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+            try:
+                deadline=time.monotonic()+10
+                while ex('test','-f','/v01/w1-lock-ready',ok=False).returncode:
+                    assert held.poll() is None and time.monotonic()<deadline
+                    time.sleep(.05)
+                w1('w1_reader','backup','delete',candidate,code='RETENTION_BUSY')
+            finally:
+                ex('touch','/v01/w1-lock-release')
+                stdout,stderr=held.communicate(timeout=10)
+                assert held.returncode==0 and not stdout and not stderr
+            delete=w1('w1_reader','backup','delete',candidate)
+            w1('w1_reader','backup','delete','run',delete['plan_id'],'--confirm-digest','0'*64,code='RETENTION_CONFIRMATION_MISMATCH')
+            executed=w1('w1_reader','backup','delete','run',delete['plan_id'],'--confirm-digest',delete['digest'])
+            assert executed['completed']==[candidate] and executed['audit_recorded'] is True
+            replay=w1('w1_writer','backup','delete','run',delete['plan_id'],'--confirm-digest',delete['digest'])
+            assert replay['completed']==[candidate] and replay['audit_recorded'] is False and replay['job_id']==executed['job_id']
+            preview=w1('w1_writer','backup','prune','--profile',profile_name,'--keep-last','1')
+            assert len(preview['candidates'])==1
+            completed=w1('w1_reader','backup','prune','run',preview['plan_id'],'--confirm-digest',preview['digest'])
+            assert completed['completed']==preview['candidates']
+            remaining=preview['retained'][0]
+            w1('w1_reader','backup','delete',remaining,code='RETENTION_LAST_VALID')
+            listing=w1('w1_reader','backup','list')['signed']
+            assert remaining in {h['backup_id'] for h in listing}
+            assert all(i not in {h['backup_id'] for h in listing} for i in set(ids)-{remaining})
+        assert inventory_query("SELECT count(*) FROM artifact WHERE state='deleted'")[0][0]>=4
+        assert ex('find','/v01/store/scratch','-mindepth','1').stdout==''
+        print(f'PG{major} W1 writable offline v1/v2 discovery/private/audited verification, minimal custody, source/passfile loss, unchanged deletion/prune/replay/stale/protection/last-valid controls passed',flush=True)
         assert ex('find', '/v01/store/scratch', '-mindepth', '1').stdout == ''
         assert ex('find', '/v01/store/staging', '-mindepth', '1').stdout == ''
         print(f'PG{major} hstore, publication/subscription omission, encrypted FDW sentinel, privilege refusal and reader-only lost-source recovery passed', flush=True)

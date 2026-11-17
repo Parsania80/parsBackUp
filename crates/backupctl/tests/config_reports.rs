@@ -269,7 +269,14 @@ fn fixture_custody_read_only_and_availability_refuse_before_any_resource_open() 
                 || matches!(args[1], "list" | "inspect" | "verify" | "prune" | "delete")
                     && args[0] == "backup"
             {
-                scene.envelope(&args, Some("CAPABILITY_NOT_ENABLED"));
+                scene.envelope(
+                    &args,
+                    Some(if args[1] == "list" {
+                        "FILESYSTEM_UNSAFE"
+                    } else {
+                        "KEY_UNSAFE"
+                    }),
+                );
             }
             // Writable keyless commands are exercised separately with a real inventory.
         }
@@ -598,4 +605,29 @@ fn versioned_resources_are_structural_and_filesystem_refusals_are_safe() {
     scene.envelope(&["inventory", "recover"], Some("FILESYSTEM_UNSAFE"));
     assert!(!scene.0.join("absent").exists());
     assert_eq!(fs::read_dir(scene.root()).unwrap().count(), 1);
+}
+
+#[test]
+fn writable_discovery_needs_no_keys_tools_source_and_never_recovers_work() {
+    let scene = Scene::new();
+    fs::create_dir(scene.root()).unwrap();
+    fs::set_permissions(scene.root(), fs::Permissions::from_mode(0o700)).unwrap();
+    let scratch = scene.root().join("scratch");
+    fs::create_dir(&scratch).unwrap();
+    fs::set_permissions(&scratch, fs::Permissions::from_mode(0o700)).unwrap();
+    let abandoned = scratch.join(Uuid::new_v4().to_string());
+    fs::create_dir(&abandoned).unwrap();
+    fs::write(abandoned.join("sentinel"), b"owned work retained").unwrap();
+    for role in ["reader", "writer"] {
+        scene.write(&scene.v1(role, false, false));
+        let listing = scene.envelope(&["backup", "list"], None);
+        assert_eq!(listing["data"]["signed"], json!([]));
+        assert_eq!(
+            fs::read(abandoned.join("sentinel")).unwrap(),
+            b"owned work retained"
+        );
+    }
+    fs::rename(&scratch, scene.0.join("saved-scratch")).unwrap();
+    symlink(scene.0.join("saved-scratch"), &scratch).unwrap();
+    scene.envelope(&["backup", "list"], Some("FILESYSTEM_UNSAFE"));
 }

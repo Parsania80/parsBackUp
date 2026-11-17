@@ -59,7 +59,7 @@ use layout::{
     PAYLOAD_FILE, PLANS_DIR, PUBLIC_FILE, SIGNATURE_FILE, STAGING_DIR,
 };
 pub use reconcile::LocalReconciler;
-pub use retention::LocalRetention;
+pub use retention::{LocalRetention, ProtectedRetention};
 use sha2::{Digest, Sha256};
 use stage::Target;
 use std::fs::{self, DirBuilder, File, OpenOptions};
@@ -72,12 +72,12 @@ use uuid::Uuid;
 
 /// The key material a store holds.
 ///
-/// A keyed store always holds a decryption identity. Versioned writers load all four
-/// roles; recovery readers load only identity and verifier. Signature-only snapshot
-/// verification keeps its verifier separately in snapshot state and needs no StoreKeys.
+/// Versioned writers load all four roles; recovery readers load identity and verifier.
+/// Writable signature-only verification holds only a verifier and cannot decrypt.
+/// Signature-only snapshots keep their verifier separately in snapshot state.
 /// A signing key selects signed v1 publication; legacy encrypted stores can omit it.
 pub struct StoreKeys {
-    identity: KeyFile,
+    identity: Option<KeyFile>,
     recipient: Option<KeyFile>,
     /// The secret half of the origin signature. Never read on a host that only verifies, and
     /// never rendered: its `Debug` names the path.
@@ -109,8 +109,8 @@ pub struct SignedArtifact {
 
 pub struct LocalStore {
     root: PathBuf,
-    /// `None` keeps every artifact plaintext, exactly as the tool did before the
-    /// recipient stanza existed: encryption is a property of the configured store.
+    /// `None` selects legacy plaintext/discovery behavior. Verifier-only keys select
+    /// a signed reader that cannot decrypt; publication requires explicit writer keys.
     keys: Option<StoreKeys>,
     resources: Option<backup_domain::ResourceLimits>,
     snapshot: Option<std::sync::Arc<snapshot::SnapshotState>>,

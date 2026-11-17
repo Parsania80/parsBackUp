@@ -9,6 +9,7 @@ mod configuration;
 mod inventory;
 mod keys;
 mod native;
+mod offline;
 mod output;
 mod report;
 mod signals;

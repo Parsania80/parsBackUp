@@ -147,9 +147,14 @@ impl LocalStore {
             digest: Sha256::new(),
             bytes: 0,
         };
+        let identity = keys
+            .identity
+            .as_ref()
+            .context("decryption identity required")?
+            .identity()?;
         match limit {
-            Some(limit) => decrypt_with_limit(keys.identity.identity()?, &mut reader, file, limit)?,
-            None => decrypt(keys.identity.identity()?, &mut reader, file)?,
+            Some(limit) => decrypt_with_limit(identity, &mut reader, file, limit)?,
+            None => decrypt(identity, &mut reader, file)?,
         };
         if let Some((bytes, digest)) = expected_ciphertext {
             // Bind the exact stream decrypted, including any bytes age did not consume.

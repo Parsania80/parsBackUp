@@ -124,3 +124,23 @@ the write, without promising an atomic catalog/dump transaction. Versioned offli
 reads still use read_only snapshot mode with external scratch; writable offline and
 retention dispatch remain separate release work. Verification acceptance is recorded
 in the [current handoff](../../project.md#54-v01-signed-table-family-compatibility--2026-11-17).
+
+V01-W1 follow-up (2026-11-17): writable versioned fixture writer/reader configurations
+now support `backup list`, `inspect`, `verify`, and `prune`/`delete` preview/run. This
+supersedes the earlier unavailable writable-offline statements. See the exact
+[dispatch/custody rules](../development/v01-w1-offline-dispatch.md). List needs no
+keys; signature needs only the verifier; inspect/checksum/archive/retention load
+identity plus verifier, including under a writer config. Signer/recipient and source
+credentials are never opened for these operations. Archive needs explicitly configured
+matching protected pg_restore; other offline operations need no tools/source. Named
+prune scope still uses a configured profile, whose source is structurally validated
+without connecting. Delete/run need no source/profile configuration.
+
+Writable verification records the existing observation when possible and reports
+`audit_recorded`. `backup verify --read-only` suppresses observation writes but can
+still create locks/internal scratch; config `read_only=true` is the separate immutable
+snapshot promise. Retention preview saves intent without deleting; execution requires
+`backup prune run PLAN_UUID --confirm-digest DIGEST` or the corresponding `delete run`.
+Role checks, exclusions, stale/expired/refused plans, partial receipts and explicit
+recovery are unchanged. Opening/listing never recovers abandoned work. Production
+still refuses before resource opens; W2/API/UI and release acceptance remain separate.

@@ -9,7 +9,7 @@ use crate::report::{
     print_verify,
 };
 use anyhow::{Result, bail};
-use backup_application::{BackupService, VerifyService};
+use backup_application::{ArtifactStore, BackupService, VerifyService};
 use backup_domain::{Config, VERIFY_ARCHIVE, VERIFY_CHECKSUM, VERIFY_SIGNATURE};
 use backup_postgres::PostgresAdapter;
 
@@ -42,6 +42,7 @@ pub(crate) fn run_with_store(
             config,
             command,
             backup_domain::RetentionOperation::Prune,
+            protected_store.take(),
             report,
         )?,
         BackupCommand::Delete {
@@ -51,6 +52,7 @@ pub(crate) fn run_with_store(
             config,
             command,
             backup_domain::RetentionOperation::Delete,
+            protected_store.take(),
             report,
         )?,
         BackupCommand::Prune {
@@ -66,13 +68,14 @@ pub(crate) fn run_with_store(
                 keep_last: keep_last.expect("clap requires quota for preview"),
                 profile_fingerprint: backup_domain::profile_fingerprint(name),
             };
-            retention(config, request, report)?;
+            retention(config, request, protected_store.take(), report)?;
         }
         BackupCommand::Delete { id, command: None } => retention(
             config,
             backup_domain::RetentionRequest::Delete {
                 backup_id: id.expect("clap requires ID for preview"),
             },
+            protected_store.take(),
             report,
         )?,
         BackupCommand::Protect { id } | BackupCommand::Unprotect { id } => {
@@ -135,7 +138,10 @@ pub(crate) fn run_with_store(
             }
         }
         BackupCommand::List => {
-            let inventory = BackupService::new(engine.clone(), open_store(&config)?).list()?;
+            let inventory = match protected_store.take() {
+                Some(store) => backup_application::Inventory::Public(store.list_signed()?),
+                None => BackupService::new(engine.clone(), open_store(&config)?).list()?,
+            };
             if json {
                 let value = json_inventory(&inventory)?;
                 report.data(value)?;
@@ -144,7 +150,8 @@ pub(crate) fn run_with_store(
             }
         }
         BackupCommand::Inspect { id } => {
-            let record = BackupService::new(engine.clone(), open_store(&config)?).inspect(id)?;
+            let store = take_store(&config, &mut protected_store)?;
+            let record = BackupService::new(engine.clone(), store).inspect(id)?;
             if json {
                 let value = json_record(&record)?;
                 report.data(value)?;
@@ -157,7 +164,7 @@ pub(crate) fn run_with_store(
             level,
             read_only,
         } => {
-            let store = open_store(&config)?;
+            let store = take_store(&config, &mut protected_store)?;
             let service = VerifyService::new(engine.clone(), store);
             let level_name = match level {
                 VerifyLevel::Signature => VERIFY_SIGNATURE,
@@ -175,13 +182,32 @@ pub(crate) fn run_with_store(
     Ok(())
 }
 
+fn take_store(
+    config: &Config,
+    protected: &mut Option<backup_local::LocalStore>,
+) -> Result<backup_local::LocalStore> {
+    match protected.take() {
+        Some(store) => Ok(store),
+        None => open_store(config),
+    }
+}
+
 fn retention(
     config: Config,
     request: backup_domain::RetentionRequest,
+    protected_store: Option<backup_local::LocalStore>,
     report: &mut Reporter,
 ) -> Result<()> {
     let json = report.is_json();
-    let r = backup_application::preview_retention(&backup_local::LocalRetention(config), &request)?;
+    let r = match protected_store {
+        Some(store) => backup_application::preview_retention(
+            &backup_local::ProtectedRetention::new(store)?,
+            &request,
+        )?,
+        None => {
+            backup_application::preview_retention(&backup_local::LocalRetention(config), &request)?
+        }
+    };
     let value = serde_json::json!({
         "operation": r.operation, "source_fingerprint": r.source_fingerprint,
         "profile_fingerprint": r.profile_fingerprint, "keep_last": r.keep_last,
@@ -195,7 +221,7 @@ fn retention(
         println!("Retention preview (no deletion):");
         println!("{}", serde_json::to_string_pretty(&value)?);
         println!(
-            "Local history only: rebuild loses protection/deletion history; this digest is not rollback protection. No execution is enabled."
+            "Local history only: rebuild loses protection/deletion history; this digest is not rollback protection. Execution requires the saved plan and exact digest."
         );
     }
     Ok(())
@@ -205,6 +231,7 @@ fn deletion(
     config: Config,
     command: DeletionCommand,
     operation: backup_domain::RetentionOperation,
+    protected_store: Option<backup_local::LocalStore>,
     report: &mut Reporter,
 ) -> Result<()> {
     let json = report.is_json();
@@ -212,12 +239,20 @@ fn deletion(
         plan_id,
         confirm_digest,
     } = command;
-    let outcome = backup_application::execute_deletion(
-        &backup_local::LocalRetention(config),
-        plan_id,
-        operation,
-        &confirm_digest,
-    )?;
+    let outcome = match protected_store {
+        Some(store) => backup_application::execute_deletion(
+            &backup_local::ProtectedRetention::new(store)?,
+            plan_id,
+            operation,
+            &confirm_digest,
+        )?,
+        None => backup_application::execute_deletion(
+            &backup_local::LocalRetention(config),
+            plan_id,
+            operation,
+            &confirm_digest,
+        )?,
+    };
     let r = outcome.result;
     if json {
         report.data(serde_json::json!({

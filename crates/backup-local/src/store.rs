@@ -59,7 +59,7 @@ impl LocalStore {
         Self::open(
             root,
             Some(StoreKeys {
-                identity,
+                identity: Some(identity),
                 recipient: Some(recipient),
                 signing: None,
                 verifying: None,
@@ -107,7 +107,7 @@ impl LocalStore {
         Self::open(
             root,
             Some(StoreKeys {
-                identity,
+                identity: Some(identity),
                 recipient: Some(recipient),
                 signing: Some(signing),
                 verifying: Some(verifying),
@@ -144,7 +144,7 @@ impl LocalStore {
         let verifying = SigningKeyFile::load(verifying_key_file, SigningRole::Verifying)
             .with_context(|| format!("load verifying key file {}", verifying_key_file.display()))?;
         Ok(StoreKeys {
-            identity,
+            identity: Some(identity),
             recipient: None,
             signing: None,
             verifying: Some(verifying),

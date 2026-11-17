@@ -529,7 +529,7 @@ mod tests {
             .unwrap();
         backup_crypto::stream::encrypt(recipient.recipient(), &b"abc"[..], &mut file).unwrap();
         store.keys = Some(crate::StoreKeys {
-            identity: KeyFile::load(&identity, KeyRole::Identity).unwrap(),
+            identity: Some(KeyFile::load(&identity, KeyRole::Identity).unwrap()),
             recipient: Some(recipient),
             signing: None,
             verifying: None,

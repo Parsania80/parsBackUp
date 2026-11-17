@@ -22,6 +22,86 @@ use uuid::Uuid;
 
 pub struct LocalRetention(pub Config);
 
+/// Versioned retention owns the already-validated reader/store handles through the
+/// complete preview or execution. It never reopens configured key paths.
+pub struct ProtectedRetention(LocalStore);
+
+struct Retention<'a> {
+    root: &'a Path,
+    legacy: Option<&'a Config>,
+    store: Option<&'a LocalStore>,
+}
+impl LocalRetention {
+    fn adapter(&self) -> Retention<'_> {
+        Retention {
+            root: &self.0.storage.root,
+            legacy: Some(&self.0),
+            store: None,
+        }
+    }
+    pub fn check_saved_plan(
+        &self,
+        id: Uuid,
+        operation: RetentionOperation,
+        confirmation: &str,
+    ) -> Result<DeletionPlan> {
+        self.adapter().check_saved_plan(id, operation, confirmation)
+    }
+}
+impl ProtectedRetention {
+    pub fn new(store: LocalStore) -> Result<Self> {
+        ensure!(
+            store.fs_guard.is_some() && store.snapshot.is_none(),
+            "CONFIG_INVALID"
+        );
+        ensure!(
+            store.keys.as_ref().is_some_and(|k| k.identity.is_some()
+                && k.verifying.is_some()
+                && k.signing.is_none()
+                && k.recipient.is_none()),
+            "CONFIG_INVALID"
+        );
+        Ok(Self(store))
+    }
+    fn adapter(&self) -> Retention<'_> {
+        Retention {
+            root: &self.0.root,
+            legacy: None,
+            store: Some(&self.0),
+        }
+    }
+}
+impl RetentionPlanner for LocalRetention {
+    fn preview(&self, request: &RetentionRequest) -> Result<RetentionPreview> {
+        self.adapter().preview(request)
+    }
+}
+impl RetentionPlanner for ProtectedRetention {
+    fn preview(&self, request: &RetentionRequest) -> Result<RetentionPreview> {
+        self.adapter().preview(request)
+    }
+}
+impl backup_application::DeletionExecutor for LocalRetention {
+    fn run(
+        &self,
+        id: Uuid,
+        operation: RetentionOperation,
+        confirmation: &str,
+    ) -> Result<backup_application::DeletionOutcome> {
+        self.adapter().run(id, operation, confirmation)
+    }
+}
+impl backup_application::DeletionExecutor for ProtectedRetention {
+    fn run(
+        &self,
+        id: Uuid,
+        operation: RetentionOperation,
+        confirmation: &str,
+    ) -> Result<backup_application::DeletionOutcome> {
+        self.adapter().run(id, operation, confirmation)
+    }
+}
+
 struct Snapshot {
     source: String,
     profile: String,
@@ -75,13 +155,13 @@ fn descriptor_path(dir: &File) -> PathBuf {
     PathBuf::from(format!("/proc/self/fd/{}", dir.as_raw_fd()))
 }
 
-impl LocalRetention {
+impl Retention<'_> {
     fn snapshot(
         &self,
         request: &RetentionRequest,
         expected: Option<&DeletionPlan>,
     ) -> Result<Snapshot> {
-        let activity = maintenance(&self.0.storage.root)?;
+        let activity = maintenance(self.root)?;
         let mut snapshot = self.snapshot_claimed(request, expected, &activity)?;
         snapshot._activity = Some(activity);
         Ok(snapshot)
@@ -93,7 +173,7 @@ impl LocalRetention {
         expected: Option<&DeletionPlan>,
         activity: &ActivityLock,
     ) -> Result<Snapshot> {
-        let root = &self.0.storage.root;
+        let root = self.root;
         let root_fd = directory(root).context("RETENTION_INVENTORY_INVALID")?;
         quiet(root)?;
         let index = root.join(INVENTORY_FILE);
@@ -262,14 +342,13 @@ impl LocalRetention {
                     .context("RETENTION_BUSY: needed artifact is in use")?,
             );
         }
-        let (entries, _) =
-            LocalReconciler(root.clone())
-                .scan_files(&rows)
-                .context(if expected.is_some() {
-                    "RETENTION_PLAN_STALE: complete scan failed"
-                } else {
-                    "RETENTION_ARTIFACT_INVALID: complete scan failed"
-                })?;
+        let (entries, _) = LocalReconciler(root.to_path_buf())
+            .scan_files(&rows)
+            .context(if expected.is_some() {
+                "RETENTION_PLAN_STALE: complete scan failed"
+            } else {
+                "RETENTION_ARTIFACT_INVALID: complete scan failed"
+            })?;
         let observed: BTreeMap<_, _> = entries
             .iter()
             .filter_map(|e| e.backup_id.map(|id| (id, e.status)))
@@ -279,31 +358,28 @@ impl LocalRetention {
                 excluded.push(RetentionExclusion::new(e.backup_id, &[e.status]));
             }
         }
-        let keys = (|| -> Result<_> {
-            let encryption = self
-                .0
-                .encryption
-                .as_ref()
-                .context("missing reader identity")?;
-            let signing = self
-                .0
-                .signing
-                .as_ref()
-                .context("missing trusted verifier")?;
-            LocalStore::reader_keys(&encryption.identity_file, &signing.verifying_key_file)
-        })()
-        .map_err(|_| {
-            anyhow::anyhow!(
-                "RETENTION_ARTIFACT_INVALID: reader identity and trusted verifier are required"
-            )
-        })?;
-        let store = LocalStore {
-            snapshot: None,
-            resources: None,
-            fs_guard: None,
-            scratch_budget: crate::resources::Budget::new(u64::MAX),
-            root: root.clone(),
-            keys: Some(keys),
+        let legacy_store;
+        let store = match self.store {
+            Some(store) => store,
+            None => {
+                let keys = (|| -> Result<_> {
+                    let config = self.legacy.context("missing legacy reader configuration")?;
+                    let encryption = config.encryption.as_ref().context("missing reader identity")?;
+                    let signing = config.signing.as_ref().context("missing trusted verifier")?;
+                    LocalStore::reader_keys(&encryption.identity_file, &signing.verifying_key_file)
+                })().map_err(|_| anyhow::anyhow!(
+                    "RETENTION_ARTIFACT_INVALID: reader identity and trusted verifier are required"
+                ))?;
+                legacy_store = LocalStore {
+                    snapshot: None,
+                    resources: None,
+                    fs_guard: None,
+                    scratch_budget: crate::resources::Budget::new(u64::MAX),
+                    root: root.to_path_buf(),
+                    keys: Some(keys),
+                };
+                &legacy_store
+            }
         };
         let artifacts =
             open_at(&root_fd, ARTIFACTS_DIR, true).context("RETENTION_ARTIFACT_INVALID")?;
@@ -394,7 +470,7 @@ impl LocalRetention {
             bytes.len() <= DELETION_PLAN_MAX_BYTES,
             "RETENTION_PLAN_TOO_LARGE: exact envelope exceeds 64 KiB"
         );
-        let dir = plan_dir(&self.0.storage.root, true).context("RETENTION_PLAN_INVALID")?;
+        let dir = plan_dir(self.root, true).context("RETENTION_PLAN_INVALID")?;
         let path = descriptor_path(&dir).join(format!("deletion-{}.json", saved.plan.plan_id));
         let mut file = OpenOptions::new()
             .write(true)
@@ -424,7 +500,7 @@ impl LocalRetention {
         operation: RetentionOperation,
         confirmation: &str,
     ) -> Result<DeletionPlan> {
-        let saved = load_plan(&self.0.storage.root, id)?;
+        let saved = load_plan(self.root, id)?;
         saved.validate(id, operation, now()?)?;
         ensure!(
             confirmation == saved.digest,
@@ -468,7 +544,7 @@ fn file_snapshot(dir: &File) -> Result<Vec<FileSnapshot>> {
         .collect()
 }
 
-impl RetentionPlanner for LocalRetention {
+impl RetentionPlanner for Retention<'_> {
     fn preview(&self, request: &RetentionRequest) -> Result<RetentionPreview> {
         let snapshot = self.snapshot(request, None)?;
         let mut report = RetentionPreview {
@@ -589,7 +665,7 @@ fn partition(
     };
     Ok(backup_application::DeletionOutcome { result, error })
 }
-impl backup_application::DeletionExecutor for LocalRetention {
+impl backup_application::DeletionExecutor for Retention<'_> {
     /// A receipt is checked before expiry or files; a failed job can never resume pending IDs.
     fn run(
         &self,
@@ -597,7 +673,7 @@ impl backup_application::DeletionExecutor for LocalRetention {
         operation: RetentionOperation,
         confirmation: &str,
     ) -> Result<backup_application::DeletionOutcome> {
-        let root = &self.0.storage.root;
+        let root = self.root;
         let saved = load_plan(root, id)?;
         saved.validate_structure(id, operation)?;
         ensure!(
@@ -803,13 +879,14 @@ mod tests {
             digest: plan.digest().unwrap(),
             plan: plan.clone(),
         };
-        planner.save(&saved).unwrap();
+        planner.adapter().save(&saved).unwrap();
         let path = root
             .join("plans")
             .join(format!("deletion-{}.json", plan.plan_id));
         let original = fs::read(&path).unwrap();
         assert!(
             planner
+                .adapter()
                 .save(&saved)
                 .unwrap_err()
                 .to_string()
@@ -829,6 +906,7 @@ mod tests {
         };
         assert!(
             planner
+                .adapter()
                 .save(&oversized)
                 .unwrap_err()
                 .to_string()

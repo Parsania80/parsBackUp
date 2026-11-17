@@ -57,9 +57,11 @@ upgrading dependencies. This is an implementation/dependency review, not indepen
 cryptographic assurance or a constant-time proof. A clean advisory scan is time-bound.
 
 V01 reports acceptance separately from blockers. Versioned writable offline reads and
-retention dispatch still refuse CAPABILITY_NOT_ENABLED; production plan canonical
-bytes/context must be defined before adding its writer. Those remain production
-compatibility gates, not capabilities certified by these fixture tests. Resolve any
+retention dispatch are implemented and verified by [V01-W1](v01-w1-offline-dispatch.md)
+with acceptance in [project §56](../../project.md#56-v01-w1-writable-offline-dispatch--2026-11-17).
+Production plan canonical bytes/context still require W2 definition/fixture proof
+before dependent writers. Production operations remain disabled; W1 certifies only
+its stated fixture command paths. Resolve any
 new content/security failures before V01 acceptance; do not mark the entire phase done
 while required behavior remains unvalidated. V02 measurements, V03 license/security/
 support/release decision, T03 off-host replay limitation and hosted CI execution remain

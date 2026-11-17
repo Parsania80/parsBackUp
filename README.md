@@ -271,3 +271,46 @@ four all-major native-suite and both-target package results remain applicable.
 The operator requested a local commit; Git history records its identity. GitHub
 Desktop push remains with the operator. Next: versioned writable offline reads
 and retention dispatch. Production remains disabled.
+
+Progress after signed-family checkpoint a0ab1d4 (2026-11-17): the CLI core,
+retention and fixture hardening/package foundations are delivered. Three CLI
+release tasks remain: finish V01 production command/plan and content/security
+acceptance, run V02 measurements/recovery rehearsal, then complete V03 release
+policy and separately reviewed production enablement. V01 includes versioned
+writable offline reads/retention dispatch and production restore-plan compatibility.
+The later full platform still has four API tasks, four UI tasks and three platform
+release tasks; API/UI are not required for the first CLI release. Task counts are
+not equal effort or a percentage estimate. Production remains disabled.
+
+Why validation precedes API/UI: the current roadmap releases the CLI first,
+and the future API/UI reuse its backup/restore/retention services. Core correctness
+checks protect every interface; CLI release administration and the full V02/V03
+sequence are a product sequencing choice. A web-first direction could defer
+CLI-only release work while addressing required shared backend contracts before
+dependent API operations. API/UI integration and end-to-end validation still follow
+their implementation. No roadmap reordering is authorized by this clarification.
+
+The operator has now approved the **web-first sequence**: close exactly two shared
+backend gates (versioned writable offline/retention dispatch, then restore-plan
+compatibility contract/fixture proof), build the API, build the UI, and perform
+integrated release validation. Full CLI release is no longer a prerequisite for
+API work. Existing core tests remain the baseline; broad performance/release work
+moves after the UI. API auth/worker decisions and UI framework choices remain their
+own recorded implementation tasks. Production stays disabled until reviewed release
+acceptance. The bounded gates and handoff criteria are in
+[the current roadmap](project.md#55-web-first-delivery-and-bounded-backend-handoff--2026-11-17).
+
+V01-W1 is now in progress. Its [pre-code dispatch contract](docs/development/v01-w1-offline-dispatch.md) specifies key-free discovery, verifier-only signature checks, reader-only private verification and retention on writable versioned fixtures, without contacting the source. Implementation and verification follow; production remains disabled.
+
+V01-W1 is now implemented and verified: writable versioned fixtures can list,
+inspect, verify and prepare/execute retention offline. List needs no keys; signature
+checks need only the verifier; private operations use identity plus verifier without
+signer/recipient/source credentials. Archive checks alone need matching tools.
+**323 tests** and V01/B06/snapshot native suites on PG16–18 pass. Existing plan bytes,
+schema, retention safeguards and immutable snapshots remain intact. The increment
+is uncommitted for review; production stays disabled. **Next: W2 restore-plan
+compatibility contract/fixture proof, then API → UI → integrated release validation.**
+See [W1 acceptance](project.md#w1-implementation-and-acceptance--2026-11-17).
+
+The operator requested a local checkpoint of all current W1 and web-first roadmap
+changes. Git history records the commit identity; pushing remains operator-owned.

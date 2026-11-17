@@ -44,6 +44,7 @@ impl Role {
 pub enum KeyUse {
     Writer,
     Reader,
+    Signature,
     Status,
 }
 #[derive(Clone, Copy)]
@@ -72,6 +73,7 @@ impl Resources {
             || matches!(usage, KeyUse::Reader)
             || (matches!(usage, KeyUse::Status) && config.access == Access::Reader);
         let verifier = writer
+            || matches!(usage, KeyUse::Signature)
             || identity
             || (matches!(usage, KeyUse::Status) && config.access == Access::Public);
         let mut paths = Vec::new();
@@ -343,7 +345,7 @@ fn load_all(resources: &Resources) -> Result<Loaded> {
 /// Opens a writable store only after loading exactly the operation's protected custody.
 pub fn open_protected_store(config: &ConfigV1, usage: KeyUse) -> Result<crate::LocalStore> {
     ensure!(
-        matches!(usage, KeyUse::Writer | KeyUse::Reader),
+        matches!(usage, KeyUse::Writer | KeyUse::Reader | KeyUse::Signature),
         "CONFIG_INVALID"
     );
     ensure!(!config.read_only, "READ_ONLY");
@@ -358,7 +360,11 @@ pub fn open_protected_store(config: &ConfigV1, usage: KeyUse) -> Result<crate::L
     let resources = Resources::open(config, usage, false)?;
     let loaded = load_all(&resources)?;
     let keys = crate::StoreKeys {
-        identity: loaded.identity.context("KEY_INVALID")?,
+        identity: if matches!(usage, KeyUse::Signature) {
+            None
+        } else {
+            Some(loaded.identity.context("KEY_INVALID")?)
+        },
         recipient: loaded.recipient,
         signing: loaded.signing,
         verifying: loaded.verifying,
@@ -393,7 +399,7 @@ pub(crate) fn snapshot_keys(
     let (keys, verifier) = if decrypt {
         (
             Some(crate::StoreKeys {
-                identity: loaded.identity.context("KEY_INVALID")?,
+                identity: Some(loaded.identity.context("KEY_INVALID")?),
                 recipient: None,
                 signing: None,
                 verifying: loaded.verifying,

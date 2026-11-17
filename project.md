@@ -1,6 +1,6 @@
 # PostgreSQL Backup Platform — Implementation Roadmap
 
-Latest implementation handoff: §54 (V01 signed table-family compatibility verified and review accepted for local checkpoint, 2026-11-17). V01 checkpoint is `5a1834b`; SQLite checkpoint `d90a3b4` is committed and remote push verified. Cryptography checkpoint `c13f593` is committed locally. H05 is committed as `046c22e`; H04 as `6a547e9`, H03 as `cb34f5e` and H02 fixture hardening as `3cc9326`. H fixture foundations are locally accepted; production compatibility/content/security validation and V02/V03 remain required. The historical 2026-10-03 rewrite was operator-authorized; historical results are distinct from current verification.
+Latest direction: §55 (operator-approved web-first sequence, 2026-11-17): W1 is verified (§56), W2 is next, then API → UI → integrated release validation. Signed-family checkpoint a0ab1d4 is committed locally; its acceptance is in §54. V01 checkpoint is `5a1834b`; SQLite checkpoint `d90a3b4` is committed and remote push verified. Cryptography checkpoint `c13f593` is committed locally. H05 is committed as `046c22e`; H04 as `6a547e9`, H03 as `cb34f5e` and H02 fixture hardening as `3cc9326`. H fixture foundations are locally accepted; production compatibility/content/security validation and V02/V03 remain required. The historical 2026-10-03 rewrite was operator-authorized; historical results are distinct from current verification.
 
 ## 1. Project vision and how to use this document
 
@@ -25,7 +25,7 @@ Contract authority: operator instructions and AGENT.md govern work; the [frozen 
 
 ## 2. Goals, scope and exclusions
 
-The first production product is a hardened CLI: full and supported selective logical backups, signed encrypted local artifacts, inspect/list/verify, fresh-target restore, inventory/jobs, safe retention, systemd scheduling, Debian packaging and measured restore drills. API/UI are later releases; a CLI release must not wait for them.
+The first production product is the operator-approved web application backed by the hardened CLI/core (§55): full and supported selective logical backups, signed encrypted local artifacts, inspect/list/verify, fresh-target restore, inventory/jobs, safe retention, systemd scheduling, Debian packaging and measured restore drills. Close two bounded shared-backend gaps, then build the API and UI before integrated release validation. A separate CLI production launch is not required first.
 
 Initial scope is one configured source and one local storage root per configuration, with named profiles of that source. Multiple source estates in one inventory are not supported. A backup is a consistent logical snapshot of one database, not a complete deployment.
 
@@ -47,7 +47,7 @@ Local artifacts share the host's failure domain. Do not claim host-loss recovery
 | B02–B06 | Accepted M5b: schema v8 protection, exact retention plans, confirmed marker-first deletion/recovery, local older-snapshot warnings and native destructive/race/crash drill (§40) | Rebuild loses lifecycle/rollback history; local ledger is not independent replay protection. Production hardening remains H/V. |
 | Phase S | Same-scope acquisition is tested mid-dump **and** by two real CLI processes | Opening a store removes nothing; work owns `activity.lock` shared, only `backup create` cleans it exclusively. Continuously busy stores may defer abandoned-work cleanup. |
 | Review corrections R | Consumption-bound signed/encrypted reads; process-group cleanup; overflow refusal; quoted native role exports; restore checks/preparation before mutations | Captured catalog/TOC output above 64 KiB is refused; service isolation remains H02. |
-| Operations/service | H03 fixture .deb and opt-in dedicated-user systemd backup timer accepted on Debian 13/Ubuntu 24.04 userspaces (§48) | Shared host-kernel container evidence; H04 CI/references and H05 readability have local acceptance (§49–§50). Production content/compatibility/release gates remain; API/UI are later. |
+| Operations/service | H03 fixture .deb and opt-in dedicated-user systemd backup timer accepted on Debian 13/Ubuntu 24.04 userspaces (§48) | Shared host-kernel container evidence; H04 CI/references and H05 readability have local acceptance (§49–§50). Two shared-backend gates precede API/UI; remaining production validation joins the integrated release (§55). |
 | H01 policy / H02 fixture hardening | Configuration/reports, native auth/recovery, custody, filesystem/resources, snapshot reads and cancellation/process ownership (§42–§47) accepted on fixtures | Fixture hardening and H03 service/cgroup/package acceptance are recorded (§47–§48). Production command/plan compatibility remains a release gate; production operations stay gated until V03. |
 
 Historical review evidence (before the S/C02/R increments): `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo test --workspace` passed; 167 tests passed, zero failed. Existing PostgreSQL 16/17/18 matrices have historical passing records through M4b. They were not rerun in the review or this rewrite. Test counts describe the baseline, not a target future count.
@@ -355,7 +355,7 @@ Fixtures cover normal and insufficient privileges, optional extensions/FDWs/publ
 
 ## 24. Benchmarks and production limits
 
-At V02 generate reproducible 100 MB, 1 GB and 10+ GB datasets with compressible/incompressible data, many/small/large relations, indexes and large objects. Record generator seed, hardware/filesystem, OS, PostgreSQL/client/application versions, compression, concurrency and cache conditions.
+At V02, during integrated release validation after API/UI (§55), generate reproducible 100 MB, 1 GB and 10+ GB datasets with compressible/incompressible data, many/small/large relations, indexes and large objects. Record generator seed, hardware/filesystem, OS, PostgreSQL/client/application versions, compression, concurrency and cache conditions.
 
 Measure full backup + verification + restore time, throughput, compression ratio, CPU, peak RSS, I/O and source load. Repeat and report median/range. Current v1 writes gzip compression; zstd/directory parallel dumps are future options only after native-version/format and restore tests. Never silently change recorded compression during cleanup.
 
@@ -385,15 +385,15 @@ A new model should be able to resume from status plus contracts without trusting
 | 9 | A — complete M5a inventory/jobs/recovery | ✅ Done | A01–A08 accepted 2026-11-13, including separate JobLock hardening; evidence in §34.7. |
 | 10 | B — M5b retention/protection/deletion | ✅ Done | B01–B06 accepted; eight PG16/17/18 matrices and destructive/race/crash gates pass (§40). |
 | 11 | H — M6 hardened CLI/systemd/Debian | ✅ Fixture scope | H01–H05 fixture foundations accepted (§41–§50); H05 committed 046c22e. Production compatibility remains a V gate. |
-| 12 | V — CLI production validation/release | 🔄 Current | V01 readiness validation/findings in §51; no production enablement. V02/V03 remain. |
-| 13 | P — M7 API/asynchronous service | ⬜ Todo | Requires hardened core and explicit decisions. |
+| 12 | V — production validation/release | 🔄 W1 verified; W2 next | W1 acceptance in §56; W2 compatibility contract/fixture proof completes the bounded API handoff (§55). Remaining V01, V02/V03 join integrated validation after UI; production disabled. |
+| 13 | P — M7 API/asynchronous service | ⏭️ Next | P01–P04 follow V01-W1/W2; full CLI release is not a prerequisite. Runtime/auth/worker decisions remain P01. |
 | 14 | U — M8 API-backed UI | ⬜ Todo | Requires stable API. |
-| 15 | F — platform validation/release | ⬜ Todo | Original M9 full-platform track. |
+| 15 | F — platform validation/release | ⬜ Todo | After API/UI: integrate remaining V01, V02/V03 and F01–F03; one shared release evidence set. |
 
-### ➡️ Current: #12 - V — V01 production readiness validation
-### ⏭️ Next: V01 blocker resolution, then V02 measurements and V03 release decision
+### ➡️ Current: #12 - V01-W2 — shared restore-plan compatibility contract and fixture proof
+### ⏭️ Next: #13 - P01 API contract → P02–P04 API → U01–U04 UI → integrated V/F release validation
 
-Task IDs below remain stable even if a phase is split into several commits. Complete dependent tasks in listed order. Independent documentation can proceed alongside its owning task; later feature coding waits for the phase prerequisites.
+Task IDs below remain stable even if a phase is split into several commits. The operator-approved §55 sequence governs remaining work: V01-W1/W2 → P → U → integrated V/F. V01-W1/W2 are bounded sub-gates of the existing V01 task. Full CLI release no longer blocks API development. Independent documentation can proceed alongside its owning task; dependent implementation waits for its stated prerequisites.
 
 ### Completed milestones M0–M4b: preserve this baseline
 
@@ -510,19 +510,19 @@ Prerequisites: B acceptance. Implement in reviewable increments; do not enable p
 
 Acceptance: tested Debian/Ubuntu install+upgrade+remove, dedicated-user timer creates signed backups without overlap or leaks, restore with recovery keys works, limits/errors/read-only modes match docs. Production-source enablement waits for V03.
 
-### V — CLI production validation and release
+### V — production validation and release
 
-Prerequisites: H plus all core acceptance gates; API/UI not required.
+Prerequisites: H plus the relevant core acceptance gates. Under §55 only V01-W1/W2 block P implementation. Remaining V01 acceptance and V02/V03 run with F after API/UI; no separate CLI-first release is required. V03 still controls production enablement.
 
 1. **V01 — content/security/failure matrix.** Run supported majors and privilege modes, full and supported selective restores, key loss/rotation, corruption, schema upgrades, restart/write/disk failure and target conflicts. Confirm compatibility/limits with recorded environments. Review custom crypto transcript/custody assumptions and dependencies; tests are evidence of behavior, not an independent cryptographic audit.
 2. **V02 — benchmarks and real recovery rehearsal.** Execute §24 sizes and validate restored rows/schema/security/sequence state. Measure snapshot age/restore time and load. Demonstrate off-host recovery only if an independent copy workflow is actually implemented/tested; otherwise retain the limitation.
 3. **V03 — release decision.** Resolve critical findings, choose license, publish SECURITY/CHANGELOG/support matrix and reproducible checksummed release. Enable production source configuration only in a separately reviewed change after these gates. Require signed encrypted writes for real data; refuse plaintext/unsigned production publication. Do not treat `--confirm-synthetic` as a production opt-out flag.
 
-Acceptance: CLI install/run/restore/retention/recovery meets the documented local product promise, no unsupported host-loss/PITR/RPO/RTO claim, and every untested/excluded capability is visible. Mark original M9 CLI track complete independently from M7/M8.
+Acceptance: CLI install/run/restore/retention/recovery meets the documented local product promise, no unsupported host-loss/PITR/RPO/RTO claim, and every untested/excluded capability is visible. Under §55, accept this core release evidence alongside the integrated web-product release, without a separate prerequisite CLI launch.
 
 ### P — M7 API and asynchronous jobs
 
-Prerequisites: hardened validated core; dependency/auth/worker decisions recorded.
+Prerequisites: accepted H/core baseline and V01-W1/W2 (§55), followed by P01 dependency/auth/worker decisions before API implementation. Completing V02/V03 or lifting the production guard is not a prerequisite. API development and acceptance remain fixture-only until the integrated release gate.
 
 1. **P01 — design contract.** Select framework/runtime; define OpenAPI, actors/permissions, safe errors, idempotency, token custody, TLS/deployment and queue/cancel ownership. Bound target authorization and destructive plan tokens to actor/request/expiry.
 2. **P02 — worker adapter.** Add bounded queue/workers invoking existing core, persisted accepted/running/terminal states with real writers, restart reconciliation and cancellation by process group. Do not insert runtime dependencies into pure domain/crypto just to host HTTP.
@@ -539,7 +539,7 @@ Acceptance: an operator can inspect verification, plan/confirm restore and monit
 
 ### F — Full-platform release
 
-Prerequisites: V/P/U accepted. F01 reruns end-to-end and package/migration/compatibility tests across all interfaces; F02 benchmarks actual worker concurrency and reviews API/UI security/operations; F03 performs final focused clean-code/doc review and publishes versioned platform release/support notes. Original M9 full-platform track closes here.
+Prerequisites: P/U accepted and a recorded disposition of remaining V01 findings. Under §55, F01 integrates remaining V01 content/security/failure and cross-interface package/migration/compatibility acceptance; F02 shares V02 dataset/recovery measurements and adds actual worker concurrency plus API/UI security/operations; F03 shares V03 license/security/support/release work and final focused clean-code/doc review. Evidence can satisfy both V and F when it tests the same promise; do not duplicate a whole gate solely for its task label. V03 production enablement is a separately reviewed final change after required evidence passes. Original M9 full-platform track closes only when V/P/U/F acceptance is complete.
 
 ## 27. Universal acceptance and Definition of Done
 
@@ -591,7 +591,7 @@ Before release: package/service permissions and process descendants tested; conf
 | Key loss/compromise or custom crypto assumption fails | Separate recovery custody, hybrid construction, versioned suite/independent review; no audit claim from passing tests. |
 | SQLite copy is inconsistent or silently corrupt | Consistent backup/quiescent copy, integrity check, staged rebuild; local index is not a witness. |
 | Host loss deletes all local copies | Explicit limitation; independent-copy subsystem before strong recovery claim. |
-| Roadmap overbuilds API/UI before usable CLI | V release before P/U; small concrete ports and no speculative worker framework. |
+| Roadmap delays the web product or duplicates its core | Two bounded shared-backend gates → existing-core API → API-only UI → integrated V/F; small concrete ports and a bounded worker tied to real operations. |
 
 ## 31. Future extensions
 
@@ -805,8 +805,8 @@ After R and C1 acceptance, execute existing §26 task IDs unchanged:
 | A / M5a | A01 modes/jobs CLI → A02 observational reconciliation → A03 rebuild/recovery → A04 digest-bound events/enrichment → A05 restore target/artifact ownership → A06 PG crash/migration drill → A07 leakage/transaction checks → A08 operating guide and close. Existing backup rows are delivered; implement their missing readers/recovery, not a second inventory. | All unknown/conflict/adoption rules and real ownership/crash/privacy gates pass. No deletion enabled. |
 | B / M5b | Only after A: B01 exact policy/plan → B02 protection → B03 saved plans → B04 confirmed marker-first execution → B05 local rollback warning → B06 retention drill and close. | Last-valid/protected/active/job-dependent exclusions, exact-set revalidation, interruption/tombstone tests and recovery prove deletion safety. |
 | H / M6 | Only after B: H01 production configuration policy → H02 remaining process/filesystem/service hardening → H03 package/timer → H04 CI/operating guide → H05 readability review. Preserve R fixes; do not reimplement them. | Actual supported package/service environments pass lifecycle, permissions, key custody and recovery checks. Synthetic guard remains until V03. |
-| V / CLI release | V01 supported matrix/security/failure review → V02 benchmarks/recovery rehearsal → V03 explicit release/production-source decision. | Release limits, license/security/support docs and measured recovery agree. API/UI are not prerequisites. |
-| P → U → F | Explicit API/auth/worker decisions, existing-core adapters, then API-only UI, then full-platform verification. | Interface tests cannot bypass core trust/confirmation/ownership gates; no platform completion before all prerequisites pass. |
+| V / shared backend and release | V01-W1/W2 → P/U; remaining V01 and V02/V03 integrate with F after UI (§55). | Backend handoff is bounded; production remains disabled until release limits, security/support and measured recovery agree at V03. |
+| P → U → integrated V/F | After V01-W1/W2: explicit API/auth/worker decisions and existing-core adapters → API-only UI → shared full-platform release verification. | No separate CLI launch gate; interface tests cannot bypass core trust/confirmation/ownership gates or V03 production approval. |
 
 Every handoff names the next exact task, affected symbols/files, tests executed and pending gates. Recheck current code/status rather than trusting a dated “done” sentence. A future issue discovered while refactoring becomes its own behavior correction with regression evidence.
 
@@ -2004,3 +2004,168 @@ release assurance: the catalog/DDL limits, two retained dependency maintenance
 warnings and remaining V01/V02/V03/T03 obligations still apply. Next logical work
 is versioned writable offline reads/retention dispatch, followed by production
 restore-plan bytes/context before a production writer.
+
+## 55. Web-first delivery and bounded backend handoff — 2026-11-17
+
+Operator explicitly selected: bound the remaining backend gaps, then prioritize
+API → UI → integrated release validation. This supersedes the earlier CLI-first
+sequencing in historical handoffs (§51–§54), not their acceptance evidence or safety
+contracts. Signed-family checkpoint **a0ab1d4** has verified parent c13f593, exact
+29 blobs/tree and clean checkout at commit. Subsequent README/log status explanations
+are documentation-only and uncommitted; this direction change does not commit them.
+
+### Exactly two shared-backend gates before API implementation
+
+| Gate | Bounded work | Acceptance and exit |
+|---|---|---|
+| V01-W1 | Implement versioned writable offline `backup list/inspect/verify` and retention `prune/delete` preview/run dispatch through existing services. | Allowed fixture/access combinations work; denied/public/inventory/reader combinations preserve the existing access policy; read-only mutation still refuses. Offline operations neither connect to PostgreSQL nor require its availability/passfile. Preserve protected paths, key custody, operation claims, authenticated reads, deletion/last-valid/protection rules, recovery and safe receipts. Cover v1/v2 artifacts and relevant positive/negative dispatch cases. No production enablement, new retention policy, new crypto or schema redesign. |
+| V01-W2 | Define the shared production restore-plan bytes/context compatibility contract needed by future CLI/API producers; prove its mapping to the existing fixture plan path. | Record canonical encoding/version strategy, source/maintenance endpoint identity, mode, target, archive/manifest binding, restore security/sections, expiry and confirmation/revalidation requirements; exclude credential contents. Preserve historical plan bytes/readers or explicitly version any necessary change. Demonstrate unchanged existing plan compatibility and refusal of changed bound context before target mutation using focused fixtures. If new bytes are necessary, require a real fixture producer/consumer and negative controls, not unused scaffolding. Production writer implementation/enablement is deferred to integrated V01/V03. API actor/request authorization is specified by P01 and enforced by P02/P03; W2 does not invent authenticated actors for the CLI. |
+
+These are two work packages with explicit exits, not a promise of two commits.
+Existing application services, signed-family v2 support, inventory schema8, H fixture
+hardening and package acceptance are the baseline. Do not reopen H02 or perform a
+new general refactor to reach P01. Reuse accepted evidence when affected bytes are
+unchanged; run focused tests for the changed operation and required regression gates.
+Do not rerun every native/package/crash matrix for documentation-only work.
+
+When W1/W2 acceptance is recorded, **start P01**, then P02–P04. No additional general
+backend phase may be inserted as an unstated prerequisite. A newly observed failure
+that directly prevents a planned API operation or breaks a safety invariant is a
+specific blocker: record its reproducer, affected operation, minimal fix and exit
+check in the owning W/P task. Unrelated improvements remain in the release backlog.
+P01 contract preparation may proceed alongside W1/W2; API runtime/routes/workers wait
+for the bounded handoff and recorded P01 decisions.
+
+### API, UI and integrated release handoffs
+
+| Stage | Deliverable | Ready for the next stage when |
+|---|---|---|
+| P01–P04 | API contract, bounded asynchronous worker adapter, authorized routes and operation-specific verification. | Core services are called directly, not through a CLI subprocess facade. P01 records runtime/dependencies, OpenAPI, authentication/token custody, actor permissions, actor/request-bound idempotency and destructive confirmation, queue/restart/cancellation and deployment boundary before dependent code. P04 proves cross-actor/expiry/replay refusals, safe partial receipts and API/core equivalence on synthetic fixtures. |
+| U01–U04 | API-backed operator UI for delivered health/artifact/job/profile/status and backup/restore/retention operations as selected in P01/U01. | Stable OpenAPI, explicit framework decision, server-enforced authorization and confirmations, no browser-held backup keys/DB credentials, accessible loading/error/partial states and browser-to-API restore acceptance. Configuration, schedule and key changes have UI controls only when their backend operations exist. |
+| Integrated V/F | Remaining V01 findings, V02/F02 performance and recovery rehearsal, V03/F03 release decision plus F01 end-to-end acceptance. | Supported content/security/migration/failure cases pass or are explicitly excluded from the product promise; representative measured restores validate data; CLI/API/UI/package behavior agrees; dependency maintenance findings are resolved or explicitly dispositioned; license/SECURITY/CHANGELOG/support and checksummed release are complete. Production capability requires its own reviewed implementation and final V03 enablement, with no API bypass. |
+
+Development remains synthetic/local and production-disabled through P/U. Initial
+PostgreSQL endpoint policy is unchanged; adding HTTP does not authorize remote DB
+connections, arbitrary native flags/paths, independent restore endpoints, overwrite,
+data-only fresh-target restore, new stores or multi-tenancy. No HTTP runtime/UI
+framework/dependency is selected by this roadmap edit. Security/authentication for
+the API itself must be implemented before exposing API operations beyond its stated
+P01 development boundary; fixture-only mode does not waive authorization tests.
+
+Deferred **until integrated release work**, rather than API-start blockers: broad
+remaining content/security support disposition, full V02 datasets/RTO measurements,
+CLI release paperwork, hosted CI execution, final package/release reruns and production
+writer implementation. A critical issue affecting the actual P/U fixture path must
+still be fixed in that path. Both existing unmaintained-dependency advisories and the
+future-Rust constraint remain visible; pinning the accepted toolchain is not a
+release exemption. T03 remains an explicit off-host/root-loss limitation; implementing
+an independent-copy/replay system is outside the initial web product unless separately
+authorized, and no host-loss guarantee may be advertised without it.
+
+**Current handoff:** W1 is implemented and verified in §56; W2 compatibility
+contract/fixture proof is next. Then P01 API contract → P02–P04 → U01–U04 → integrated
+V/F. API/UI remain unimplemented; the production guard is unchanged.
+
+| File Path | Change Type | Description |
+|---|---|---|
+| [project.md](project.md) | Surgical edits/appended | Reorder active roadmap/prerequisites, bind two backend exits and defer CLI-first release work to integrated V/F. |
+| [README.md](README.md) | Appended | Explain the approved web-first sequence and unchanged production gate. |
+| [session-log.md](session-log.md) | Appended | Record operator authorization, bounded work and verification. |
+
+## 56. V01-W1 writable offline dispatch — 2026-11-17
+
+Operator requested W1 implementation starting with precise dispatch rules. Inspection
+finds access.rs authorizes private roles but falls through to CAPABILITY_NOT_ENABLED;
+legacy backup reads reopen legacy key paths and legacy LocalRetention reloads reader
+keys from Config. Record [W1 contract](docs/development/v01-w1-offline-dispatch.md)
+before code: protected existing-root discovery, verifier-only signature, protected
+reader inspect/checksum/archive and retention; archive uses offline matching tools,
+all other paths are source/tool-free. Reuse services, bytes/policy/locks/receipts;
+carry the protected root/resource/key handles into retention rather than reopening
+paths. Keep production/read-only/access and snapshot boundaries unchanged. Final
+fast/V01/B06/snapshot gates are required; previous package evidence is retained.
+Implementation and verification pending; W2/API/UI remain next, no commit/push.
+
+### W1 implementation and acceptance — 2026-11-17
+
+**W1 is implemented and verified, uncommitted for review.** Versioned fixture
+writable backup list/inspect/verify and prune/delete preview/run now reach existing
+services through the new source-free offline adapter. Authorization/production and
+snapshot dispatch remain before this path. List explicitly selects signed discovery
+without keys; signature opens verifier-only custody; private commands use reader
+custody even from a writer config. Archive selects matching offline tools from the
+authenticated artifact major. No source, passfile or writer-only key path is projected
+into the service/report adapter. Existing-root opening and descriptor pinning,
+resource budgets, physical lock domain and cleanup are retained.
+
+LocalRetention keeps its historical constructor and behavior; a private shared
+implementation also accepts ProtectedRetention's owned, already-validated reader
+store. The protected path never reloads keys from legacy Config paths. Retention
+selection/plan encoding/schema8/expiry/marker-first deletion/receipt/recovery are
+unchanged. StoreKeys now represents verifier-only custody with an absent identity;
+all existing writer/reader constructors still supply their identity, and decryption
+requires it explicitly. Human preview text now correctly states that execution
+requires the saved plan/digest rather than claiming execution is unavailable.
+
+Acceptance: locked/offline fast gate passes **323 workspace tests**, strict Clippy,
+format, workflow/actionlint, reference/syntax/TOML/JSON and real CLI examples. Three
+native suites pass **PG16/17/18**: V01 content plus actual W1 v1/v2 offline checks,
+B06 destructive/race/crash retention and H02 non-root immutable snapshot/syscall
+regression. V01 explicitly stops the server, proves it unavailable, removes passfile/
+recipient/signer and then verifies writer-config/reader/source-free/tool-free paths,
+identity-free listing/signature, current archive events/audit suppression, tamper/
+unsafe key refusals, exact prune/delete, wrong digest/stale/protected/last-valid/
+active-lock refusal, receipt replay and independent tombstone/survivor checks.
+Historical old/new v1 restore and old-v2 refusal still pass on all majors.
+
+Each wrapper retains **178 inputs unchanged during its run**. Final V01 differs from
+the earlier fast/B06/snapshot records only in its own fixture script: explicit older
+snapshot acknowledgement after creating later W1 backups, and a persistent container
+parent so PostgreSQL can stop while offline CLI checks continue. No runtime changes
+followed fast/native acceptance. Final reference/syntax checks cover the corrected
+script. Evidence: target/ci-logs/{fast,native-v01_content_privileges,
+native-m5b_retention_drill,native-h02_snapshot_drill}{.log,-inputs.json},
+w1-final-freeze-inputs.json, w1-before-acknowledgement/w1-final-freeze-inputs.json,
+/tmp/parsbackup-w1-{fast,snapshot,retention-final,v01-stopped-source}.log and the final
+/tmp/parsbackup-w1-audit.py/.log audit. Earlier signed-family fast/content/snapshot
+records and package are preserved under checkpoint-family; package SHA256 remains
+af84a634aeee0f147fa948a4522f7c62c80cb2e615c466593b9059d9c237c989.
+
+Excluded attempts: initial compile caught two existing save-test calls needing the
+shared adapter; fixed before gates. A supplied family-capable baseline could not
+satisfy the historical v1-only reader refusal assertion; corrected invocation uses
+the retained c13f593 binary (SHA256 b6d32ad152654e00b72310d421bb2a23dcf8afbe0e5cc51e40ca958eee49b71a).
+An operator interruption ended V01/B06 runners; incomplete logs were retained and
+only their identified containers/temp directory removed before successful reruns.
+V01 fixture then correctly refused an unacknowledged older snapshot after later W1
+creates, and stopping PID1 ended its container (exit137). The fixture acknowledgement
+and container lifetime were corrected without weakening product guards or assertions.
+Failed/interrupted evidence remains under w1-wrong-baseline, w1-interrupted,
+w1-before-acknowledgement and w1-before-server-stop-fix. No failure is counted as a pass.
+
+No new package/hosted run, dependency/advisory scan, production writer/enablement,
+artifact/restore/deletion-plan/schema/controlled-flow/crypto change or push is claimed.
+Prior package evidence is retained, not called W1 package acceptance. Both maintenance
+advisories/future-Rust constraint and T03 remain visible release limitations. Current
+scope includes the already-authorized three-document web-first roadmap edits; those
+were preserved. W2 is the only remaining bounded backend handoff before P01, then
+API → UI → integrated V/F. Do not reopen general hardening or start W2 in this increment.
+
+| File Path | Change Type | Description |
+|---|---|---|
+| [offline.rs](crates/backupctl/src/offline.rs) | Added | Source-free protected writable dispatch and matching offline archive tools. |
+| [access.rs](crates/backupctl/src/access.rs), [main.rs](crates/backupctl/src/main.rs), [backup.rs](crates/backupctl/src/backup.rs) | Modified | Route the authorized commands, consume supplied handles and reuse reports/services. |
+| [custody.rs](crates/backup-local/src/custody.rs), [local lib.rs](crates/backup-local/src/lib.rs), [store.rs](crates/backup-local/src/store.rs), [scratch.rs](crates/backup-local/src/scratch.rs), [filesystem.rs](crates/backup-local/src/filesystem.rs) | Modified | Verifier-only writable custody, required decryption identity and existing fixture representation. |
+| [retention.rs](crates/backup-local/src/retention.rs) | Modified | Shared unchanged algorithm behind legacy and protected-handle adapters. |
+| [config_reports.rs](crates/backupctl/tests/config_reports.rs), [v01_content_privileges.sh](tests/v01_content_privileges.sh), [ci/check.py](ci/check.py) | Modified | Dispatch/custody/missing-resource and all-major actual offline/retention controls; contract references. |
+| [W1 contract](docs/development/v01-w1-offline-dispatch.md) | Added | Pre-code command/access/custody/evidence scope. |
+| [V01 validation](docs/development/v01-validation.md), [CLI reference](docs/operations/cli-reference.md), [recovery reference](docs/operations/recovery-reference.md) | Surgical edit/appended | Current availability, offline custody and audit/snapshot/recovery distinction. |
+| [README.md](README.md), [project.md](project.md), [session-log.md](session-log.md) | Surgical edits/appended | Preserve authorized web-first direction; record W1 implementation, acceptance and W2 handoff. |
+
+Final W1 audit passes **495 local reference targets/fragments**, 52 embedded Python
+blocks plus standalone/shell/maintainer syntax, real CLI examples, format/diff, exact
+20-file scope/HEADa0ab1d4/empty index, protected contract/schema/crypto/dependency/
+controlled-flow/deployment boundaries, source-bound gate records, retained package
+and append-only archive/log hashes, and scoped cleanup. Only README/project/log and
+the three operation/validation handoff docs changed after native acceptance. Evidence:
+/tmp/parsbackup-w1-audit.py/.log. W1 is verified/uncommitted; W2 is next.
