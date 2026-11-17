@@ -258,6 +258,7 @@ mod tests {
             exclude_tables: Vec::new(),
             dangling: Vec::new(),
             extension_members: vec!["hstore".to_string()],
+            table_family_edges: None,
         };
         let scope = ArtifactScope::from_profile(&profile, &resolved);
         assert_eq!(scope.requested_schemas, vec!["app".to_string()]);

@@ -26,14 +26,30 @@ struct Scene {
 }
 impl Scene {
     fn new(count: usize) -> Self {
+        Self::with_family(count, false)
+    }
+    fn with_family(count: usize, family: bool) -> Self {
         let base = temp_root("retention");
         let root = base.join("data");
         let keys = Keys::generate(&base.join("keys"));
-        let config = config(
+        let mut config = config(
             &root,
             Some((keys.identity.clone(), keys.recipient.clone())),
             Some(signing_block(&keys)),
         );
+        if family {
+            config.profiles.push(backup_domain::Profile {
+                name: "family".into(),
+                database: config.source.database.clone(),
+                mode: backup_domain::SelectionMode::SchemaAndData,
+                schemas: vec![],
+                tables: vec!["app.parent".into()],
+                exclude_schemas: vec![],
+                exclude_tables: vec![],
+                exclude_extensions: vec![],
+                large_objects: false,
+            });
+        }
         let mut scene = Self {
             base,
             config,
@@ -41,10 +57,23 @@ impl Scene {
             ids: vec![],
         };
         let capture = Capture::default();
+        if family {
+            capture
+                .selections
+                .borrow_mut()
+                .push(backup_domain::ResolvedSelection {
+                    tables: vec!["app.parent".into(), "aux.child".into()],
+                    table_family_edges: Some(vec![backup_domain::TableFamilyEdge {
+                        parent: "app.parent".into(),
+                        child: "aux.child".into(),
+                    }]),
+                    ..Default::default()
+                });
+        }
         for _ in 0..count {
             let Created::Signed { manifest, .. } =
                 BackupService::new(StubEngine { capture: &capture }, scene.writer())
-                    .create(&scene.config, None)
+                    .create(&scene.config, family.then_some("family"))
                     .unwrap()
             else {
                 panic!()
@@ -145,6 +174,38 @@ impl Drop for Scene {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.base);
     }
+}
+
+#[test]
+fn v2_family_artifacts_remain_authenticated_retention_candidates_and_witnesses() {
+    let s = Scene::with_family(3, true);
+    let retained = s.ids[0];
+    s.protect(retained, true);
+    let request = RetentionRequest::Prune {
+        keep_last: 1,
+        profile_fingerprint: profile_fingerprint("family"),
+    };
+    let preview = s.planner().preview(&request).unwrap();
+    assert_eq!(preview.candidates.len(), 2);
+    assert_eq!(preview.retained, [retained]);
+    let plan = s
+        .planner()
+        .check_saved_plan(
+            preview.plan_id.unwrap(),
+            RetentionOperation::Prune,
+            &preview.digest.unwrap(),
+        )
+        .unwrap();
+    assert_eq!(plan.candidates.len(), 2);
+    assert_eq!(plan.retained[0].backup_id, retained);
+    assert_eq!(s.inventory().schema_version().unwrap(), 8);
+    assert!(
+        s.inventory()
+            .artifacts()
+            .unwrap()
+            .iter()
+            .all(|r| r.shape == backup_inventory::Shape::V1Signed)
+    );
 }
 
 #[test]

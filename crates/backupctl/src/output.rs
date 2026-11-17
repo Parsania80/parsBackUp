@@ -460,8 +460,12 @@ fn diagnostic(error: &anyhow::Error) -> Option<&'static str> {
             "selection depends on an out-of-scope column type.",
         ),
         (
-            "unknown public.json format version 2",
-            "unknown public.json format version 2; this build accepts version 1.",
+            "unknown public.json format version 3",
+            "unknown public.json format version 3; this build accepts versions 1 and 2.",
+        ),
+        (
+            "disagree on format_version",
+            "signed manifest and public header disagree on format_version.",
         ),
         (
             "disagree on signature_suite",

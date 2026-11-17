@@ -91,6 +91,14 @@ verifying_key_file="/scene/keys/verifier"
         create('key','generate')
         created = create('backup','create','--confirm-synthetic')
         artifact_id = created['public']['backup_id']
+        assert created['public']['format_version'] == 1
+        execute(writer,'psql','-X','-U','postgres','-d','backupctl_fixture_snapshot',
+                '-v','ON_ERROR_STOP=1','-c',
+                "CREATE TABLE public.family(id integer) PARTITION BY RANGE(id); CREATE TABLE public.family_one PARTITION OF public.family FOR VALUES FROM (0) TO (10); INSERT INTO public.family VALUES(1);")
+        write(writer,'/scene/writer.toml',cfg+'\n[[profile]]\nname="family"\ndatabase="backupctl_fixture_snapshot"\ntables=["public.family"]\n')
+        family = create('backup','create','--profile','family','--confirm-synthetic')
+        family_id = family['public']['backup_id']
+        assert family['public']['format_version'] == 2
         for part in ('store','keys'):
             run(['docker','cp',f'{writer}:/scene/{part}',str(scene / part)])
         # Destroy the source server before launching the offline reader.
@@ -178,6 +186,12 @@ min_free_bytes=1048576
         cli('backup','inspect',artifact_id,error='ACCESS_DENIED')
         config(base)
         cli('backup','inspect',artifact_id)
+        family_manifest,_=cli('backup','inspect',family_id)
+        assert family_manifest['requested_selection']['tables'] == ['public.family']
+        assert family_manifest['resolved_selection']['tables'] == ['public.family','public.family_one']
+        for level in ('signature','checksum','archive'):
+            data,_=cli('backup','verify',family_id,'--level',level)
+            assert data['audit_recorded'] is False
         for level in ('signature','checksum','archive'):
             data,_=cli('backup','verify',artifact_id,'--level',level)
             assert data['audit_recorded'] is False
@@ -221,7 +235,7 @@ min_free_bytes=1048576
         cli('backup','verify',artifact_id,'--level','signature',error='DELETION_RECOVERY_REQUIRED')
         cli('backup','verify',artifact_id,'--level','checksum',error='DELETION_RECOVERY_REQUIRED')
         data,_=cli('backup','list')
-        assert not data['signed']
+        assert [h['backup_id'] for h in data['signed']] == [family_id]
         inventory.chmod(0o600); inventory.write_bytes(saved_inventory); inventory.chmod(0o400)
         payload=scene/'store/artifacts'/artifact_id/'payload.age'
         payload.chmod(0o600)

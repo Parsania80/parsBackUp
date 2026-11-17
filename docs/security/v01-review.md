@@ -385,3 +385,38 @@ Current pinned-toolchain builds pass; an eventual toolchain upgrade must address
 the macro incompatibility. Both maintenance advisories still require resolution or
 explicit V03 release disposition. This checkpoint adds no exemption or suppression
 and does not accept production readiness or independent cryptographic assurance.
+
+## Signed table-family scope boundary — 2026-11-17
+
+The [v2 family contract](../backup-format/manifest-v2-family.md) separates expanded
+scope semantics from frozen v1. Both versions use the same encrypted signed container:
+the signed manifest ciphertext digest authenticates the private version, original
+request and direct-edge graph. Header version remains untrusted until the existing
+public/private comparison. A supported header-version edit can pass signature level
+and must fail when the sealed manifest disagrees; unknown versions fail discovery.
+V1 retains literal-request validation and omits graph metadata; v2 requires bounded
+unique safe names, complete root reachability and an acyclic graph, consistent profile
+and exclusions. Offline checks establish internal consistency of the signer's catalog
+observation, not historical catalog truth or arbitrary dependency closure.
+
+No crypto implementation/suite/transcript/key change, dependency update, schema
+migration, restore-plan byte change or production enablement is part of this increment.
+Schema8's historical v1-signed label records the shared container facts; graph/version
+binding remains through the authenticated manifest digest. Re-resolution detects
+observed DDL changes but does not establish an atomic catalog/dump transaction or
+ABA-proof structural freeze. Avoid concurrent structural DDL for selective backups.
+Prior maintenance advisories/future-Rust constraint and wider V01/V03/T03 assurance
+limits remain. Final compatibility/native/package acceptance follows in project §54.
+
+Final signed-family acceptance passes 322 workspace tests/strict Clippy, four PG16–18
+native suites and both actual package targets, with all six wrappers preserving the
+same 176 inputs. Both-direction old/new v1 recovery, old-reader v2 refusal, invalid/
+omitted/unsafe/extension-owned scope controls, v2 rebuild/retention and non-root offline
+snapshot/source-loss recovery pass. Header-version claims remain untrusted until the
+manifest comparison; the new mismatch control pins that boundary. Package SHA256
+af84a634aeee0f147fa948a4522f7c62c80cb2e615c466593b9059d9c237c989. Detailed evidence,
+excluded preliminary/diagnostic/interrupted runs and limitations are in
+[the acceptance record](../../project.md#signed-table-family-compatibility-acceptance--2026-11-17).
+The identical Cargo.lock retains the prior recorded zero-vulnerability verdict and
+both maintenance advisories; no fresh advisory scan, suppression or broader release
+acceptance is claimed. Production remains disabled and the increment is uncommitted.

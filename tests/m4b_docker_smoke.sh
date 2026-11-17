@@ -727,10 +727,18 @@ PY
     rejects "an oversized public.json" ctl backup verify "$pair_a" --level signature
     grep -q "over the 4096 byte cap" "$test_root/reject.out"
     restore_a
-    edit_public "$dir_a" format_version 2 int
-    rejects "public.json claiming format version 2" ctl backup verify "$pair_a" \
+    edit_public "$dir_a" format_version 3 int
+    rejects "public.json claiming unknown format version 3" ctl backup verify "$pair_a" \
         --level signature
-    grep -q "unknown public.json format version 2" "$test_root/reject.out"
+    grep -q "unknown public.json format version 3" "$test_root/reject.out"
+    restore_a
+
+    # A supported version is still an untrusted header claim until the sealed
+    # manifest agrees. The signature covers ciphertext digests, not this field.
+    edit_public "$dir_a" format_version 2 int
+    ctl backup verify "$pair_a" --level signature > /dev/null
+    rejects "a v1 manifest under a v2 public header" ctl backup verify "$pair_a" --level checksum
+    grep -q "disagree on format_version" "$test_root/reject.out"
     restore_a
 
     # 6.11 the recorded suite downgraded to classical-only, in public.json and nowhere else.

@@ -272,14 +272,18 @@ pub(crate) fn sections_from(selected: &[Section]) -> RestoreSections {
 }
 
 pub(crate) fn selection_json(selection: &ResolvedSelection) -> serde_json::Value {
-    serde_json::json!({
+    let mut value = serde_json::json!({
         "whole_database": selection.whole_database,
         "resolved_schemas": selection.schemas,
         "resolved_tables": selection.tables,
         "excluded_schemas": selection.exclude_schemas,
         "excluded_tables": selection.exclude_tables,
         "extension_members": selection.extension_members,
-    })
+    });
+    if let Some(edges) = &selection.table_family_edges {
+        value["table_family_edges"] = serde_json::json!(edges);
+    }
+    value
 }
 
 /// A key file as an operator sees it in `--output json`: public facts only. The

@@ -155,6 +155,7 @@ fn manifest_with(
             exclude_tables: Vec::new(),
             dangling: Vec::new(),
             extension_members: Vec::new(),
+            table_family_edges: None,
         },
         archive_format: ARCHIVE_FORMAT.to_string(),
         compression: ARCHIVE_COMPRESSION.to_string(),

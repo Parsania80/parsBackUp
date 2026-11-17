@@ -59,3 +59,11 @@ Handled SIGINT/SIGTERM uses ordinary cleanup and failed jobs; hard loss can leav
 Rebuild is explicit and cannot invent lost verification, protection, operation or rollback history. Restoring an older snapshot is distinct from restoring an older inventory; retain original evidence rather than replacing an index to silence a refusal. A partial publication/database receipt describes possible effects, not proven rollback or durable completion. Keep partial target/artifact/roles for inspection and use a newly reviewed plan/target when another attempt is appropriate. No automation in this increment repairs or deletes them.
 
 V01 follow-up (2026-11-16): the selective-public collision has a narrow TOC-gated empty-schema preparation correction with local PG16–18 acceptance. Its positive and populated-template refusal evidence is recorded in the [V01 handoff](../../project.md#51-v01-production-readiness-validation--2026-11-16); earlier H03 observations above remain historical. Production readiness still has separate compatibility/security blockers.
+
+Expanded table-family artifacts use [scope format v2](../backup-format/manifest-v2-family.md)
+with the same signed container and key custody. Preserve their complete original
+bytes and use a v2-capable binary; an older reader explicitly refuses them. Updated
+readers retain v1 recovery. The existing authenticated manifest digest binds the
+family graph into restore plans; changing manifest bytes requires a new artifact and
+plan. Schema8's historical v1-signed inventory shape describes the shared file layout,
+not permission to use an old reader. Production recovery/plan policy remains gated.

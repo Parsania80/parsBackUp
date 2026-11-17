@@ -132,6 +132,7 @@ pub(crate) fn manifest_v1_fixture() -> ArtifactManifest {
             exclude_tables: Vec::new(),
             dangling: Vec::new(),
             extension_members: vec!["hstore".to_string()],
+            table_family_edges: None,
         },
         archive_format: ARCHIVE_FORMAT.to_string(),
         compression: ARCHIVE_COMPRESSION.to_string(),

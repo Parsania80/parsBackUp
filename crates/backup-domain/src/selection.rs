@@ -26,6 +26,21 @@ pub struct ResolvedSelection {
     /// Extensions owning objects inside the selection, recorded so a restore
     /// operator can see that member objects came from an extension.
     pub extension_members: Vec<String>,
+    /// Direct catalog links accounting for an expanded table request. Omitted for
+    /// literal selections so existing v1 manifest serialization stays unchanged.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_family_edges",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub table_family_edges: Option<Vec<crate::TableFamilyEdge>>,
+}
+
+// Absence is the v1 shape; explicit null is not an alias for absence.
+fn deserialize_family_edges<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Vec<crate::TableFamilyEdge>>, D::Error> {
+    Vec::deserialize(deserializer).map(Some)
 }
 
 impl ResolvedSelection {

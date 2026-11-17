@@ -1,6 +1,6 @@
 # PostgreSQL Backup Platform — Implementation Roadmap
 
-Latest implementation handoff: §53 (cryptography advisory remediation verified, 2026-11-16). V01 checkpoint is `5a1834b`; SQLite checkpoint `d90a3b4` is committed and remote push verified. The cryptography follow-up is uncommitted. H05 is committed as `046c22e`; H04 as `6a547e9`, H03 as `cb34f5e` and H02 fixture hardening as `3cc9326`. H fixture foundations are locally accepted; production compatibility/content/security validation and V02/V03 remain required. The historical 2026-10-03 rewrite was operator-authorized; historical results are distinct from current verification.
+Latest implementation handoff: §54 (V01 signed table-family compatibility verified and review accepted for local checkpoint, 2026-11-17). V01 checkpoint is `5a1834b`; SQLite checkpoint `d90a3b4` is committed and remote push verified. Cryptography checkpoint `c13f593` is committed locally. H05 is committed as `046c22e`; H04 as `6a547e9`, H03 as `cb34f5e` and H02 fixture hardening as `3cc9326`. H fixture foundations are locally accepted; production compatibility/content/security validation and V02/V03 remain required. The historical 2026-10-03 rewrite was operator-authorized; historical results are distinct from current verification.
 
 ## 1. Project vision and how to use this document
 
@@ -1835,3 +1835,172 @@ Preparing exact nine-file local commit with staged-blob/tree/parent/clean verifi
 operator retains GitHub Desktop push responsibility. Next is remaining V01
 signed-family/request compatibility, then missing versioned command/production-plan
 contracts; V01/V02/V03/T03 remain open and production stays disabled.
+
+## 54. V01 signed table-family compatibility — 2026-11-17
+
+Cryptography review checkpoint committed locally as **c13f593**, exact nine blobs/tree,
+parent d90a3b4 and clean checkout verified. Operator owns its Desktop push. Requested
+next: define signed partition-family compatibility contract, then implement it.
+Inspection confirms native family expansion conflicts with frozen v1's literal-request
+validation; changing v1 or falsifying the request is rejected. Selected bounded v2
+scope semantics with signed direct family edges; v1 remains the output for unchanged
+literal scopes. Explicit-child-only v1 profiles are compatible but do not solve the
+automatic-family feature. Contract and acceptance recorded before runtime edits in
+[signed table-family scope contract](docs/backup-format/manifest-v2-family.md).
+
+Keep cryptographic container/suites/transcripts, schema8, physical inventory shape,
+existing restore-plan bytes/context checks and production guard unchanged. New readers
+accept v1/v2 with separate scope rules; old readers explicitly refuse v2. Re-resolve
+expanded scope before publication to detect observed DDL changes without promising an
+atomic catalog/dump transaction. Crypto package and five CI evidence pairs preserved
+under ignored checkpoint-crypto, baseline CLI/hash under /tmp/parsbackup-family-*.
+Implementation and final fast/all-major legacy/signed/content/snapshot/package gates
+follow; no acceptance, commit or push claimed yet. Maintenance warnings remain V03 work.
+
+Implementation now adds optional-on-the-type/omitted-in-v1 family metadata, separate
+v2 graph/profile/exclusion validation, one-statement native relation/edge observation,
+pending-detach/unsafe-name refusal and post-dump re-resolution before publication.
+Only expanded scopes select version2; header/manifest versions must agree. Human
+reports show actual versions and expanded dry-run JSON includes direct edges.
+Schema8/physical inventory shape and authenticated-manifest-bound restore/deletion
+plans retain their existing bytes. Domain graph/refusal and composed publication/
+changed-scope/rebuild tests pass; a v2 retention candidate/retained-witness regression
+passes under unchanged schema8. Strict locked/offline Clippy preflight passes.
+
+Preliminary native setup failed three times before family writing: writable versioned
+offline dispatch is intentionally unavailable, then scratch overlapped the key-parent
+tree, then snapshot root overlapped that same key-parent tree. Stopped piecemeal retries,
+read actual snapshot custody code and changed the fixture to the established separated
+key/store/external-scratch layout, with a config/mode precheck. No product guard or
+assertion was weakened. Next run reached actual old/new v1 restore and v2 partition/
+schema-only/inheritance recovery, then synthetic extra-table setup lacked CREATE on
+the app schema after the security fixture transferred its ownership to Alice. An
+explicit fixture-only grant corrects that setup. Failed logs remain under
+/tmp/parsbackup-family-v01-{initial,snapshot,external,separated-layout}.log; they are
+not acceptance evidence. Unit setup compile omissions and held-reader rebuild refusal
+are likewise excluded; the reader is released before testing maintenance exclusion.
+Final source freeze and full contracted gates follow after the preliminary matrix.
+
+The preliminary native program subsequently passed all three majors, including both
+directions of actual v1 cross-build recovery, explicit old-reader v2 refusal and v2
+family/source-loss recovery. Its outer shell then failed because the running script
+had been edited during that preliminary run; it is excluded from final acceptance.
+No such edits are allowed during the final frozen-input wrappers. Pre-freeze review
+also corrected extension dependency probing to include actual membership type e as
+well as automatic dependency x (primary pg_depend contract), with a native extension-
+owned family no-publication control. No dependency/schema/crypto change is involved.
+
+First frozen fast gate passed322 tests/strict Clippy and V01/M3 passed all majors,
+each preserving176 inputs. M4b then stopped at its new unknown-version3 diagnostic
+assertion. An external ERR trap (no source edits) identified line733: reader refusal
+was correct but the safe-message catalogue still recognized only unknown version2,
+so it returned the generic safe refusal. No validation gap. Before changing code,
+selected the narrow reporting correction: recognize version3 statically and add the
+static public/private format-version disagreement message used by the new tamper
+control. Both are literal safe text, not interpolated input. Failed/diagnostic logs
+and input record retained under /tmp/parsbackup-family-m4b-*. A fresh freeze and final
+gates follow this reporter correction; earlier gate records are superseded.
+
+### Signed table-family compatibility acceptance — 2026-11-17
+
+**The signed-family request/resolution gap is resolved within the new contract.**
+Expanded table requests now publish format2 with their original profile/request and
+signed direct parent/child links; whole-database, schema and literal table scopes
+remain format1, with the old serialization and literal-scope refusal retained. Both
+public/private versions must agree. Old binaries explicitly refuse format2; new
+readers recover old v1 artifacts. Existing crypto/container transcripts, dependencies,
+schema8, physical inventory shape, restore/deletion-plan bytes and production guard
+are unchanged. The native extension lookup now includes actual membership e as well
+as automatic dependency x, so expanded extension-owned families cannot be silently
+omitted by the dump. No advisory ignore or new dependency was added.
+
+| Gate | Accepted final evidence |
+|---|---|
+| fast | **322 workspace tests**, strict locked/offline Clippy, formatting, all three workflows semantically linted, reference/script syntax and two real CLI report envelopes. Graph invalidity/version/profile/exclusion controls, publication/observed-scope-change refusal, v2 rebuild and authenticated retention candidate/retained-witness behavior pass. |
+| v01_content_privileges | PG16.15/17.11/18.6 with matching clients: signed partition and ordinary/multiple inheritance families; overlapping roots; multilevel cross-schema descendants; schema-only recovery; independent rows/parent links/unrelated-table absence; original request/graph inspect; literal v1; child-only/excluded/unsafe/extension-owned no-publication controls; key-free reconcile/inventory and reader-only v2 recovery after source loss. Existing content/privilege/public-schema/refusal tests also pass. |
+| Cross-build controls in V01 | Actual preserved c13f593 CLI creates v1 for new-reader recovery; new v1 restores through the old CLI. Inspected v1 facts agree, no family field is added and stored artifact hashes remain identical. Old CLI refuses new v2 signature/inspect paths without changing stored bytes. All three majors pass; baseline CLI SHA256 b6d32ad152654e00b72310d421bb2a23dcf8afbe0e5cc51e40ca958eee49b71a. |
+| m3_docker_smoke | PG16/17/18 legacy selective scope, family expansion, dangling/large-object/extension refusals, section-limited and full native restore, TOC binding. |
+| m4b_docker_smoke | PG16/17/18 v1 publication/verification boundaries, existing forgery and reader-key DR/source-binding controls, plus supported-header2/private-manifest1 mismatch refusal after signature level and unknown-header3 refusal. Existing rage locale warnings remain visible. |
+| h02_snapshot_drill | PG16/17/18 non-root read-only media containing both v1 and v2, source destroyed first; signature/checksum/archive/inspect with reader keys, immutable store/inventory metadata, no network, external scratch cleanup/limits, custody/tamper/tombstone controls and syscall audit. |
+| package | Ubuntu-built locked/offline release and identical repeat archive; lifecycle without a system manager; identical package on actual Ubuntu24.04/systemd255/glibc2.39/PG16 and Debian13/systemd257/glibc2.41/PG17. Both managers pass installation/reconfiguration/reinstallation/upgrade/removal/purge, custody/sandbox/timer/manual overlap/v7 migration/graceful cancellation/three escaped-session hard stops and reader-only lost-source recovery. |
+
+These are **four native suites / twelve script-major combinations**, fast and package.
+All **six final wrappers preserve the same 176 source inputs**; only the five handoff
+documents named below change afterward. No runtime/test/contract change follows final
+acceptance. The multi-suite runner ended143 during its last M3 run without an assertion
+failure; cause is unconfirmed. Its incomplete log/input record is retained, its exact
+container/directory cleaned, and a fresh standalone M3 wrapper passes all majors on
+the same frozen inputs. That interruption and all earlier fixture/reporter diagnostic
+runs are excluded from acceptance. No assertion or validation was relaxed.
+
+Package SHA256 **af84a634aeee0f147fa948a4522f7c62c80cb2e615c466593b9059d9c237c989**;
+the previous crypto package/evidence remains under checkpoint-crypto at SHA256
+87b09cdafcaa3a9f7071b119c5538ee41cb82f65acbf6394212c9610d7d7f35e; SQLite/V01/H05
+packages/evidence remain retained. Compiler/package-tool warnings are visible. Shared
+host kernel and repeat-archive rather than independent Rust-build reproducibility
+limits remain. Unrelated SQLite/retention crash matrices were retained, not rerun.
+The prior crypto audit still binds the identical lockfile: zero vulnerabilities in
+that recorded scan, both unmaintained advisories and future-Rust constraint remain;
+no newly fetched advisory scan or independent cryptographic assurance is claimed.
+
+### Signed-family files changed
+
+| File Path | Change Type | Description |
+|---|---|---|
+| [docs/backup-format/manifest-v2-family.md](docs/backup-format/manifest-v2-family.md) | Added | Pre-code version/scope/container/inventory/plan compatibility contract and acceptance. |
+| [artifact_v1.rs](crates/backup-domain/src/artifact_v1.rs), [selection.rs](crates/backup-domain/src/selection.rs), [table_family.rs](crates/backup-domain/src/table_family.rs), [protocol.rs](crates/backup-domain/src/protocol.rs), [domain lib.rs](crates/backup-domain/src/lib.rs) | Modified/added | Separate v1/v2 validation, omitted-in-v1 metadata, bounded DAG/root completeness and additive version/edge constants. |
+| [artifact.rs](crates/backup-domain/src/artifact.rs), [fixture.rs](crates/backup-domain/src/fixture.rs) | Test fixtures modified | Existing v1 fixtures explicitly omit new metadata. |
+| [application lib.rs](crates/backup-application/src/lib.rs), [PostgreSQL lib.rs](crates/backup-postgres/src/lib.rs) | Modified | Select v2 for expanded scopes, re-resolve before publication, observe native graph and refuse unsupported observations/extension ownership. |
+| [cli.rs](crates/backupctl/src/cli.rs), [report.rs](crates/backupctl/src/report.rs), [output.rs](crates/backupctl/src/output.rs) | Modified | Expanded dry-run graph, actual artifact version and safe static unknown/mismatched-version diagnostics. |
+| [inventory artifact.rs](crates/backup-inventory/src/artifact.rs) | Comment only | Explain the existing shared physical container shape; stored values and schema remain unchanged. |
+| [common/mod.rs](crates/backup-local/tests/common/mod.rs), [retention.rs](crates/backup-local/tests/retention.rs), [signed_store.rs](crates/backup-local/tests/signed_store.rs), [signed_write_path.rs](crates/backup-local/tests/signed_write_path.rs) | Tests modified | V1 fixture compatibility, v2 publication/change/rebuild and authenticated retention behavior. |
+| [v01_content_privileges.sh](tests/v01_content_privileges.sh), [m4b_docker_smoke.sh](tests/m4b_docker_smoke.sh), [h02_snapshot_drill.sh](tests/h02_snapshot_drill.sh), [ci/check.py](ci/check.py) | Tests/checks modified | Actual family/cross-build/recovery/refusal and read-only acceptance; new contract link audit. |
+| [v01-validation.md](docs/development/v01-validation.md), [cli-reference.md](docs/operations/cli-reference.md), [recovery-reference.md](docs/operations/recovery-reference.md), [security review](docs/security/v01-review.md), [README.md](README.md), [project.md](project.md), [session-log.md](session-log.md) | Appended/surgical edits | Compatibility/support limits, acceptance, exact evidence and handoff. |
+
+Pre-handoff audit passes exact **29-file scope**, unchanged protected v1/crypto/
+dependency/schema/plan/access/controlled-document boundaries, all six176-input records,
+source/baseline/package/archive hashes, append-only log, syntax/references/format/diff
+and scoped cleanup. Evidence: target/ci-logs/family-final-freeze-inputs.json, the six
+canonical CI/input pairs, prior records in family-before-report-correction and
+checkpoint-crypto, /tmp/parsbackup-family-{fast,m3_docker_smoke,m4b_docker_smoke,
+h02_snapshot_drill,v01_content_privileges,package}.log, baseline and final-audit files.
+Post-test handoff changes are limited to README/project/log/security review and V01
+validation status; final audit follows those edits.
+
+This **verified 29-file increment remains uncommitted** on c13f593 for review. Next
+review/commit it, then implement the still-unavailable versioned writable offline
+reads/retention dispatch and define production restore-plan bytes/context before
+adding a production writer. V01 remaining content/security, V02/V03/T03 remain open;
+production stays disabled. No frozen v1/operating-flow rewrite, push, host deployment
+or hosted-green claim. The signed graph is a catalog observation, and post-dump
+re-resolution is not an atomic or ABA-proof structural DDL freeze.
+
+Final handoff audit passes **463 local reference targets/fragments**, 52 embedded
+Python blocks plus standalone/shell/maintainer syntax, format/diff, exact29-file scope/
+HEADc13f593/empty index, all six176-input manifests with only the five stated handoff
+documents changed, protected v1/crypto/dependency/schema/plan/access/controlled-doc
+boundaries, baseline/new/prior package/archive hashes, append-only log and scoped
+cleanup. Evidence: /tmp/parsbackup-family-final-audit.py/.log. No runtime/test/contract
+change follows acceptance. The signed-family increment is verified/uncommitted for
+review; remaining release obligations and the production guard are unchanged.
+
+### Signed-family checkpoint review — 2026-11-17
+
+Operator requested review and local commit of this verified checkpoint. Review
+finds no blocking issue in v1 strictness/serialization, v2 graph/profile/exclusion
+validation, native catalog bounds/detach/extension refusals, observed post-dump
+change handling, authenticated reader/version behavior or unchanged schema/plan/
+crypto boundaries. No implementation changes were needed during review. The final
+audit was rerun against all 29 paths and retained six 176-input verification records:
+322 tests, four PG16/17/18 native suites and both-target package evidence remain
+applicable. Heavy gates were not rerun; source/test/contract bytes are unchanged.
+
+This review accepts the increment for the operator-authorized local checkpoint;
+Git history supplies its commit identity. Prior uncommitted statements above
+describe the implementation handoff. Review updates only README/project/log, then
+rechecks documentation, exact staged blobs/tree and clean checkout after commit.
+Push remains the operator's GitHub Desktop action. No production enablement or
+release assurance: the catalog/DDL limits, two retained dependency maintenance
+warnings and remaining V01/V02/V03/T03 obligations still apply. Next logical work
+is versioned writable offline reads/retention dispatch, followed by production
+restore-plan bytes/context before a production writer.

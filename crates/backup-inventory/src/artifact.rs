@@ -120,7 +120,8 @@ fn row_size(row: &Row<'_>, column: &str) -> Result<Option<u64>> {
 /// fields must be present; the other two have no such file, so their discovery fields must not be.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Shape {
-    /// Artifact v1: signed, `public.json` present, payload and manifest sealed.
+    /// Historical name for the signed container layout: scope versions 1 and 2
+    /// share these files/discovery facts; their semantics are the reader's job.
     V1Signed,
     /// M4a: age-sealed payload and manifest, no signature and no discovery record.
     AgeUnsigned,

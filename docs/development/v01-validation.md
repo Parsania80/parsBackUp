@@ -66,3 +66,12 @@ support/release decision, T03 off-host replay limitation and hosted CI execution
 separate. No push, deployment, production mode bypass or controlled-flow change.
 
 Inspection follow-up: native partition-family dump/resolution succeeds, but frozen artifact v1 refuses expanded children absent from the literal request. The matrix records this no-publication readiness blocker; full-database partition recovery is tested separately. No v1 validation relaxation or requested-selection falsification is authorized here.
+
+Authorized follow-up on 2026-11-17: [signed table-family scope v2](../backup-format/manifest-v2-family.md)
+defines separate expanded-scope semantics while preserving the frozen v1 rules and
+the original user request. Its implementation replaces the historical expected
+family refusal above with actual signed all-major family recovery and old/new reader
+controls. Final acceptance is recorded in [project §54](../../project.md#signed-table-family-compatibility-acceptance--2026-11-17):
+322 workspace tests, four PG16–18 native suites and both package targets pass on
+unchanged inputs. This closes the signed-family mismatch within the v2 contract;
+the remaining production command/plan/content/security obligations stay open.

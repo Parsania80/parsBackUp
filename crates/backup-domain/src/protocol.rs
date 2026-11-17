@@ -67,6 +67,12 @@ pub const MAX_RESOLVED_TABLES: usize = 512;
 /// The only `format_version` a v1 artifact may state. A reader rejects an unknown major
 /// version rather than parsing fields it does not understand.
 pub const ARTIFACT_FORMAT_VERSION: u32 = 1;
+/// Expanded table families use distinct scope semantics; literal scopes remain v1.
+pub const TABLE_FAMILY_FORMAT_VERSION: u32 = 2;
+pub const READABLE_ARTIFACT_FORMAT_VERSIONS: &[u32] =
+    &[ARTIFACT_FORMAT_VERSION, TABLE_FAMILY_FORMAT_VERSION];
+/// Bound multiple-inheritance metadata independently of the relation argv limit.
+pub const MAX_TABLE_FAMILY_EDGES: usize = 4096;
 /// The manifest's `engine` value. Only PostgreSQL is dumped or restored.
 pub const ENGINE_POSTGRESQL: &str = "postgresql";
 /// The manifest's `subscription_policy`: `pg_dump --no-subscriptions` is always passed,

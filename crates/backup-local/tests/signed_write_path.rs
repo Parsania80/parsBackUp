@@ -10,8 +10,8 @@
 mod common;
 
 use backup_application::{
-    ArtifactStore, BackupService, Created, Inventory, Record, RestoreService, VerifyService,
-    WriteOptions,
+    ArtifactStore, BackupService, Created, Inventory, Record, RestoreService, SignedArtifactHandle,
+    VerifyService, WriteOptions,
 };
 use backup_crypto::protocol::{HYBRID_SIGNATURE_BYTES, SUITE_HYBRID};
 use backup_domain::{
@@ -37,6 +37,79 @@ use uuid::Uuid;
 
 const SOURCE_DATABASE: &str = "backupctl_fixture_m4b";
 const DR_TARGET: &str = "backupctl_fixture_m4b_dr";
+
+#[test]
+fn family_publication_uses_v2_and_observed_scope_change_publishes_nothing() {
+    use backup_domain::{Profile, ResolvedSelection, SelectionMode, TableFamilyEdge};
+    for changed in [false, true] {
+        let capture = Capture::default();
+        let fixture = write_signed(&capture);
+        let mut config = fixture.config.clone();
+        config.export_globals = false;
+        config.profiles.push(Profile {
+            name: "family".into(),
+            database: SOURCE_DATABASE.into(),
+            mode: SelectionMode::SchemaAndData,
+            schemas: vec![],
+            tables: vec!["app.parent".into()],
+            exclude_schemas: vec![],
+            exclude_tables: vec![],
+            exclude_extensions: vec![],
+            large_objects: false,
+        });
+        let first = ResolvedSelection {
+            tables: vec!["app.parent".into(), "aux.child".into()],
+            table_family_edges: Some(vec![TableFamilyEdge {
+                parent: "app.parent".into(),
+                child: "aux.child".into(),
+            }]),
+            ..Default::default()
+        };
+        let mut second = first.clone();
+        if changed {
+            second.tables.push("aux.new_child".into());
+        }
+        *capture.selections.borrow_mut() = vec![first.clone(), second];
+        let result = BackupService::new(StubEngine { capture: &capture }, fixture.writer())
+            .create(&config, Some("family"));
+        if changed {
+            assert!(failure(result).contains("table-family scope changed during dump"));
+            assert_eq!(
+                fs::read_dir(fixture.store_root.join("artifacts"))
+                    .unwrap()
+                    .count(),
+                1
+            );
+            let inventory = backup_inventory::Inventory::open_read_only_bound(
+                &fixture.store_root.join(INVENTORY_FILE),
+            )
+            .unwrap();
+            assert_eq!(
+                inventory
+                    .jobs()
+                    .unwrap()
+                    .iter()
+                    .filter(|j| j.state == JobState::Failed)
+                    .count(),
+                1
+            );
+        } else {
+            let Created::Signed { header, manifest } = result.unwrap() else {
+                panic!("signed family");
+            };
+            assert_eq!(header.format_version, 2);
+            assert_eq!(manifest.requested_selection.tables, ["app.parent"]);
+            assert_eq!(manifest.resolved_selection, first);
+            let opened = fixture.reader().open_signed(header.backup_id).unwrap();
+            assert_eq!(opened.manifest().resolved_selection, first);
+            drop(opened);
+            rebuild_fixture(&fixture);
+            let opened = fixture.reader().open_signed(header.backup_id).unwrap();
+            assert_eq!(opened.manifest().format_version, 2);
+        }
+        fixture.remove();
+    }
+}
 
 fn rebuild_fixture(fixture: &Fixture) {
     let scanner = backup_local::LocalReconciler(fixture.store_root.clone());

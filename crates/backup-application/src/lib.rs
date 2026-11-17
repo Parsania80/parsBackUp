@@ -17,9 +17,9 @@ use backup_domain::{
     ArtifactScope, BACKUP_STATUS, Config, DEV_FORMAT, DevelopmentManifest, DumpOptions,
     ENGINE_POSTGRESQL, GLOBALS_POLICY_EXPORTED, GLOBALS_POLICY_SKIPPED, Profile, PublicHeader,
     RequestedSelection, ResolvedSelection, RestorePlan, RestoreSections, RestoreSecurityPolicy,
-    SUBSCRIPTION_POLICY_DROPPED, SelectionMode, Source, VERIFICATION_NONE, VERIFY_ARCHIVE,
-    VERIFY_CHECKSUM, VERIFY_RESTORE_TESTED, VERIFY_SIGNATURE, WHOLE_DATABASE_PROFILE, format_utc,
-    source_fingerprint,
+    SUBSCRIPTION_POLICY_DROPPED, SelectionMode, Source, TABLE_FAMILY_FORMAT_VERSION,
+    VERIFICATION_NONE, VERIFY_ARCHIVE, VERIFY_CHECKSUM, VERIFY_RESTORE_TESTED, VERIFY_SIGNATURE,
+    WHOLE_DATABASE_PROFILE, format_utc, source_fingerprint,
 };
 use sha2::Digest as _;
 use std::io::{self, Read, Write};
@@ -681,6 +681,18 @@ impl<E: DatabaseAdapter, S: ArtifactStore> BackupService<E, S> {
                 .inspect_archive(&config.source, inspected.path(), timeout)
                 .context("PostgreSQL archive inspection failed; artifact was not published")?;
             let toc_sha256 = toc_digest(&toc)?;
+            // Resolution and pg_dump use separate connections. Refuse an observed
+            // family DDL change rather than signing a stale catalog observation.
+            if resolved.table_family_edges.is_some() {
+                let current = self.engine.resolve_selection(
+                    &config.source,
+                    profile.context("table-family scope requires a profile")?,
+                    timeout,
+                )?;
+                if current != resolved {
+                    bail!("table-family scope changed during dump; artifact was not published");
+                }
+            }
             let (size_bytes, sha256) = self.store.measure(&stage)?;
             let mut globals_sha256 = None;
             let mut globals_size_bytes = None;
@@ -725,7 +737,11 @@ impl<E: DatabaseAdapter, S: ArtifactStore> BackupService<E, S> {
                     None => whole_database_profile(&config.source),
                 };
                 let manifest = ArtifactManifest {
-                    format_version: ARTIFACT_FORMAT_VERSION,
+                    format_version: if resolved.table_family_edges.is_none() {
+                        ARTIFACT_FORMAT_VERSION
+                    } else {
+                        TABLE_FAMILY_FORMAT_VERSION
+                    },
                     backup_id: id,
                     engine: ENGINE_POSTGRESQL.to_string(),
                     source_server_major: info.source_major,

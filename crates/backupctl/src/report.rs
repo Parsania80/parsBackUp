@@ -169,7 +169,10 @@ fn print_development_created(manifest: &DevelopmentManifest) {
 /// here is a claim the operator's own key has now attested to — including the two id
 /// fingerprints, which name the keys an artifact can be opened and trusted by.
 fn print_signed_created(manifest: &ArtifactManifest) {
-    println!("created signed artifact v1 {}", manifest.backup_id);
+    println!(
+        "created signed artifact v{} {}",
+        manifest.format_version, manifest.backup_id
+    );
     println!("source database: {}", manifest.profile_snapshot.database);
     println!("profile: {}", manifest.profile_snapshot.name);
     println!(
@@ -255,7 +258,7 @@ fn print_development_inspect(manifest: &DevelopmentManifest) {
 
 fn print_signed_inspect(manifest: &ArtifactManifest) {
     println!("id: {}", manifest.backup_id);
-    println!("format: signed artifact v1");
+    println!("format: signed artifact v{}", manifest.format_version);
     println!(
         "engine: {} major {}",
         manifest.engine, manifest.source_server_major
@@ -337,8 +340,11 @@ pub(crate) fn print_inventory(inventory: &Inventory) {
         Inventory::Public(listing) => {
             for header in &listing.signed {
                 println!(
-                    "{}  {} bytes  signed v1 (signer {})",
-                    header.backup_id, header.payload_ciphertext_bytes, header.signer_id
+                    "{}  {} bytes  signed v{} (signer {})",
+                    header.backup_id,
+                    header.payload_ciphertext_bytes,
+                    header.format_version,
+                    header.signer_id
                 );
             }
             for id in &listing.unsigned {

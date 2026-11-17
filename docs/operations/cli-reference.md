@@ -112,3 +112,15 @@ Create/restore receipts carry actual job_id (nullable for alternate library adap
 Safe generated messages/codes are owned by the [reporter](../../crates/backupctl/src/output.rs); do not parse human phrasing or assume every code above exhausts all operation-specific failures.
 
 V01 follow-up (2026-11-16): the selective-public collision has a narrow TOC-gated empty-schema preparation correction with local PG16–18 acceptance. Its positive and populated-template refusal evidence is recorded in the [V01 handoff](../../project.md#51-v01-production-readiness-validation--2026-11-16); earlier H03 observations above remain historical. Production readiness still has separate compatibility/security blockers.
+
+V01 table-family compatibility (2026-11-17): a signed table request that expands to
+partition/inheritance descendants writes [scope format v2](../backup-format/manifest-v2-family.md).
+The original request stays intact; inspect/dry-run JSON includes the resolved direct
+parent/child links. Literal table, schema and whole-database scopes continue writing
+v1. Human create/inspect/list output reports each artifact's actual version. Older
+binaries cannot read v2; use the updated binary for that store. Keep structural DDL
+quiet during selective backups; an observed family change before publication refuses
+the write, without promising an atomic catalog/dump transaction. Versioned offline
+reads still use read_only snapshot mode with external scratch; writable offline and
+retention dispatch remain separate release work. Verification acceptance is recorded
+in the [current handoff](../../project.md#54-v01-signed-table-family-compatibility--2026-11-17).

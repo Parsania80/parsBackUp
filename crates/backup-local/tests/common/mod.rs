@@ -38,6 +38,8 @@ pub struct Capture {
     created: RefCell<Vec<String>>,
     pub target_exists: std::cell::Cell<bool>,
     pub globals_applied: std::cell::Cell<usize>,
+    /// Optional catalog observations for selective-backup/re-resolution tests.
+    pub selections: RefCell<Vec<ResolvedSelection>>,
     /// Fired once, from the first byte a dump's stream is actually read.
     ///
     /// That instant is the point. It is mid-dump, on a real `backup create`, with no SQL
@@ -113,7 +115,16 @@ impl DatabaseAdapter for StubEngine<'_> {
         _profile: &Profile,
         _timeout: Duration,
     ) -> Result<ResolvedSelection> {
-        unreachable!("these tests name no profile");
+        let mut selections = self.capture.selections.borrow_mut();
+        assert!(
+            !selections.is_empty(),
+            "profile tests supply catalog observations"
+        );
+        Ok(if selections.len() == 1 {
+            selections[0].clone()
+        } else {
+            selections.remove(0)
+        })
     }
 
     fn dump_stream(

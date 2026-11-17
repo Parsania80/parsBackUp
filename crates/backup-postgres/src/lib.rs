@@ -33,8 +33,9 @@ use crate::tools::{
 use anyhow::{Context, Result, bail};
 use backup_application::{DatabaseAdapter, EngineInfo};
 use backup_domain::{
-    DanglingReference, DumpOptions, MAX_RESOLVED_TABLES, Profile, ResolvedSelection,
-    RestoreSections, RestoreSecurityPolicy, SUPPORTED_MAJOR_RANGE, SUPPORTED_MAJORS, Source,
+    DanglingReference, DumpOptions, MAX_RESOLVED_TABLES, MAX_TABLE_FAMILY_EDGES, Profile,
+    ResolvedSelection, RestoreSections, RestoreSecurityPolicy, SUPPORTED_MAJOR_RANGE,
+    SUPPORTED_MAJORS, Source, TableFamilyEdge,
 };
 use std::fs;
 use std::io::Read;
@@ -217,9 +218,8 @@ impl DatabaseAdapter for PostgresAdapter {
                     missing.join(", ")
                 );
             }
-            // Expand partition and inheritance families here instead of asking
-            // pg_dump to do it, so the recorded scope and the requested scope
-            // are literally the same list of names.
+            // Read relations and direct edges in one catalog snapshot. pg_dump
+            // receives this exact list; the original profile stays untouched.
             let expanded = self.query_column(
                 source,
                 &format!(
@@ -230,21 +230,61 @@ impl DatabaseAdapter for PostgresAdapter {
                      family AS (SELECT oid FROM roots \
                         UNION SELECT i.inhrelid FROM pg_catalog.pg_inherits i \
                         JOIN family f ON f.oid = i.inhparent) \
-                     SELECT n.nspname || '.' || c.relname FROM pg_catalog.pg_class c \
+                     , named AS (SELECT c.oid, n.nspname || '.' || c.relname AS name \
+                     FROM pg_catalog.pg_class c \
                      JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
-                     JOIN family f ON f.oid = c.oid ORDER BY 1",
-                    value_pairs(&profile.tables)
+                     JOIN family f ON f.oid = c.oid) \
+                     SELECT json_build_array('table', name)::text FROM named \
+                     UNION ALL \
+                     SELECT json_build_array('edge', p.name, c.name)::text \
+                     FROM pg_catalog.pg_inherits i \
+                     JOIN named p ON p.oid = i.inhparent JOIN named c ON c.oid = i.inhrelid \
+                     UNION ALL \
+                     SELECT json_build_array('detaching')::text \
+                     FROM pg_catalog.pg_inherits i WHERE i.inhdetachpending \
+                     AND (i.inhrelid IN (SELECT oid FROM family) \
+                          OR i.inhparent IN (SELECT oid FROM family)) \
+                     LIMIT {}",
+                    value_pairs(&profile.tables),
+                    MAX_RESOLVED_TABLES + MAX_TABLE_FAMILY_EDGES + 2
                 ),
                 timeout,
                 "expand partition and inheritance families",
             )?;
-            if expanded.len() > MAX_RESOLVED_TABLES {
+            let mut edges = Vec::new();
+            for row in expanded {
+                let fields: Vec<String> = serde_json::from_str(&row)
+                    .context("decode table-family catalog observation")?;
+                match fields.as_slice() {
+                    [kind, table] if kind == "table" => selection.tables.push(table.clone()),
+                    [kind, parent, child] if kind == "edge" => edges.push(TableFamilyEdge {
+                        parent: parent.clone(),
+                        child: child.clone(),
+                    }),
+                    _ => bail!("table-family catalog is changing or has an invalid observation"),
+                }
+            }
+            if selection.tables.len() > MAX_RESOLVED_TABLES || edges.len() > MAX_TABLE_FAMILY_EDGES
+            {
                 bail!(
                     "profile {} resolves to more than {MAX_RESOLVED_TABLES} relations; select schemas instead",
                     profile.name
                 );
             }
-            selection.tables = expanded;
+            selection.tables.sort();
+            edges.sort();
+            if selection
+                .tables
+                .iter()
+                .any(|table| !profile.tables.contains(table))
+            {
+                if !profile.exclude_extensions.is_empty() {
+                    bail!("table-family scope cannot exclude extensions");
+                }
+                selection.table_family_edges = Some(edges);
+                // Also refuses unsafe descendant names before they reach pg_dump.
+                selection.validate_table_family(&profile.tables)?;
+            }
         }
         let included = included_relations_cte(&selection);
         selection.dangling = self.find_dangling(source, &included, timeout)?;
@@ -255,12 +295,15 @@ impl DatabaseAdapter for PostgresAdapter {
                  SELECT DISTINCT x.extname FROM pg_catalog.pg_depend d \
                  JOIN pg_catalog.pg_extension x ON x.oid = d.refobjid \
                  WHERE d.classid = 'pg_class'::regclass \
-                   AND d.refclassid = 'pg_extension'::regclass AND d.deptype = 'x' \
+                   AND d.refclassid = 'pg_extension'::regclass AND d.deptype IN ('e', 'x') \
                    AND d.objid IN (SELECT oid FROM included) ORDER BY 1"
             ),
             timeout,
             "probe extension membership",
         )?;
+        if selection.table_family_edges.is_some() {
+            selection.validate_table_family(&profile.tables)?;
+        }
         Ok(selection)
     }
 

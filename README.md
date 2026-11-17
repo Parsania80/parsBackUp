@@ -243,3 +243,31 @@ the patched age 0.11 branch removes the vulnerable dependency path but introduce
 an unmaintained macro dependency and a future-Rust warning. Both maintenance
 advisories remain open release obligations; this checkpoint does not accept them
 for production. Next: remaining V01 signed-family compatibility work.
+
+Crypto checkpoint is committed locally as `c13f593`. V01 table-family work now has a
+[compatibility contract](docs/backup-format/manifest-v2-family.md): preserve v1 and
+use version 2 only when a selected table expands to descendants, with the original
+request and signed parent/child links retained. Older readers will refuse those new
+artifacts explicitly. Implementation and recovery verification follow; production
+stays disabled and the maintenance warnings remain open release work.
+
+The signed table-family implementation is ready for final verification. It keeps
+literal scopes on v1, uses v2 for expanded families, and refuses invalid graphs,
+unsafe/omitted family members and observed scope changes before publication.
+Preliminary old/new recovery and family tests passed; final frozen-input native and
+package gates are still pending. No production capability is enabled.
+
+Signed table-family compatibility is now verified: expanded families publish and
+restore as version 2 while retaining the original request and signed parent/child
+links. Whole/schema/literal scopes keep version 1. Old/new binaries recover v1 in
+both directions; older readers explicitly refuse v2. **322 tests**, four PG16–18
+native suites and the Ubuntu 24.04/Debian 13 package gates pass on frozen inputs.
+The 29-file increment is uncommitted for review; production remains disabled and
+the other V01/release obligations remain open. See [acceptance](project.md#signed-table-family-compatibility-acceptance--2026-11-17).
+
+Checkpoint review accepts the signed-family increment with no blocking findings.
+The exact 29-file scope and frozen acceptance evidence were rechecked; the 322-test,
+four all-major native-suite and both-target package results remain applicable.
+The operator requested a local commit; Git history records its identity. GitHub
+Desktop push remains with the operator. Next: versioned writable offline reads
+and retention dispatch. Production remains disabled.

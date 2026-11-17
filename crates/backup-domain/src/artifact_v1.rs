@@ -1,4 +1,4 @@
-//! The two records a published v1 artifact carries.
+//! The shared records carried by signed scope formats v1 and v2.
 //!
 //! [`ArtifactManifest`] is the private manifest whose plaintext is what `manifest.age`
 //! decrypts to; [`PublicHeader`] is `public.json`, the discovery record `backup list`
@@ -11,12 +11,12 @@
 use crate::config::Source;
 use crate::profile::{Profile, is_valid_schema_name, is_valid_table_name};
 use crate::protocol::{
-    ARCHIVE_COMPRESSION, ARCHIVE_FORMAT, ARTIFACT_FORMAT_VERSION, DIGEST_HEX_LEN,
-    ENGINE_POSTGRESQL, GLOBALS_POLICY_EXPORTED, GLOBALS_POLICY_SKIPPED, ID_HEX_LEN,
-    MAX_COMPATIBILITY_NOTES, MAX_PUBLIC_JSON_BYTES, MAX_TEXT_FIELD_CHARS,
-    PROFILE_FINGERPRINT_DOMAIN, READABLE_RECIPIENT_SUITES, READABLE_SIGNATURE_SUITES,
+    ARCHIVE_COMPRESSION, ARCHIVE_FORMAT, DIGEST_HEX_LEN, ENGINE_POSTGRESQL,
+    GLOBALS_POLICY_EXPORTED, GLOBALS_POLICY_SKIPPED, ID_HEX_LEN, MAX_COMPATIBILITY_NOTES,
+    MAX_PUBLIC_JSON_BYTES, MAX_TEXT_FIELD_CHARS, PROFILE_FINGERPRINT_DOMAIN,
+    READABLE_ARTIFACT_FORMAT_VERSIONS, READABLE_RECIPIENT_SUITES, READABLE_SIGNATURE_SUITES,
     RECIPIENT_SUITES, SIGNATURE_SUITES, SOURCE_FINGERPRINT_DOMAIN, SUBSCRIPTION_POLICY_DROPPED,
-    SUPPORTED_MAJOR_RANGE, SUPPORTED_MAJORS, VERIFICATION_NONE,
+    SUPPORTED_MAJOR_RANGE, SUPPORTED_MAJORS, TABLE_FAMILY_FORMAT_VERSION, VERIFICATION_NONE,
 };
 use crate::selection::ResolvedSelection;
 use crate::utc::is_utc_timestamp;
@@ -27,8 +27,8 @@ use uuid::Uuid;
 
 /// The names the operator asked for, before the live catalog was read. It is recorded
 /// next to the resolved selection so a reader can see whether an artifact dumped what it
-/// was told to: an object in the resolved list that nobody requested is a lie about scope,
-/// and one that was requested but vanished is a lie about completeness.
+/// was told to. V1 permits only literal requests; v2 accounts for additional descendants
+/// with signed catalog links without pretending the operator listed them.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RequestedSelection {
@@ -77,7 +77,7 @@ impl RequestedSelection {
     }
 }
 
-/// The private manifest of a v1 artifact, as it exists once `manifest.age` is
+/// The private manifest of a signed artifact, as it exists once `manifest.age` is
 /// authenticated. Fields are required, not optional, wherever the writer always knows the
 /// answer: an absent field here would be a format gap rather than a fact about a dump.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -131,9 +131,9 @@ impl ArtifactManifest {
     /// downgraded artifact is refused by name as a policy violation instead of failing to
     /// parse and looking like corruption.
     pub fn validate(&self) -> Result<()> {
-        if self.format_version != ARTIFACT_FORMAT_VERSION {
+        if !READABLE_ARTIFACT_FORMAT_VERSIONS.contains(&self.format_version) {
             bail!(
-                "unknown artifact manifest format version {}, this build writes {ARTIFACT_FORMAT_VERSION}",
+                "unknown artifact manifest format version {}, this build reads versions 1 and 2",
                 self.format_version
             );
         }
@@ -322,6 +322,19 @@ impl ArtifactManifest {
 
     fn resolved_selection_validate(&self) -> Result<()> {
         let resolved = &self.resolved_selection;
+        if self.format_version == TABLE_FAMILY_FORMAT_VERSION {
+            if self.requested_selection != RequestedSelection::from_profile(&self.profile_snapshot)
+                || resolved.exclude_tables != self.profile_snapshot.exclude_tables
+                || resolved.exclude_schemas != self.profile_snapshot.exclude_schemas
+                || !self.profile_snapshot.exclude_extensions.is_empty()
+            {
+                bail!("table-family scope disagrees with the profile or excludes extensions");
+            }
+            return resolved.validate_table_family(&self.requested_selection.tables);
+        }
+        if resolved.table_family_edges.is_some() {
+            bail!("v1 scope cannot carry table-family edges");
+        }
         let whole = resolved.whole_database;
         if whole && (!resolved.schemas.is_empty() || !resolved.tables.is_empty()) {
             bail!("a whole-database resolved selection must not list objects");
@@ -434,9 +447,9 @@ impl PublicHeader {
     }
 
     pub fn validate(&self) -> Result<()> {
-        if self.format_version != ARTIFACT_FORMAT_VERSION {
+        if !READABLE_ARTIFACT_FORMAT_VERSIONS.contains(&self.format_version) {
             bail!(
-                "unknown public.json format version {}, this build writes {ARTIFACT_FORMAT_VERSION}",
+                "unknown public.json format version {}, this build reads versions 1 and 2",
                 self.format_version
             );
         }
@@ -847,10 +860,10 @@ mod tests {
         assert!(empty.validate().is_err());
 
         let mut unknown_version = header.clone();
-        unknown_version.format_version = 2;
+        unknown_version.format_version = 3;
         let error = unknown_version.validate().unwrap_err().to_string();
         assert!(
-            error.contains("unknown public.json format version 2"),
+            error.contains("unknown public.json format version 3"),
             "{error}"
         );
 
