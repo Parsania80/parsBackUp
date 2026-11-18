@@ -202,7 +202,11 @@ impl Request {
             backup_domain::is_literal_database_name(name)
                 && name
                     .strip_prefix(backup_domain::FIXTURE_PREFIX)
-                    .is_some_and(|s| !s.is_empty())
+                    .is_some_and(|s| {
+                        !s.is_empty()
+                            && s.bytes()
+                                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+                    })
         };
         let valid = match self {
             Self::Backup {
@@ -306,6 +310,7 @@ pub enum Effects {
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ErrorCode {
     InvalidRequest,
+    AuthRequired,
     AccessDenied,
     NotFound,
     IdempotencyConflict,
@@ -313,12 +318,18 @@ pub enum ErrorCode {
     ConfigChanged,
     IntentExpired,
     PolicyRefused,
+    BodyTooLarge,
+    UnsupportedMedia,
+    RateLimit,
     QueueFull,
+    NotReady,
     ContainmentUnavailable,
     ControlCapacity,
+    DiscoveryLimit,
     OperationCancelled,
     OperationFailed,
     OperationInterrupted,
+    InternalError,
 }
 
 impl std::fmt::Display for ErrorCode {

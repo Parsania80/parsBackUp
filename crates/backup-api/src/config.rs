@@ -66,12 +66,17 @@ fn read_private(path: &Path, limit: u64) -> Result<Vec<u8>> {
 #[serde(deny_unknown_fields)]
 struct Input {
     format: String,
+    #[serde(default = "default_listen")]
     listen: SocketAddr,
     public_origin: String,
     development_http: bool,
     control_database: PathBuf,
     credential_registry: PathBuf,
     profiles: Vec<Profile>,
+}
+
+fn default_listen() -> SocketAddr {
+    SocketAddr::from(([127, 0, 0, 1], 8090))
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -106,6 +111,10 @@ pub struct Config {
     pub(crate) path: PathBuf,
     pub(crate) source_hash: String,
     pub(crate) database: PathBuf,
+    pub(crate) listen: SocketAddr,
+    pub(crate) public_origin: String,
+    pub(crate) host: axum::http::uri::Authority,
+    pub(crate) development_http: bool,
     registry: PathBuf,
     profiles: BTreeMap<String, LoadedProfile>,
 }
@@ -314,10 +323,20 @@ impl Config {
             );
         }
         ensure!(profiles.contains_key("default"), ErrorCode::ConfigChanged);
+        let host = input
+            .public_origin
+            .split_once("://")
+            .and_then(|(_, authority)| authority.parse::<axum::http::uri::Authority>().ok())
+            .filter(|authority| !authority.host().is_empty())
+            .context(ErrorCode::ConfigChanged)?;
         let config = Self {
             path: path.to_owned(),
             source_hash: hash(&bytes),
             database: input.control_database,
+            listen: input.listen,
+            public_origin: input.public_origin,
+            host,
+            development_http: input.development_http,
             registry: input.credential_registry,
             profiles,
         };
@@ -349,6 +368,49 @@ impl Config {
             core_profile: entry.spec.core_profile.clone(),
             revision,
         })
+    }
+
+    pub(crate) fn discovery_config(&self) -> Result<ConfigV1> {
+        let entry = self
+            .profiles
+            .get("default")
+            .context(ErrorCode::ConfigChanged)?;
+        ensure!(
+            hash(&read_private(&self.path, 256 * 1024)?) == self.source_hash,
+            ErrorCode::ConfigChanged
+        );
+        let (reader, _, revision) = entry.spec.load()?;
+        ensure!(revision == entry.revision, ErrorCode::ConfigChanged);
+        Ok(reader)
+    }
+
+    pub(crate) fn profiles(&self, authority: &Authority) -> Vec<ProfileView<'_>> {
+        self.profiles
+            .values()
+            .map(|entry| ProfileView {
+                id: &entry.spec.id,
+                display_name: &entry.spec.display_name,
+                operations: entry
+                    .spec
+                    .operations
+                    .iter()
+                    .copied()
+                    .filter(|op| authority.allows(*op))
+                    .collect(),
+            })
+            .collect()
+    }
+
+    pub(crate) fn authenticate(&self, token_hash: &str) -> Result<(Actor, Authority)> {
+        use subtle::ConstantTimeEq;
+        let mut matched = None;
+        for entry in self.registry()?.credentials {
+            let equal = bool::from(entry.token_sha256.as_bytes().ct_eq(token_hash.as_bytes()));
+            if equal && entry.active {
+                matched = Some((entry.binding(), Authority(entry.roles)));
+            }
+        }
+        matched.context(ErrorCode::AuthRequired)
     }
 
     fn registry(&self) -> Result<Registry> {
@@ -443,6 +505,14 @@ impl Credential {
 }
 
 pub(crate) struct Authority(Vec<Role>);
+
+#[derive(Serialize)]
+pub(crate) struct ProfileView<'a> {
+    id: &'a str,
+    display_name: &'a str,
+    operations: Vec<Operation>,
+}
+
 impl Authority {
     pub(crate) fn admin(&self) -> bool {
         self.0.contains(&Role::Admin)
@@ -472,5 +542,49 @@ impl Authority {
                 ),
                 _ => false,
             })
+    }
+
+    pub(crate) fn operations(&self) -> Vec<Operation> {
+        use Operation::*;
+        [
+            Backup,
+            Inspection,
+            Verification,
+            RestorePlan,
+            Restore,
+            RetentionPreview,
+            RetentionRun,
+            ArtifactProtection,
+        ]
+        .into_iter()
+        .filter(|op| self.allows(*op))
+        .collect()
+    }
+
+    pub(crate) fn permissions(&self) -> Vec<&'static str> {
+        let mut permissions = vec![
+            "session.self",
+            "artifact.list",
+            "profile.read",
+            "job.read_own",
+            "health.read",
+        ];
+        permissions.extend(self.operations().into_iter().map(|op| match op {
+            Operation::Backup => "backup.create",
+            Operation::Inspection => "artifact.inspect",
+            Operation::Verification => "artifact.verify",
+            Operation::RestorePlan => "restore.plan",
+            Operation::Restore => "restore.run",
+            Operation::RetentionPreview => "retention.preview",
+            Operation::RetentionRun => "retention.run",
+            Operation::ArtifactProtection => "artifact.protect",
+        }));
+        if self.cancel() {
+            permissions.push("job.cancel_own");
+        }
+        if self.admin() {
+            permissions.extend(["job.read_all", "job.cancel_all", "metrics.read"]);
+        }
+        permissions
     }
 }

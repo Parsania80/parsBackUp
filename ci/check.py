@@ -64,7 +64,11 @@ for file in sorted(Path('tests').glob('*.sh')) + [Path('ci/run.sh'), Path('deplo
         blocks += 1
 for file in Path('deploy/debian').iterdir():
     subprocess.run(['sh', '-n', str(file)], check=True)
-for file in sorted(Path('ci').glob('*.py')) + [Path('tests/h03/package_drill.py'), Path('tests/p02_worker_drill.py')]:
+for file in sorted(Path('ci').glob('*.py')) + [
+    Path('tests/h03/package_drill.py'),
+    Path('tests/p02_worker_drill.py'),
+    Path('tests/p03_http_drill.py'),
+]:
     code = file.read_text()
     compile(code, str(file), 'exec')
     if file.name == 'package_drill.py':

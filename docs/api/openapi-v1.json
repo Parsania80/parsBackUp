@@ -2,8 +2,8 @@
   "openapi": "3.1.2",
   "info": {
     "title": "parsBackUp fixture API",
-    "version": "1.0.0-design",
-    "description": "P01 design only. No routes implemented. Read p01-api-contract.md for actor/intent, restart and containment invariants; production operations remain disabled."
+    "version": "1.0.0-fixture",
+    "description": "P03 fixture interface. See p01-api-contract.md for actor/intent and containment invariants. A supervised listener admits jobs. The read-only listener returns CONTAINMENT_UNAVAILABLE for job mutations."
   },
   "servers": [
     {

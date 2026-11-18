@@ -349,3 +349,15 @@ The P01/P02 checkpoint review verified that queued jobs can still be cancelled
 when the receipt limit is reached. Backup jobs now report uncertainty if the
 recovery pass fails before it can say what changed. Git history records the local
 checkpoint.
+
+P03 now serves the fixture API on loopback. It supports bearer tokens and
+browser sessions, with permissions for artifact reads, restore planning, job
+submission and cancellation. The read-only listener is available for local
+development, and the supervised listener runs jobs. See the
+[HTTP API guide](docs/operations/http-api.md). **Next is P04 API verification,
+then the UI.**
+
+The P03 checkpoint review verified that health reports degraded readiness when
+the default profile configuration changes. The HTTP drill confirmed that the
+same change blocks new work and that restoring the configuration restores
+readiness. Git history records the local checkpoint.

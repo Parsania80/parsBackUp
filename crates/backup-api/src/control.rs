@@ -109,8 +109,33 @@ CREATE TABLE intents (
 );
 PRAGMA user_version = 1;";
 
+const SCHEMA_V2: &str = "
+CREATE TABLE sessions (
+    token_sha256 TEXT PRIMARY KEY, actor TEXT NOT NULL,
+    created INTEGER NOT NULL, expires INTEGER NOT NULL
+);
+CREATE INDEX jobs_actor_page ON jobs(json_extract(job, '$.actor_id'), id);
+PRAGMA user_version = 2;";
+
+#[derive(Clone, Copy)]
+pub(crate) struct Session {
+    pub actor: Actor,
+    pub expires: u64,
+}
+
+#[derive(Default, Serialize)]
+pub(crate) struct Metrics {
+    pub accepted_total: u64,
+    pub succeeded_total: u64,
+    pub failed_total: u64,
+    pub partial_total: u64,
+    pub cancelled_total: u64,
+    pub interrupted_total: u64,
+    pub rejected_total: u64,
+}
+
 impl Store {
-    pub fn open(path: &Path, group: &str) -> Result<Self> {
+    pub fn open(path: &Path, group: Option<&str>) -> Result<Self> {
         let location = Location::open(path)?;
         let lock = private_file(&location.sidecar(".lock"), true)?;
         // SAFETY: the descriptor is live and this process keeps it for the Store lifetime.
@@ -135,37 +160,27 @@ impl Store {
             tx.execute_batch(SCHEMA)?;
             tx.execute(
                 "INSERT INTO metadata VALUES (?,?)",
-                params![Uuid::new_v4().to_string(), group],
+                params![Uuid::new_v4().to_string(), group.unwrap_or_default()],
             )?;
-        } else {
-            ensure!(version == 1, "UNKNOWN_CONTROL_SCHEMA");
         }
-        let owner: String = tx.query_row("SELECT owner_group FROM metadata", [], |r| r.get(0))?;
-        ensure!(owner == group, ErrorCode::ContainmentUnavailable);
-        let instance = instance(&tx)?;
-        let abandoned = {
-            let mut statement = tx.prepare(
-                "SELECT job FROM jobs WHERE state IN ('queued','running','cancel_requested')",
-            )?;
-            statement
-                .query_map([], |row| row.get::<_, String>(0))?
-                .collect::<rusqlite::Result<Vec<_>>>()?
-        };
-        let time = now()?;
-        for raw in abandoned {
-            let mut job: Job = serde_json::from_str(&raw)?;
-            let effects = if job.state == State::Queued {
-                Effects::None
-            } else {
-                Effects::Unknown
-            };
-            apply(
-                &mut job,
-                Outcome::error(State::Interrupted, ErrorCode::OperationInterrupted, effects),
-                time,
+        ensure!(version <= 2, "UNKNOWN_CONTROL_SCHEMA");
+        if version < 2 {
+            tx.execute_batch(SCHEMA_V2)?;
+        }
+        tx.execute("DELETE FROM sessions", [])?;
+        if let Some(group) = group {
+            let owner: String =
+                tx.query_row("SELECT owner_group FROM metadata", [], |r| r.get(0))?;
+            ensure!(
+                owner.is_empty() || owner == group,
+                ErrorCode::ContainmentUnavailable
             );
-            update(&tx, &job)?;
+            if owner.is_empty() {
+                tx.execute("UPDATE metadata SET owner_group=?", [group])?;
+            }
+            interrupt_abandoned(&tx)?;
         }
+        let instance = instance(&tx)?;
         tx.commit()?;
         location._directory.sync_all()?;
         Ok(Self {
@@ -181,6 +196,126 @@ impl Store {
     }
     pub fn intent(&self, id: Uuid) -> Result<(Intent, String)> {
         read_intent(&self.db, id)
+    }
+
+    pub fn new_session(
+        &mut self,
+        hash: &str,
+        actor: Actor,
+        previous: Option<&str>,
+    ) -> Result<Session> {
+        let time = now()?;
+        let expires = time
+            .checked_add(8 * 60 * 60 * 1000)
+            .filter(|expiry| *expiry <= MAX_TIME)
+            .context("CLOCK_INVALID")?;
+        let tx = self.db.transaction()?;
+        tx.execute("DELETE FROM sessions WHERE expires <= ?", [time as i64])?;
+        if let Some(previous) = previous {
+            tx.execute("DELETE FROM sessions WHERE token_sha256=?", [previous])?;
+        }
+        let count: i64 = tx.query_row("SELECT count(*) FROM sessions", [], |row| row.get(0))?;
+        ensure!(count < 4096, ErrorCode::ControlCapacity);
+        tx.execute(
+            "INSERT INTO sessions VALUES (?,?,?,?)",
+            params![
+                hash,
+                serde_json::to_string(&actor)?,
+                time as i64,
+                expires as i64
+            ],
+        )?;
+        tx.commit()?;
+        Ok(Session { actor, expires })
+    }
+
+    pub fn session(&self, hash: &str) -> Result<Session> {
+        let time = now()? as i64;
+        let (actor, expires) = self.db.query_row(
+            "SELECT actor,expires FROM sessions WHERE token_sha256=? AND created<=? AND expires>?",
+            params![hash, time, time], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+        ).optional()?.context(ErrorCode::AuthRequired)?;
+        Ok(Session {
+            actor: serde_json::from_str(&actor)?,
+            expires: expires.try_into()?,
+        })
+    }
+
+    pub fn revoke_session(&mut self, hash: &str) -> Result<()> {
+        self.db
+            .execute("DELETE FROM sessions WHERE token_sha256=?", [hash])?;
+        Ok(())
+    }
+
+    pub fn queue_depth(&self) -> Result<u32> {
+        Ok(self.db.query_row(
+            "SELECT count(*) FROM jobs WHERE state='queued'",
+            [],
+            |row| row.get(0),
+        )?)
+    }
+
+    pub fn metrics(&self) -> Result<Metrics> {
+        let mut statement = self
+            .db
+            .prepare("SELECT state, count(*) FROM jobs GROUP BY state")?;
+        let mut rows = statement.query([])?;
+        let mut result = Metrics::default();
+        while let Some(row) = rows.next()? {
+            let state = row.get::<_, String>(0)?;
+            let count = u64::from(row.get::<_, u32>(1)?);
+            result.accepted_total += count;
+            match state.as_str() {
+                "succeeded" => result.succeeded_total = count,
+                "failed" => result.failed_total = count,
+                "partial" => result.partial_total = count,
+                "cancelled" => result.cancelled_total = count,
+                "interrupted" => result.interrupted_total = count,
+                _ => {}
+            }
+        }
+        Ok(result)
+    }
+
+    pub fn page_jobs(
+        &self,
+        actor: Actor,
+        authority: &crate::config::Authority,
+        after: Option<Uuid>,
+        limit: usize,
+    ) -> Result<(Vec<Job>, Option<Uuid>)> {
+        let cursor = after.map(|id| id.to_string()).unwrap_or_default();
+        let mut statement;
+        let mut rows = if authority.admin() {
+            statement = self
+                .db
+                .prepare("SELECT job FROM jobs WHERE id>? ORDER BY id LIMIT ?")?;
+            statement.query(params![cursor, limit as i64 + 1])?
+        } else {
+            statement = self.db.prepare(
+                "SELECT job FROM jobs WHERE json_extract(job,'$.actor_id')=? AND id>?
+                 AND json_extract(job,'$.operation') IN (SELECT value FROM json_each(?))
+                 ORDER BY id LIMIT ?",
+            )?;
+            statement.query(params![
+                actor.actor_id.to_string(),
+                cursor,
+                serde_json::to_string(&authority.operations())?,
+                limit as i64 + 1
+            ])?
+        };
+        let mut jobs: Vec<Job> = Vec::new();
+        let mut bytes = 0;
+        while let Some(row) = rows.next()? {
+            let raw: String = row.get(0)?;
+            if jobs.len() == limit || (!jobs.is_empty() && bytes + raw.len() > 2 * IPC_LIMIT) {
+                let next = jobs.last().map(|job| job.id);
+                return Ok((jobs, next));
+            }
+            bytes += raw.len();
+            jobs.push(serde_json::from_str(&raw)?);
+        }
+        Ok((jobs, None))
     }
 
     pub fn admit(
@@ -417,6 +552,33 @@ impl Store {
         tx.commit()?;
         Ok(job)
     }
+}
+
+fn interrupt_abandoned(tx: &Transaction<'_>) -> Result<()> {
+    let abandoned = {
+        let mut statement = tx.prepare(
+            "SELECT job FROM jobs WHERE state IN ('queued','running','cancel_requested')",
+        )?;
+        statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    let time = now()?;
+    for raw in abandoned {
+        let mut job: Job = serde_json::from_str(&raw)?;
+        let effects = if job.state == State::Queued {
+            Effects::None
+        } else {
+            Effects::Unknown
+        };
+        apply(
+            &mut job,
+            Outcome::error(State::Interrupted, ErrorCode::OperationInterrupted, effects),
+            time,
+        );
+        update(tx, &job)?;
+    }
+    Ok(())
 }
 
 fn apply(job: &mut Job, outcome: Outcome, time: u64) {

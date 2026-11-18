@@ -27,7 +27,7 @@ pub use snapshot::{SnapshotReader, SnapshotUse};
 mod retention;
 mod rollback;
 mod scratch;
-pub use filesystem::ProtectedRoot;
+pub use filesystem::{ProtectedRoot, PublicArtifact};
 mod stage;
 mod store;
 
@@ -383,12 +383,7 @@ impl LocalStore {
     /// and every field in it is still untrusted here — the signature check that follows is
     /// what makes it true.
     fn read_header(&self, dir: &Path) -> Result<PublicHeader> {
-        let path = dir.join(PUBLIC_FILE);
-        ensure_regular_file(&path)?;
-        let bytes = read_bounded(&path, MAX_PUBLIC_JSON_BYTES as u64 + 1)?;
-        let text = std::str::from_utf8(&bytes)
-            .with_context(|| format!("{} is not valid UTF-8", path.display()))?;
-        PublicHeader::from_json(text)
+        read_public_header(dir)
     }
 
     /// Refuses an artifact directory holding both a plaintext `manifest.json` and a sealed
@@ -1197,6 +1192,15 @@ fn read_restore_plan(path: &Path) -> Result<Option<RestorePlan>> {
     let plan: RestorePlan = serde_json::from_slice(&bytes)?;
     plan.validate(backup_application::now_unix_ms()?)?;
     Ok(Some(plan))
+}
+
+fn read_public_header(dir: &Path) -> Result<PublicHeader> {
+    let path = dir.join(PUBLIC_FILE);
+    ensure_regular_file(&path)?;
+    let bytes = read_bounded(&path, MAX_PUBLIC_JSON_BYTES as u64 + 1)?;
+    let text = std::str::from_utf8(&bytes)
+        .with_context(|| format!("{} is not valid UTF-8", path.display()))?;
+    PublicHeader::from_json(text)
 }
 
 fn ensure_real_dir(path: &Path) -> Result<()> {

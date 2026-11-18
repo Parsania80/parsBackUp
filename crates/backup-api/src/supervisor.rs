@@ -8,7 +8,10 @@ use std::{
     io::{Read, Write},
     path::{Path, PathBuf},
     process::{ExitStatus, Stdio},
-    sync::{Arc, Mutex, MutexGuard},
+    sync::{
+        Arc, Mutex, MutexGuard,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 use tokio::{
@@ -104,15 +107,47 @@ impl Group {
 struct Shared {
     config: Config,
     store: Mutex<Store>,
+    supervised: bool,
+    accepting: AtomicBool,
 }
 
-/// Interface for the future HTTP adapter. Callers supply identities already
+/// Interface for the HTTP adapter. Callers supply identities already
 /// authenticated by the transport. Registry permissions are rechecked here.
 #[derive(Clone)]
 pub struct Control(Arc<Shared>);
 
 impl Control {
-    fn store(&self) -> Result<MutexGuard<'_, Store>> {
+    fn open(config: Config, group: Option<&str>) -> Result<Self> {
+        let store = Store::open(&config.database, group)?;
+        Ok(Self(Arc::new(Shared {
+            config,
+            store: Mutex::new(store),
+            supervised: group.is_some(),
+            accepting: AtomicBool::new(group.is_some()),
+        })))
+    }
+
+    pub(crate) fn read_only(config: Config) -> Result<Self> {
+        Self::open(config, None)
+    }
+
+    pub(crate) fn config(&self) -> &Config {
+        &self.0.config
+    }
+
+    pub(crate) fn supervised(&self) -> bool {
+        self.0.supervised
+    }
+
+    pub(crate) fn accepting(&self) -> bool {
+        self.0.accepting.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn stop_admission(&self) {
+        self.0.accepting.store(false, Ordering::Release);
+    }
+
+    pub(crate) fn store(&self) -> Result<MutexGuard<'_, Store>> {
         self.0
             .store
             .lock()
@@ -120,11 +155,21 @@ impl Control {
     }
 
     pub fn submit(&self, actor: Actor, key: Uuid, request: Request) -> Result<Job> {
-        self.store()?.admit(&self.0.config, actor, key, request)
+        let mut store = self.store()?;
+        self.check_admission()?;
+        store.admit(&self.0.config, actor, key, request)
     }
 
     pub fn cancel(&self, actor: Actor, job: Uuid, key: Uuid) -> Result<Job> {
-        self.store()?.cancel(&self.0.config, actor, job, key)
+        let mut store = self.store()?;
+        self.check_admission()?;
+        store.cancel(&self.0.config, actor, job, key)
+    }
+
+    fn check_admission(&self) -> Result<()> {
+        ensure!(self.supervised(), ErrorCode::ContainmentUnavailable);
+        ensure!(self.accepting(), ErrorCode::NotReady);
+        Ok(())
     }
 
     pub fn job(&self, actor: Actor, id: Uuid) -> Result<Job> {
@@ -191,11 +236,7 @@ impl Supervisor {
             .await
             .context(ErrorCode::ContainmentUnavailable)?;
         ensure!(executable.is_absolute(), "WORKER_EXECUTABLE_INVALID");
-        let store = Store::open(&config.database, &group.name)?;
-        let control = Control(Arc::new(Shared {
-            config,
-            store: Mutex::new(store),
-        }));
+        let control = Control::open(config, Some(&group.name))?;
         Ok(Self {
             control,
             group,
@@ -215,6 +256,7 @@ impl Supervisor {
         let mut interrupt = signal(SignalKind::interrupt())?;
         let stop = async {
             tokio::select! { _ = term.recv() => {}, _ = interrupt.recv() => {} }
+            self.control.stop_admission();
         };
         tokio::pin!(stop);
         loop {

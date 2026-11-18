@@ -1,5 +1,5 @@
 use anyhow::{Result, ensure};
-use backup_api::{Config, Supervisor};
+use backup_api::{Config, serve_http};
 use std::{path::PathBuf, process::ExitCode};
 
 fn run() -> Result<()> {
@@ -9,17 +9,13 @@ fn run() -> Result<()> {
     if arguments[0] == "--worker" {
         return backup_api::worker(&path);
     }
-    ensure!(arguments[0] == "--supervise", "USAGE");
+    let supervised = arguments[0] == "--supervise";
+    ensure!(supervised || arguments[0] == "--read-only", "USAGE");
     let config = Config::load(&path)?;
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?
-        .block_on(async {
-            Supervisor::open(config, std::env::current_exe()?)
-                .await?
-                .serve()
-                .await
-        })
+        .block_on(serve_http(config, supervised))
 }
 
 fn main() -> ExitCode {

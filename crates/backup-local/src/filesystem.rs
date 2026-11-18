@@ -9,6 +9,14 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
+use uuid::Uuid;
+
+/// Keyless discovery facts. The header and even the existence of the artifact
+/// are observational until a worker verifies it under the core's claims.
+pub struct PublicArtifact {
+    pub id: Uuid,
+    pub header_version: Option<u32>,
+}
 
 pub struct ProtectedRoot {
     directory: File,
@@ -114,6 +122,62 @@ impl ProtectedRoot {
     pub fn path(&self) -> &Path {
         &self.path
     }
+
+    /// Count the bounded directory before reading any headers.
+    /// None means the catalog exceeds the requested bound.
+    pub fn discover_public(&self, max_entries: usize) -> Result<Option<Vec<PublicArtifact>>> {
+        let Some(artifacts) = self.artifact_directory()? else {
+            return Ok(Some(Vec::new()));
+        };
+        let mut ids = Vec::new();
+        for (index, entry) in std::fs::read_dir(descriptor_path(&artifacts))?.enumerate() {
+            if index >= max_entries {
+                return Ok(None);
+            }
+            let entry = entry?;
+            if let Some(id) = entry.file_name().to_str().and_then(|name| {
+                Uuid::parse_str(name)
+                    .ok()
+                    .filter(|id| id.to_string() == name)
+            }) {
+                ids.push(id);
+            }
+        }
+        ids.sort_unstable();
+        let inventory = self.discovery_inventory()?;
+        let mut found = Vec::new();
+        for id in ids {
+            if let Some(entry) = discover_entry(&artifacts, inventory.as_ref(), id)? {
+                found.push(entry);
+            }
+        }
+        Ok(Some(found))
+    }
+
+    pub fn discover_public_id(&self, id: Uuid) -> Result<Option<PublicArtifact>> {
+        let Some(artifacts) = self.artifact_directory()? else {
+            return Ok(None);
+        };
+        discover_entry(&artifacts, self.discovery_inventory()?.as_ref(), id)
+    }
+
+    fn artifact_directory(&self) -> Result<Option<File>> {
+        if !exists(&self.directory, c"artifacts")? {
+            return Ok(None);
+        }
+        let dir = open_dir(&self.directory, c"artifacts")?;
+        private_dir(&dir)?;
+        Ok(Some(dir))
+    }
+
+    fn discovery_inventory(&self) -> Result<Option<backup_inventory::Inventory>> {
+        if !exists(&self.directory, c"inventory.db")? {
+            return Ok(None);
+        }
+        Ok(Some(backup_inventory::Inventory::open_read_only_bound(
+            &self.path.join(crate::layout::INVENTORY_FILE),
+        )?))
+    }
     /// Admission can validate a saved plan without opening keys or initializing the store.
     pub fn saved_restore_plan(&self, id: uuid::Uuid) -> Result<Option<backup_domain::RestorePlan>> {
         let plans = open_dir(&self.directory, c"plans")?;
@@ -196,6 +260,68 @@ impl ProtectedRoot {
         reject_descendant(&self.directory, dir)
     }
 }
+
+fn descriptor_path(directory: &File) -> PathBuf {
+    PathBuf::from(format!("/proc/self/fd/{}/.", directory.as_raw_fd()))
+}
+
+fn discover_entry(
+    artifacts: &File,
+    inventory: Option<&backup_inventory::Inventory>,
+    id: Uuid,
+) -> Result<Option<PublicArtifact>> {
+    let name = CString::new(id.to_string())?;
+    let directory = match open_dir(artifacts, &name) {
+        Ok(directory) => directory,
+        Err(error) if missing(&error) => return Ok(None),
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|e| matches!(e.raw_os_error(), Some(libc::ENOTDIR | libc::ELOOP))) =>
+        {
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    };
+    private_dir(&directory)?;
+    let path = descriptor_path(&directory);
+    let completed = || {
+        path.join(crate::layout::COMPLETE_MARKER)
+            .symlink_metadata()
+            .is_ok_and(|meta| meta.is_file())
+    };
+    if !completed() {
+        return Ok(None);
+    }
+    if let Some(inventory) = inventory
+        && inventory
+            .artifact(id)?
+            .is_some_and(|row| row.state.is_deletion())
+    {
+        return Ok(None);
+    }
+    let version = if exists(&directory, c"public.json")? {
+        let read = crate::read_public_header(&path);
+        if !completed() {
+            return Ok(None);
+        }
+        let header = read?;
+        ensure!(header.backup_id == id, "ARTIFACT_HEADER_ID_MISMATCH");
+        Some(header.format_version)
+    } else {
+        None
+    };
+    Ok(completed().then_some(PublicArtifact {
+        id,
+        header_version: version,
+    }))
+}
+
+fn missing(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<std::io::Error>()
+        .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+}
 fn reject_descendant(root: &File, dir: &File) -> Result<()> {
     let store = root.metadata().context("FILESYSTEM_UNSAFE")?;
     let mut current = dir.try_clone().context("FILESYSTEM_UNSAFE")?;
@@ -227,7 +353,9 @@ fn open_dir(parent: &File, name: &std::ffi::CStr) -> Result<File> {
                 | libc::O_NONBLOCK,
         )
     };
-    ensure!(fd >= 0, "FILESYSTEM_UNSAFE");
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error()).context("FILESYSTEM_UNSAFE");
+    }
     // SAFETY: successful open returns a fresh owned descriptor.
     Ok(unsafe { File::from_raw_fd(fd) })
 }

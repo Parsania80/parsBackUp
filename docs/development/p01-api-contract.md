@@ -1,10 +1,8 @@
 # P01 — first API contract
 
-Status: design accepted for P02 implementation, 2026-11-18. No HTTP server, worker,
-authentication service or new dependency is implemented by this document. W2 is
-committed as `2f60e33430a68b4ffb457bfe784263eaf0c09709`. The two bounded backend
-gates are closed; the next implementation task is P02, then P03/P04 and the UI.
-Production operations remain disabled throughout these fixture increments.
+Status: v1 fixture contract implemented through P03, 2026-11-18. See the
+[HTTP API guide](../operations/http-api.md) for listener configuration and checks.
+P04 verifies the full API safety contract before the UI.
 
 The machine-readable interface is [OpenAPI 3.1.2](../api/openapi-v1.json). This
 document defines the ownership and cross-request rules that schemas cannot express.
@@ -42,7 +40,7 @@ Primary references checked 2026-11-18: [Axum](https://docs.rs/axum/0.8.9/axum/),
 [OpenAPI](https://spec.openapis.org/oas/v3.1.2.html),
 [HTTP semantics](https://httpwg.org/specs/rfc9110.html) and
 [systemd kill ownership](https://www.freedesktop.org/software/systemd/man/255/systemd.kill.html).
-OpenAPI is a static reviewed contract, not generated from unimplemented handlers.
+OpenAPI is a static reviewed contract for the HTTP implementation.
 
 ## Authentication, actors and target authority
 
@@ -60,7 +58,10 @@ token at `POST /api/v1/session`; the token must then be discarded from browser m
 It is never persisted in local/session storage. An opaque 256-bit session cookie
 `__Host-backupctl` is HttpOnly, Secure, SameSite=Strict, Path=/, without Domain.
 Only a hash of its value is persisted in the private control database. Sessions
-expire eight hours after issuance, with no sliding renewal. Registry revocation or
+expire eight hours after issuance, with no sliding renewal. The server derives
+the session's CSRF token from the cookie secret with a separate SHA-256 domain.
+It can recover this token for session reads with only the presented cookie.
+Registry revocation or
 revision change invalidates derived sessions and queued work. Browser session reads
 return a session-bound random CSRF token; all cookie-authenticated POST/DELETE calls
 require that token in `X-CSRF-Token` and an exact configured Origin. Login itself
@@ -215,8 +216,9 @@ All new submissions (including reads requiring a worker) use the same queue. Lim
 one active worker and 16 queued jobs. FIFO order; queued jobs expire after 30 minutes
 or their earlier intent expiry. HTTP concurrency is capped at 32; per-actor token
 bucket 60 requests/minute, burst 20, login 5/minute per peer, burst 5. Rate/admission
-refusals precede intent consumption. Initial rates are explicit fixture defaults,
-not performance claims.
+refusals precede intent consumption. Login buckets use the direct TCP peer, so a
+proxy's clients share its bucket. The listener ignores forwarding headers.
+Initial rates are fixture defaults.
 
 Core-generated restore/retention plans remain server-owned bytes. An API intent wraps
 the existing core plan ID/canonical SHA-256 digest, creator actor, API planning job ID,

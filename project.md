@@ -68,7 +68,7 @@ Chosen compatibility policy: PostgreSQL 16, 17 and 18 source servers, absolute s
 | Encryption | `age` = 0.11.5, `age-core` = 0.11.0, `hpke` = 0.12.0 alloc-only, existing custom hybrid recipient | Security maintenance pair; frozen v1 compatibility verified in §53. |
 | Signatures | `ed25519-dalek` 2.2 line and `ml-dsa` 0.1.1 or reviewed compatible update | Required zeroization features; both signature legs verify. |
 | CLI | `clap` derive | Existing human/JSON modes; parsing/presentation only. |
-| API adapter | Tokio = 1.54.1, static OpenAPI 3.1.2. Axum = 0.8.9 selected for P03 | Tokio is confined to `backup-api`. The core is synchronous. P02 uses isolated operation processes and a separate private control DB (§59). |
+| API adapter | Axum = 0.8.9, Tokio = 1.54.1, static OpenAPI 3.1.2 | HTTP dependencies are confined to `backup-api`. The core is synchronous. The adapter uses isolated operation processes and a private control DB (§59–§60). |
 | Local coordination | Unix `flock` through `libc` | Kernel ownership; nonblocking scope acquisition; never unlink live lock files. |
 
 Approved direct workspace libraries: `anyhow`, `clap`, `serde`, `serde_json`, `sha2`, `toml`, `uuid`, `age`, `age-core`, `base64`, `hkdf`, `libc`, `hpke`, `ml-kem`, `rand`, `sha3`, `typenum`, `x25519-dalek`, `rusqlite`, `ed25519-dalek`, `ml-dsa`, `zeroize`. [Cargo.toml](Cargo.toml) is the declaration and [Cargo.lock](Cargo.lock) records resolved versions and transitive dependencies. Preserve feature flags and exact pins unless a named task requires a reviewed upgrade.
@@ -387,12 +387,12 @@ A new model should be able to resume from status plus contracts without trusting
 | 10 | B — M5b retention/protection/deletion | ✅ Done | B01–B06 accepted; eight PG16/17/18 matrices and destructive/race/crash gates pass (§40). |
 | 11 | H — M6 hardened CLI/systemd/Debian | ✅ Fixture scope | H01–H05 fixture foundations accepted (§41–§50); H05 committed 046c22e. Production compatibility remains a V gate. |
 | 12 | V — production validation/release | ✅ W1/W2 bounded handoff | W1 in §56 and W2 in §57 accepted. Remaining V01, V02/V03 join integrated validation after UI; production stays disabled. |
-| 13 | P — M7 API/asynchronous service | 🔄 P02 verified; P03 next | P01 contract in §58. P02 worker and actual PostgreSQL/systemd proof in §59. P03 routes and P04 verification precede UI. |
+| 13 | P — M7 API/asynchronous service | 🔄 P03 verified; P04 next | The P01/P02 checkpoint is a2920ff. P03 fixture HTTP routes and authentication are verified in §60. P04 API acceptance precedes UI. |
 | 14 | U — M8 API-backed UI | ⬜ Todo | Requires stable API. |
 | 15 | F — platform validation/release | ⬜ Todo | After API/UI: integrate remaining V01, V02/V03 and F01–F03; one shared release evidence set. |
 
-### ➡️ Current: #13 - P03 — API routes, authentication and observability (P02 worker verified)
-### ⏭️ Next: P03 routes → P04 API verification → U01–U04 UI → integrated V/F release validation
+### ➡️ Current: #13 - P04 — API verification and cleanup (P03 HTTP verified)
+### ⏭️ Next: P04 API verification → U01–U04 UI → integrated V/F release validation
 
 Task IDs below remain stable even if a phase is split into several commits. The operator-approved §55 sequence governs remaining work: V01-W1/W2 → P → U → integrated V/F. V01-W1/W2 are bounded sub-gates of the existing V01 task. Full CLI release no longer blocks API development. Independent documentation can proceed alongside its owning task; dependent implementation waits for its stated prerequisites.
 
@@ -527,7 +527,7 @@ Prerequisites: accepted H/core baseline and V01-W1/W2 (§55), followed by P01 de
 
 1. **P01 — design contract.** Defined in §58 and [the API contract](docs/development/p01-api-contract.md), with [OpenAPI](docs/api/openapi-v1.json). Runtime/auth/permissions, safe errors, receipts, token custody, TLS and actor/request/expiry-bound intent are specified; no handlers are implemented yet.
 2. **P02 — worker adapter.** Implemented and verified in §59. One isolated operation process invokes core services directly. Private SQLite owns the bounded queue, receipts and intents. The systemd unit owns containment after an uncertain worker exit.
-3. **P03 — routes and observability.** Implement 202 jobs, artifact/profile/job reads, authenticated metrics/health and operation-specific access. Reject oversized/unknown fields, arbitrary paths and duplicate/conflicting idempotency keys before execution.
+3. **P03 — routes and observability.** Implemented and verified in §60. The fixture listener exposes all 20 operations, including authenticated reads, job submission and cancellation, and strict input handling.
 4. **P04 — verification and cleanup.** Authz/replay/rate/queue/cancel/restart/redaction tests, API-to-core equivalence and full destructive confirmation scenes. Apply C1 readability rules to new code, publish versioned API guide and threat review.
 
 Acceptance: retries do not duplicate operations, no unauthenticated destructive access, cancellation accurately reports partial restore/deletion, and API behavior is the same core policy as CLI.
@@ -2381,3 +2381,48 @@ failure preserves known recovery effects when the backup itself has no larger
 effects to report. The fresh fast gate passed all 324 tests, and the PostgreSQL
 17/systemd drill passed with both new regression cases. The locked dependency
 graph matches the prior P02 audit. P03 remains the next implementation task.
+
+## 60. P03 fixture HTTP routes and authentication — 2026-11-18
+
+The [HTTP adapter](crates/backup-api/src/http/mod.rs) implements all 20 operations
+in [OpenAPI v1](docs/api/openapi-v1.json). Axum listens on loopback. Job admission
+uses the P02 supervisor and private control database. The explicit read-only
+listener supports authenticated reads and session operations. Mutating job
+routes require verified systemd containment. HTTP work is bounded to 32 requests
+and four blocking lanes. Strict JSON, canonical UUIDs, body limits and safe error
+envelopes are enforced at the transport boundary.
+
+Bearer credentials are matched against the protected registry's fixed-size
+hashes. Browser sessions have an eight-hour expiry and require exact Origin and
+session-bound CSRF on mutations. Control schema v2 persists cookie hashes and
+migrates P02 state in place. Startup revokes sessions. The listener uses the direct
+peer for login limits and current actor identity for request limits. Artifact reads
+are keyless and unverified. Discovery checks the 4096-entry bound before opening
+headers. Job reads are paginated and filtered by ownership and current permissions.
+Health reports admission readiness, and admin metrics expose aggregate counts.
+See the [fixture HTTP guide](docs/operations/http-api.md).
+
+The [loopback drill](tests/p03_http_drill.py) passed against PostgreSQL 17 and a
+transient systemd unit. It exercised all operations, including backup acceptance
+and replay, restore of the fixture row, exact deletion and browser cancellation.
+It checked read-only refusal, session custody, logout and restart, login throttling,
+the proxy Host and Secure cookie policy, bounded discovery and v1-to-v2 migration
+with existing jobs. The workspace fast gate passed 324 tests, formatting, strict
+Clippy, reference and workflow checks. The official OpenAPI schema and 53 positive
+and 14 negative examples pass. The resolved dependency graph passed the Rust 1.97.1
+build and license review. RustSec revision
+`233155b4025b854c68a4b199c0e32d7fd53291a2` reports zero vulnerabilities and the
+two existing maintenance warnings.
+
+Evidence is in `target/ci-logs/fast{,-inputs.json}` and
+`/tmp/parsbackup-p03-{drill.log,p02-drill.log,audit.json}`. P03 is a fixture
+checkpoint. The loopback drill verifies the proxy-facing policy with HTTP
+requests to the backend. System deployment with a TLS proxy remains part of
+integrated validation. P04 is next, followed by the UI.
+
+The P03 checkpoint review tied the health response to the current protected
+configuration and default profile revision. The PostgreSQL 17/systemd HTTP drill
+confirmed degraded readiness and request refusal after drift, followed by
+recovery after restoring the original binding. The fresh 324-test fast gate,
+strict Clippy and OpenAPI checks passed. The dependency lock and retained P02
+containment evidence still apply.
