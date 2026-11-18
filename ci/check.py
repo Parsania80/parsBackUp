@@ -34,6 +34,8 @@ files += sorted(Path('docs/operations').glob('*.md'))
 files += [Path('docs/development/v01-validation.md'), Path('docs/security/v01-review.md')]
 files += [Path('docs/backup-format/manifest-v2-family.md'), Path('docs/development/v01-w1-offline-dispatch.md')]
 files += [Path('docs/development/v01-w2-restore-plan-compatibility.md')]
+files += [Path('docs/development/p01-api-contract.md')]
+subprocess.run(['python3', 'ci/check_api.py'], check=True)
 links = 0
 for file in files:
     text = file.read_text()
@@ -62,7 +64,7 @@ for file in sorted(Path('tests').glob('*.sh')) + [Path('ci/run.sh'), Path('deplo
         blocks += 1
 for file in Path('deploy/debian').iterdir():
     subprocess.run(['sh', '-n', str(file)], check=True)
-for file in sorted(Path('ci').glob('*.py')) + [Path('tests/h03/package_drill.py')]:
+for file in sorted(Path('ci').glob('*.py')) + [Path('tests/h03/package_drill.py'), Path('tests/p02_worker_drill.py')]:
     code = file.read_text()
     compile(code, str(file), 'exec')
     if file.name == 'package_drill.py':

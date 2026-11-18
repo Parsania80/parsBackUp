@@ -68,6 +68,7 @@ Chosen compatibility policy: PostgreSQL 16, 17 and 18 source servers, absolute s
 | Encryption | `age` = 0.11.5, `age-core` = 0.11.0, `hpke` = 0.12.0 alloc-only, existing custom hybrid recipient | Security maintenance pair; frozen v1 compatibility verified in §53. |
 | Signatures | `ed25519-dalek` 2.2 line and `ml-dsa` 0.1.1 or reviewed compatible update | Required zeroization features; both signature legs verify. |
 | CLI | `clap` derive | Existing human/JSON modes; parsing/presentation only. |
+| API adapter | Tokio = 1.54.1, static OpenAPI 3.1.2. Axum = 0.8.9 selected for P03 | Tokio is confined to `backup-api`. The core is synchronous. P02 uses isolated operation processes and a separate private control DB (§59). |
 | Local coordination | Unix `flock` through `libc` | Kernel ownership; nonblocking scope acquisition; never unlink live lock files. |
 
 Approved direct workspace libraries: `anyhow`, `clap`, `serde`, `serde_json`, `sha2`, `toml`, `uuid`, `age`, `age-core`, `base64`, `hkdf`, `libc`, `hpke`, `ml-kem`, `rand`, `sha3`, `typenum`, `x25519-dalek`, `rusqlite`, `ed25519-dalek`, `ml-dsa`, `zeroize`. [Cargo.toml](Cargo.toml) is the declaration and [Cargo.lock](Cargo.lock) records resolved versions and transitive dependencies. Preserve feature flags and exact pins unless a named task requires a reviewed upgrade.
@@ -386,12 +387,12 @@ A new model should be able to resume from status plus contracts without trusting
 | 10 | B — M5b retention/protection/deletion | ✅ Done | B01–B06 accepted; eight PG16/17/18 matrices and destructive/race/crash gates pass (§40). |
 | 11 | H — M6 hardened CLI/systemd/Debian | ✅ Fixture scope | H01–H05 fixture foundations accepted (§41–§50); H05 committed 046c22e. Production compatibility remains a V gate. |
 | 12 | V — production validation/release | ✅ W1/W2 bounded handoff | W1 in §56 and W2 in §57 accepted. Remaining V01, V02/V03 join integrated validation after UI; production stays disabled. |
-| 13 | P — M7 API/asynchronous service | 🔄 Current: P01 next | W1/W2 handoff accepted; define runtime/auth/OpenAPI/worker decisions before P02–P04. Full CLI release is not a prerequisite. |
+| 13 | P — M7 API/asynchronous service | 🔄 P02 verified; P03 next | P01 contract in §58. P02 worker and actual PostgreSQL/systemd proof in §59. P03 routes and P04 verification precede UI. |
 | 14 | U — M8 API-backed UI | ⬜ Todo | Requires stable API. |
 | 15 | F — platform validation/release | ⬜ Todo | After API/UI: integrate remaining V01, V02/V03 and F01–F03; one shared release evidence set. |
 
-### ➡️ Current: #13 - P01 — API design contract (W1/W2 backend handoff accepted)
-### ⏭️ Next: P01 decisions → P02–P04 API → U01–U04 UI → integrated V/F release validation
+### ➡️ Current: #13 - P03 — API routes, authentication and observability (P02 worker verified)
+### ⏭️ Next: P03 routes → P04 API verification → U01–U04 UI → integrated V/F release validation
 
 Task IDs below remain stable even if a phase is split into several commits. The operator-approved §55 sequence governs remaining work: V01-W1/W2 → P → U → integrated V/F. V01-W1/W2 are bounded sub-gates of the existing V01 task. Full CLI release no longer blocks API development. Independent documentation can proceed alongside its owning task; dependent implementation waits for its stated prerequisites.
 
@@ -524,8 +525,8 @@ Acceptance: CLI install/run/restore/retention/recovery meets the documented loca
 
 Prerequisites: accepted H/core baseline and V01-W1/W2 (§55), followed by P01 dependency/auth/worker decisions before API implementation. Completing V02/V03 or lifting the production guard is not a prerequisite. API development and acceptance remain fixture-only until the integrated release gate.
 
-1. **P01 — design contract.** Select framework/runtime; define OpenAPI, actors/permissions, safe errors, idempotency, token custody, TLS/deployment and queue/cancel ownership. Bound target authorization and destructive plan tokens to actor/request/expiry.
-2. **P02 — worker adapter.** Add bounded queue/workers invoking existing core, persisted accepted/running/terminal states with real writers, restart reconciliation and cancellation by process group. Do not insert runtime dependencies into pure domain/crypto just to host HTTP.
+1. **P01 — design contract.** Defined in §58 and [the API contract](docs/development/p01-api-contract.md), with [OpenAPI](docs/api/openapi-v1.json). Runtime/auth/permissions, safe errors, receipts, token custody, TLS and actor/request/expiry-bound intent are specified; no handlers are implemented yet.
+2. **P02 — worker adapter.** Implemented and verified in §59. One isolated operation process invokes core services directly. Private SQLite owns the bounded queue, receipts and intents. The systemd unit owns containment after an uncertain worker exit.
 3. **P03 — routes and observability.** Implement 202 jobs, artifact/profile/job reads, authenticated metrics/health and operation-specific access. Reject oversized/unknown fields, arbitrary paths and duplicate/conflicting idempotency keys before execution.
 4. **P04 — verification and cleanup.** Authz/replay/rate/queue/cancel/restart/redaction tests, API-to-core equivalence and full destructive confirmation scenes. Apply C1 readability rules to new code, publish versioned API guide and threat review.
 
@@ -2259,3 +2260,124 @@ and actual-store refusal-order/control tests plus retained 324-test/native evide
 match the reviewed inputs. Preparing the operator-authorized exact eight-file local
 commit with parent/tree/blob and clean-checkout verification; Git history supplies
 its identity. No push. P01 design follows this checkpoint.
+
+## 58. P01 API design and P02 handoff — 2026-11-18
+
+W2 review/commit is complete: **2f60e33430a68b4ffb457bfe784263eaf0c09709**,
+parent 1b51013, exact eight-file staged tree/blobs and clean postcommit checkout
+verified. No blocking review findings. Retained 324-test/PG16–18 W2 evidence was
+audited before commit; no runtime changed during checkpoint review. No push.
+
+[P01 contract](docs/development/p01-api-contract.md) and
+[OpenAPI 3.1.2](docs/api/openapi-v1.json) now define **20 operations / 18 paths**.
+The framework comparison selects Axum 0.8.9 + Tokio 1.54.1 for a future `backup-api`
+crate. Nothing is installed/resolved yet; P02 checks that concrete Cargo graph's
+compatibility, licenses and advisories. Domain/application/crypto remain synchronous.
+Static OpenAPI is the interface source; no generator or UI stack is introduced.
+
+The first API is one fixture estate/store with server-owned profiles. It defines
+operator-provisioned opaque tokens, same-origin HttpOnly sessions/CSRF, operation
+permissions, HTTPS proxy requirements, safe errors and bounded public reads. API
+control SQLite is private and separate from key-free inventory schema v8. Durable
+idempotency receipts and consumed actor/config/store/expiry-bound intents wrap
+existing core plan digests; no historical plan bytes or future production v4 writer
+change. Configuration/credential paths and native flags cannot be supplied over HTTP.
+
+Inspection found process-global sticky cancellation in application/control.rs.
+Therefore one fresh child directly invokes the existing services per operation;
+the HTTP process never cancels itself or shells out to backupctl. One worker plus
+16 queued jobs, persisted admission/results, no automatic crash replay, honest partial
+effects and tested whole-service cgroup hard-stop ownership are the bounded P02
+implementation. This accepts the availability cost of restarting the service after
+uncertain containment, rather than introducing per-job cgroup delegation or a broker.
+Unsupervised development refuses job admission. Existing CLI units are untouched.
+
+P01 validation uses the official OpenAPI 3.1 schema (2025-09-15, SHA-256
+`d0a3955182364c7b5fdebfd0583ecad259a870b4a2fe86a1b0fe8785f8224fed`), available
+jsonschema 4.19.2, schema checks for every component, **53 positive / 14 negative
+examples**, recomputed API intent digests and four structural negative controls.
+The dependency-free [CI checker](ci/check_api.py) is called by ci/check.py; it checks
+local references, closed objects, permission declarations and durable-job receipts.
+It does not pretend to verify HTTP/runtime/cgroup behavior. General references,
+syntax and real CLI examples are checked again after final documentation edits.
+No heavyweight core/native/package matrix is rerun for design-only files; W2's
+runtime/test inputs, Cargo manifests/lock, frozen contracts, schema, deployment,
+controlled flows and archive remain unchanged.
+
+P01 is defined and verified, uncommitted. **Next: P02 worker/control-state implementation**,
+then P03 routes, P04 integrated API verification and U01 UI. P02 may implement the
+described narrow adapter/shared composition needed by its second caller; no third
+general backend phase or full CLI production release is introduced. Remaining V/F
+production compatibility, real workloads, security/release and measured recovery
+acceptance remain after API/UI; production stays disabled.
+
+Final P01 checks pass: official schema/all component schemas, 53 positive and 14
+negative examples, four structural negative controls, **517 local references**,
+52 embedded Python blocks, script/pin syntax, two real CLI envelopes and diff
+whitespace. Scope/provenance audit confirms exactly seven P01 files and empty index,
+append-only log/README, unchanged runtime/tests/dependencies/frozen/controlled/deploy
+files/archive, and the retained identical 179-input W2 records. Their only current
+drift is the four previously declared handoff docs plus P01's ci/check.py integration.
+Evidence: /tmp/parsbackup-p01-{openapi,general}.log and
+/tmp/parsbackup-p01-audit.py, /tmp/parsbackup-p01-provenance.json.
+
+## 59. P02 bounded API worker — 2026-11-18
+
+[backup-api](crates/backup-api/src/lib.rs) implements admission and execution outside
+the HTTP layer. The [supervisor](crates/backup-api/src/supervisor.rs) allows one
+worker and a FIFO queue of 16. A private SQLite v1 database records jobs, retries
+and intent consumption in one transaction. Each worker has a fresh cancellation
+flag and calls the synchronous services directly. Its typed reply reports core job
+IDs when the service provides one. Restore checks the confirmed digest on the very
+plan loaded by the core before native preflight. Retention executes the saved plan's
+operation and exact digest. The artifact inventory and historical wire formats keep
+their existing versions.
+
+The [unit](deploy/systemd/backup-api.service) declares the service boundary for
+job admission. The supervisor checks that systemd owns its PID, cgroup and stop
+settings, and binds the control DB to that unit. It only starts a worker when the
+group contains the supervisor alone. If a worker leaves a live descendant or fails
+to stop within the grace period, the supervisor exits so systemd can terminate its
+group. Restart reports interrupted work and retains receipts and consumed intents.
+The systemd stop behavior follows the [upstream unit semantics](https://www.freedesktop.org/software/systemd/man/latest/systemd.kill.html).
+
+The [fixture drill](tests/p02_worker_drill.py) passed with PostgreSQL 17 and a real
+systemd 259 user manager. It uses the deployment unit's process settings on a
+transient service and exercises the same worker dispatcher. It covers the queue
+limit, replay and conflict, exclusive control ownership, plan digest drift,
+single-use restore and retention intents, verified backup and archive reads, exact
+deletion, running cancellation, clean subsequent work and a native descendant
+that enters a new session and ignores SIGTERM. The same-unit restart reports both
+active and queued jobs interrupted. The restored database contains the fixture row.
+The drill can be rerun with `python3 tests/p02_worker_drill.py <supervised-test-binary>`
+after building `cargo test -p backup-api --locked --offline --no-run` and
+`cargo build -p backupctl --locked --offline`. It needs Docker, a running user
+manager and a C compiler. It provisions a temporary root-owned fixture tool
+directory under `/opt` and removes that directory and its container on exit.
+The deploy unit's syntax passed `systemd-analyze verify` with the built binary
+path. System installation and service sandbox compatibility belong to integrated release testing.
+
+The offline workspace fast gate passed with **324 tests**, strict Clippy, format,
+examples and workflow checks. The systemd drill is opt-in and passed separately.
+The official OpenAPI structural schema and 53 positive and 14 negative examples
+pass. Rust 1.97.1 builds the locked Tokio graph. The seven added or updated registry
+identities use MIT or MIT/Apache-2.0 licensing and declare minimum Rust versions
+at or below 1.85. Full `cargo-audit` 0.22.2 against RustSec revision
+`233155b4025b854c68a4b199c0e32d7fd53291a2` reports zero vulnerabilities and the same
+basic-toml and proc-macro-error2 maintenance warnings. Evidence is in
+`target/ci-logs/fast{,-inputs.json}` and `/tmp/parsbackup-p02-{drill.log,audit.json}`.
+
+P02 remains a fixture checkpoint. Axum and HTTP/session handling arrive in P03
+when they have a caller. The `--supervise` entry point checks the environment and
+drives the dispatcher. The `Control` interface accepts actor identities from a
+trusted in-process caller, and the P03 transport is responsible for authenticating
+them. Next is P03, followed by P04 and the UI.
+
+The P01/P02 checkpoint review kept cancellation available at the receipt cap.
+Cancellation is idempotent through the state of its target job. It validates
+the idempotency key and uses no additional receipt. A backup that cannot obtain
+a recovery report records interrupted work with unknown effects. A later backup
+failure preserves known recovery effects when the backup itself has no larger
+effects to report. The fresh fast gate passed all 324 tests, and the PostgreSQL
+17/systemd drill passed with both new regression cases. The locked dependency
+graph matches the prior P02 audit. P03 remains the next implementation task.

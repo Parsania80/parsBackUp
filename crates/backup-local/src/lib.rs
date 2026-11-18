@@ -17,7 +17,7 @@ mod inventory;
 mod keys;
 pub use custody::{
     KeyMutation, KeyMutationOutcome, KeyUse, mutate_protected_keys, open_protected_store,
-    protected_key_status,
+    protected_directory, protected_key_status,
 };
 mod filesystem;
 mod reconcile;
@@ -1172,27 +1172,31 @@ impl ArtifactStore for LocalStore {
     }
 
     fn load_plan(&self, id: Uuid) -> Result<Option<RestorePlan>> {
-        let path = self.plan_path(id);
-        match fs::symlink_metadata(&path) {
-            Ok(meta) => {
-                if meta.file_type().is_symlink() || !meta.is_file() {
-                    bail!("restore plan must be a regular non-symlink file");
-                }
-                let mut bytes = Vec::new();
-                File::open(&path)?
-                    .take(MAX_PLAN_BYTES + 1)
-                    .read_to_end(&mut bytes)?;
-                if bytes.len() as u64 > MAX_PLAN_BYTES {
-                    bail!("restore plan exceeds size limit");
-                }
-                let plan: RestorePlan = serde_json::from_slice(&bytes)?;
-                plan.validate(backup_application::now_unix_ms()?)?;
-                Ok(Some(plan))
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(error).context("inspect restore plan"),
-        }
+        read_restore_plan(&self.plan_path(id))
     }
+}
+
+fn read_restore_plan(path: &Path) -> Result<Option<RestorePlan>> {
+    let mut bytes = Vec::new();
+    let file = match open_regular(path) {
+        Ok(file) => file,
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            return Ok(None);
+        }
+        Err(error) => return Err(error.context("open restore plan")),
+    };
+    file.take(MAX_PLAN_BYTES + 1).read_to_end(&mut bytes)?;
+    anyhow::ensure!(
+        bytes.len() as u64 <= MAX_PLAN_BYTES,
+        "restore plan exceeds size limit"
+    );
+    let plan: RestorePlan = serde_json::from_slice(&bytes)?;
+    plan.validate(backup_application::now_unix_ms()?)?;
+    Ok(Some(plan))
 }
 
 fn ensure_real_dir(path: &Path) -> Result<()> {

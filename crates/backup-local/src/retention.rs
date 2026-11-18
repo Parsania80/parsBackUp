@@ -49,6 +49,14 @@ impl LocalRetention {
     }
 }
 impl ProtectedRetention {
+    /// Read the plan's operation only after checking its exact saved digest.
+    pub fn bound_plan(root: &crate::ProtectedRoot, id: Uuid, digest: &str) -> Result<DeletionPlan> {
+        let saved = load_plan(root.path(), id)?;
+        saved.validate(id, saved.plan.operation, now()?)?;
+        ensure!(saved.digest == digest, "RETENTION_CONFIRMATION_MISMATCH");
+        Ok(saved.plan)
+    }
+
     pub fn new(store: LocalStore) -> Result<Self> {
         ensure!(
             store.fs_guard.is_some() && store.snapshot.is_none(),

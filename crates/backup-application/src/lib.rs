@@ -613,6 +613,15 @@ impl<E: DatabaseAdapter, S: ArtifactStore> BackupService<E, S> {
     }
 
     pub fn create(&self, config: &Config, profile_name: Option<&str>) -> Result<Created> {
+        self.create_with_job(config, profile_name)
+            .map(|(created, _)| created)
+    }
+
+    pub fn create_with_job(
+        &self,
+        config: &Config,
+        profile_name: Option<&str>,
+    ) -> Result<(Created, Option<Uuid>)> {
         control::check()?;
         let timeout = Duration::from_secs(config.timeout_seconds);
         let (info, resolved) = self.resolve(config, profile_name)?;
@@ -823,13 +832,15 @@ impl<E: DatabaseAdapter, S: ArtifactStore> BackupService<E, S> {
             job.complete()?;
             Ok(Created::Development(Box::new(manifest)))
         })();
-        result.map_err(|error: anyhow::Error| {
-            error.context(control::ExecutionFailure {
-                job_id: job.id(),
-                artifact_id: id,
-                effects: effects.get(),
+        result
+            .map(|created| (created, job.id()))
+            .map_err(|error: anyhow::Error| {
+                error.context(control::ExecutionFailure {
+                    job_id: job.id(),
+                    artifact_id: id,
+                    effects: effects.get(),
+                })
             })
-        })
     }
 
     /// Lists the store the way it can be trusted: a signed store is discovered from
@@ -1086,6 +1097,7 @@ pub struct RestoreService<E, S> {
 
 #[derive(Debug)]
 pub struct RestoreOutcome {
+    pub job_id: Option<Uuid>,
     pub plan: RestorePlan,
     /// The artifact's verification level after this run.
     pub verification_level: String,
@@ -1297,11 +1309,26 @@ impl<E: DatabaseAdapter, S: ArtifactStore> RestoreService<E, S> {
         plan_id: Uuid,
         confirm_target: &str,
     ) -> Result<RestoreOutcome> {
+        self.run_bound(config, plan_id, confirm_target, None)
+    }
+
+    /// Bind the digest on the very plan consumed by the service, before preflight.
+    pub fn run_bound(
+        &self,
+        config: &Config,
+        plan_id: Uuid,
+        confirm_target: &str,
+        expected_digest: Option<&str>,
+    ) -> Result<RestoreOutcome> {
         let timeout = Duration::from_secs(config.timeout_seconds);
         let plan = self
             .store
             .load_plan(plan_id)?
             .context("restore plan not found")?;
+        anyhow::ensure!(
+            expected_digest.is_none_or(|digest| plan.digest() == digest),
+            "RESTORE_PLAN_DIGEST_MISMATCH"
+        );
         plan.validate(now_unix_ms()?)?;
         if plan.target_database != confirm_target {
             bail!("confirmation target does not match the planned database");
@@ -1424,6 +1451,7 @@ impl<E: DatabaseAdapter, S: ArtifactStore> RestoreService<E, S> {
                 job.complete()
                     .context("restore succeeded but recording job completion failed")?;
                 return Ok(RestoreOutcome {
+                    job_id: job.id(),
                     plan,
                     verification_level: recorded,
                     recorded_in_artifact: false,
@@ -1435,6 +1463,7 @@ impl<E: DatabaseAdapter, S: ArtifactStore> RestoreService<E, S> {
                 job.complete()
                     .context("restore succeeded but recording job completion failed")?;
                 return Ok(RestoreOutcome {
+                    job_id: job.id(),
                     plan,
                     verification_level: recorded,
                     recorded_in_artifact: false,
@@ -1453,6 +1482,7 @@ impl<E: DatabaseAdapter, S: ArtifactStore> RestoreService<E, S> {
             job.complete()
                 .context("restore succeeded but recording job completion failed")?;
             Ok(RestoreOutcome {
+                job_id: job.id(),
                 plan,
                 verification_level: VERIFY_RESTORE_TESTED.to_string(),
                 recorded_in_artifact: true,

@@ -1,0 +1,35 @@
+[Unit]
+Description=parsBackUp fixture API supervisor
+After=network.target
+
+[Service]
+Type=exec
+User=backupctl
+Group=backupctl
+UMask=0077
+StateDirectory=backup-api
+StateDirectoryMode=0700
+WorkingDirectory=/var/lib/backup-api
+ExecStart=/usr/bin/backup-api --supervise /etc/backupctl/api.toml
+TimeoutStopSec=30s
+KillMode=mixed
+KillSignal=SIGTERM
+FinalKillSignal=SIGKILL
+SendSIGKILL=yes
+Delegate=no
+Restart=no
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectControlGroups=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+ReadWritePaths=/var/lib/backupctl
+LimitCORE=0
+LimitNOFILE=1024
+TasksMax=128
+MemoryMax=2G

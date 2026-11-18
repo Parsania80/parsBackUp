@@ -114,6 +114,14 @@ impl ProtectedRoot {
     pub fn path(&self) -> &Path {
         &self.path
     }
+    /// Admission can validate a saved plan without opening keys or initializing the store.
+    pub fn saved_restore_plan(&self, id: uuid::Uuid) -> Result<Option<backup_domain::RestorePlan>> {
+        let plans = open_dir(&self.directory, c"plans")?;
+        private_dir(&plans)?;
+        let path = PathBuf::from(format!("/proc/self/fd/{}/{id}.json", plans.as_raw_fd()));
+        crate::read_restore_plan(&path)
+    }
+
     pub fn keyless_store(self: &Arc<Self>) -> Result<crate::LocalStore> {
         self.initialize()?;
         Ok(crate::LocalStore {

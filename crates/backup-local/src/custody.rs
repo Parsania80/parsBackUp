@@ -198,7 +198,8 @@ impl Resources {
     }
 }
 
-pub(crate) fn protected_directory(path: &Path) -> Result<File> {
+/// Open and pin a directory through trusted, non-symlink ancestors.
+pub fn protected_directory(path: &Path) -> Result<File> {
     ensure!(
         path.is_absolute()
             && !path

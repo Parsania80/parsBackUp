@@ -329,3 +329,23 @@ W2 checkpoint review found no blocking issues; the operator requested its local
 commit before P01 API design. Retained 324-test/all-major context-recovery evidence
 was rechecked against unchanged test and contract inputs. Git history records the
 commit identity; pushing remains operator-owned.
+
+W2 is committed locally as **2f60e33**. [P01 API design](docs/development/p01-api-contract.md)
+now defines the first web interface: authenticated requests, saved restore/deletion
+confirmations, safe reports and retry-safe background jobs. The [OpenAPI contract](docs/api/openapi-v1.json)
+has 20 operations; the server itself is not implemented yet. One isolated worker
+will reuse the existing core, with a bounded queue and honest crash/cancellation
+results. **Next: P02 worker implementation → API routes/tests → UI → integrated
+release validation.** No additional general backend phase; production stays disabled.
+
+P02 now runs background jobs through the existing backup and restore services.
+It accepts up to 16 queued jobs and runs one at a time. Retries return the original
+job, and a restart reports interrupted work for review. The PostgreSQL 17 and
+systemd drill verified backup, restore, confirmed deletion, cancellation and process
+cleanup. [P02 implementation and verification](project.md#59-p02-bounded-api-worker--2026-11-18)
+records the results. **Next is P03, the HTTP routes and authentication.**
+
+The P01/P02 checkpoint review verified that queued jobs can still be cancelled
+when the receipt limit is reached. Backup jobs now report uncertainty if the
+recovery pass fails before it can say what changed. Git history records the local
+checkpoint.

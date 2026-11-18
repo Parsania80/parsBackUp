@@ -1,0 +1,4084 @@
+{
+  "openapi": "3.1.2",
+  "info": {
+    "title": "parsBackUp fixture API",
+    "version": "1.0.0-design",
+    "description": "P01 design only. No routes implemented. Read p01-api-contract.md for actor/intent, restart and containment invariants; production operations remain disabled."
+  },
+  "servers": [
+    {
+      "url": "http://127.0.0.1:8090",
+      "description": "Explicit loopback fixture development only; deployed browser origin requires HTTPS"
+    }
+  ],
+  "security": [
+    {
+      "bearerToken": []
+    },
+    {
+      "sessionCookie": []
+    }
+  ],
+  "paths": {
+    "/api/v1/session": {
+      "post": {
+        "operationId": "createSession",
+        "summary": "Exchange operator token for an eight-hour browser session",
+        "x-permission": "session.exchange",
+        "responses": {
+          "400": {
+            "$ref": "#/components/responses/400"
+          },
+          "401": {
+            "$ref": "#/components/responses/401"
+          },
+          "403": {
+            "$ref": "#/components/responses/403"
+          },
+          "404": {
+            "$ref": "#/components/responses/404"
+          },
+          "409": {
+            "$ref": "#/components/responses/409"
+          },
+          "410": {
+            "$ref": "#/components/responses/410"
+          },
+          "413": {
+            "$ref": "#/components/responses/413"
+          },
+          "415": {
+            "$ref": "#/components/responses/415"
+          },
+          "422": {
+            "$ref": "#/components/responses/422"
+          },
+          "429": {
+            "$ref": "#/components/responses/429"
+          },
+          "500": {
+            "$ref": "#/components/responses/500"
+          },
+          "503": {
+            "$ref": "#/components/responses/503"
+          },
+          "201": {
+            "description": "Successful read, current cancellation state, or terminal idempotent replay",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionResponse"
+                }
+              }
+            },
+            "headers": {
+              "Set-Cookie": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "__Host-backupctl opaque cookie; HttpOnly; Secure; SameSite=Strict; Path=/"
+              }
+            }
+          }
+        },
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/LoginOrigin"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LoginRequest"
+              },
+              "example": {
+                "token": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+              }
+            }
+          }
+        },
+        "security": []
+      },
+      "get": {
+        "operationId": "getSession",
+        "summary": "Current actor; bearer calls have null session expiry and CSRF token",
+        "x-permission": "session.self",
+        "responses": {
+          "200": {
+            "description": "Successful read, current cancellation state, or terminal idempotent replay",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/400"
+          },
+          "401": {
+            "$ref": "#/components/responses/401"
+          },
+          "403": {
+            "$ref": "#/components/responses/403"
+          },
+          "404": {
+            "$ref": "#/components/responses/404"
+          },
+          "409": {
+            "$ref": "#/components/responses/409"
+          },
+          "410": {
+            "$ref": "#/components/responses/410"
+          },
+          "413": {
+            "$ref": "#/components/responses/413"
+          },
+          "415": {
+            "$ref": "#/components/responses/415"
+          },
+          "422": {
+            "$ref": "#/components/responses/422"
+          },
+          "429": {
+            "$ref": "#/components/responses/429"
+          },
+          "500": {
+            "$ref": "#/components/responses/500"
+          },
+          "503": {
+            "$ref": "#/components/responses/503"
+          }
+        },
+        "parameters": []
+      },
+      "delete": {
+        "operationId": "deleteSession",
+        "summary": "Revoke current cookie session; subsequent use requires reauthentication",
+        "x-permission": "session.self",
+        "responses": {
+          "200": {
+            "description": "Successful read, current cancellation state, or terminal idempotent replay",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionRevokedResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/400"
+          },
+          "401": {
+            "$ref": "#/components/responses/401"
+          },
+          "403": {
+            "$ref": "#/components/responses/403"
+          },
+          "404": {
+            "$ref": "#/components/responses/404"
+          },
+          "409": {
+            "$ref": "#/components/responses/409"
+          },
+          "410": {
+            "$ref": "#/components/responses/410"
+          },
+          "413": {
+            "$ref": "#/components/responses/413"
+          },
+          "415": {
+            "$ref": "#/components/responses/415"
+          },
+          "422": {
+            "$ref": "#/components/responses/422"
+          },
+          "429": {
+            "$ref": "#/components/responses/429"
+          },
+          "500": {
+            "$ref": "#/components/responses/500"
+          },
+          "503": {
+            "$ref": "#/components/responses/503"
+          }
+        },
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/Origin"
+          },
+          {
+            "$ref": "#/components/parameters/CsrfToken"
+          }
+        ],
+        "security": [
+          {
+            "sessionCookie": []
+          }
+        ]
+      }
+    },
+    "/api/v1/health": {
+      "get": {
+        "operationId": "getHealth",
+        "summary": "getHealth",
+        "x-permission": "health.read",
+        "responses": {
+          "200": {
+            "description": "Successful read, current cancellation state, or terminal idempotent replay",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HealthResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/400"
+          },
+          "401": {
+            "$ref": "#/components/responses/401"
+          },
+          "403": {
+            "$ref": "#/components/responses/403"
+          },
+          "404": {
+            "$ref": "#/components/responses/404"
+          },
+          "409": {
+            "$ref": "#/components/responses/409"
+          },
+          "410": {
+            "$ref": "#/components/responses/410"
+          },
+          "413": {
+            "$ref": "#/components/responses/413"
+          },
+          "415": {
+            "$ref": "#/components/responses/415"
+          },
+          "422": {
+            "$ref": "#/components/responses/422"
+          },
+          "429": {
+            "$ref": "#/components/responses/429"
+          },
+          "500": {
+            "$ref": "#/components/responses/500"
+          },
+          "503": {
+            "$ref": "#/components/responses/503"
+          }
+        },
+        "parameters": []
+      }
+    },
+    "/api/v1/metrics": {
+      "get": {
+        "operationId": "getMetrics",
+        "summary": "getMetrics",
+        "x-permission": "metrics.read",
+        "responses": {
+          "200": {
+            "description": "Successful read, current cancellation state, or terminal idempotent replay",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MetricsResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/400"
+          },
+          "401": {
+            "$ref": "#/components/responses/401"
+          },
+          "403": {
+            "$ref": "#/components/responses/403"
+          },
+          "404": {
+            "$ref": "#/components/responses/404"
+          },
+          "409": {
+            "$ref": "#/components/responses/409"
+          },
+          "410": {
+            "$ref": "#/components/responses/410"
+          },
+          "413": {
+            "$ref": "#/components/responses/413"
+          },
+          "415": {
+            "$ref": "#/components/responses/415"
+          },
+          "422": {
+            "$ref": "#/components/responses/422"
+          },
+          "429": {
+            "$ref": "#/components/responses/429"
+          },
+          "500": {
+            "$ref": "#/components/responses/500"
+          },
+          "503": {
+            "$ref": "#/components/responses/503"
+          }
+        },
+        "parameters": []
+      }
+    },
+    "/api/v1/profiles": {
+      "get": {
+        "operationId": "listProfiles",
+        "summary": "listProfiles",
+        "x-permission": "profile.read",
+        "responses": {
+          "200": {
+            "description": "Successful read, current cancellation state, or terminal idempotent replay",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProfilesResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/400"
+          },
+          "401": {
+            "$ref": "#/components/responses/401"
+          },
+          "403": {
+            "$ref": "#/components/responses/403"
+          },
+          "404": {
+            "$ref": "#/components/responses/404"
+          },
+          "409": {
+            "$ref": "#/components/responses/409"
+          },
+          "410": {
+            "$ref": "#/components/responses/410"
+          },
+          "413": {
+            "$ref": "#/components/responses/413"
+          },
+          "415": {
+            "$ref": "#/components/responses/415"
+          },
+          "422": {
+            "$ref": "#/components/responses/422"
+          },
+          "429": {
+            "$ref": "#/components/responses/429"
+          },
+          "500": {
+            "$ref": "#/components/responses/500"
+          },
+          "503": {
+            "$ref": "#/components/responses/503"
+          }
+        },
+        "parameters": []
+      }
+    },
+    "/api/v1/artifacts": {
+      "get": {
+        "operationId": "listArtifacts",
+        "summary": "listArtifacts",
+        "x-permission": "artifact.list",
+        "responses": {
+          "200": {
+            "description": "Successful read, current cancellation state, or terminal idempotent replay",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ArtifactPageResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/400"
+          },
+          "401": {
+            "$ref": "#/components/responses/401"
+          },
+          "403": {
+            "$ref": "#/components/responses/403"
+          },
+          "404": {
+            "$ref": "#/components/responses/404"
+          },
+          "409": {
+            "$ref": "#/components/responses/409"
+          },
+          "410": {
+            "$ref": "#/components/responses/410"
+          },
+          "413": {
+            "$ref": "#/components/responses/413"
+          },
+          "415": {
+            "$ref": "#/components/responses/415"
+          },
+          "422": {
+            "$ref": "#/components/responses/422"
+          },
+          "429": {
+            "$ref": "#/components/responses/429"
+          },
+          "500": {
+            "$ref": "#/components/responses/500"
+          },
+          "503": {
+            "$ref": "#/components/responses/503"
+          }
+        },
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/Limit"
+          },
+          {
+            "$ref": "#/components/parameters/After"
+          }
+        ]
+      }
+    },
+    "/api/v1/jobs": {
+      "get": {
+        "operationId": "listJobs",
+        "summary": "listJobs",
+        "x-permission": "job.read_own",
+        "responses": {
+          "200": {
+            "description": "Successful read, current cancellation state, or terminal idempotent replay",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobPageResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/400"
+          },
+          "401": {
+            "$ref": "#/components/responses/401"
+          },
+          "403": {
+            "$ref": "#/components/responses/403"
+          },
+          "404": {
+            "$ref": "#/components/responses/404"
+          },
+          "409": {
+            "$ref": "#/components/responses/409"
+          },
+          "410": {
+            "$ref": "#/components/responses/410"
+          },
+          "413": {
+            "$ref": "#/components/responses/413"
+          },
+          "415": {
+            "$ref": "#/components/responses/415"
+          },
+          "422": {
+            "$ref": "#/components/responses/422"
+          },
+          "429": {
+            "$ref": "#/components/responses/429"
+          },
+          "500": {
+            "$ref": "#/components/responses/500"
+          },
+          "503": {
+            "$ref": "#/components/responses/503"
+          }
+        },
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/Limit"
+          },
+          {
+            "$ref": "#/components/parameters/After"
+          }
+        ]
+      }
+    },
+    "/api/v1/artifacts/{artifact_id}": {
+      "get": {
+        "operationId": "getArtifact",
+        "summary": "getArtifact",
+        "x-permission": "artifact.list",
+        "responses": {
+          "200": {
+            "description": "Successful read, current cancellation state, or terminal idempotent replay",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ArtifactResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/400"
+          },
+          "401": {
+            "$ref": "#/components/responses/401"
+          },
+          "403": {
+            "$ref": "#/components/responses/403"
+          },
+          "404": {
+            "$ref": "#/components/responses/404"
+          },
+          "409": {
+            "$ref": "#/components/responses/409"
+          },
+          "410": {
+            "$ref": "#/components/responses/410"
+          },
+          "413": {
+            "$ref": "#/components/responses/413"
+          },
+          "415": {
+            "$ref": "#/components/responses/415"
+          },
+          "422": {
+            "$ref": "#/components/responses/422"
+          },
+          "429": {
+            "$ref": "#/components/responses/429"
+          },
+          "500": {
+            "$ref": "#/components/responses/500"
+          },
+          "503": {
+            "$ref": "#/components/responses/503"
+          }
+        },
+        "parameters": []
+      },
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/ArtifactId"
+        }
+      ]
+    },
+    "/api/v1/jobs/{job_id}": {
+      "get": {
+        "operationId": "getJob",
+        "summary": "getJob",
+        "x-permission": "job.read_own",
+        "responses": {
+          "200": {
+            "description": "Successful read, current cancellation state, or terminal idempotent replay",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/400"
+          },
+          "401": {
+            "$ref": "#/components/responses/401"
+          },
+          "403": {
+            "$ref": "#/components/responses/403"
+          },
+          "404": {
+            "$ref": "#/components/responses/404"
+          },
+          "409": {
+            "$ref": "#/components/responses/409"
+          },
+          "410": {
+            "$ref": "#/components/responses/410"
+          },
+          "413": {
+            "$ref": "#/components/responses/413"
+          },
+          "415": {
+            "$ref": "#/components/responses/415"
+          },
+          "422": {
+            "$ref": "#/components/responses/422"
+          },
+          "429": {
+            "$ref": "#/components/responses/429"
+          },
+          "500": {
+            "$ref": "#/components/responses/500"
+          },
+          "503": {
+            "$ref": "#/components/responses/503"
+          }
+        },
+        "parameters": []
+      },
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/JobId"
+        }
+      ]
+    },
+    "/api/v1/intents/{intent_id}": {
+      "get": {
+        "operationId": "getIntent",
+        "summary": "getIntent",
+        "x-permission": "job.read_own",
+        "responses": {
+          "200": {
+            "description": "Successful read, current cancellation state, or terminal idempotent replay",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IntentResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/400"
+          },
+          "401": {
+            "$ref": "#/components/responses/401"
+          },
+          "403": {
+            "$ref": "#/components/responses/403"
+          },
+          "404": {
+            "$ref": "#/components/responses/404"
+          },
+          "409": {
+            "$ref": "#/components/responses/409"
+          },
+          "410": {
+            "$ref": "#/components/responses/410"
+          },
+          "413": {
+            "$ref": "#/components/responses/413"
+          },
+          "415": {
+            "$ref": "#/components/responses/415"
+          },
+          "422": {
+            "$ref": "#/components/responses/422"
+          },
+          "429": {
+            "$ref": "#/components/responses/429"
+          },
+          "500": {
+            "$ref": "#/components/responses/500"
+          },
+          "503": {
+            "$ref": "#/components/responses/503"
+          }
+        },
+        "parameters": []
+      },
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/IntentId"
+        }
+      ]
+    },
+    "/api/v1/jobs/{job_id}/cancel": {
+      "post": {
+        "operationId": "cancelJob",
+        "summary": "Persist cancellation request and return the same owned job; never create a second job",
+        "x-permission": "job.cancel_own",
+        "responses": {
+          "200": {
+            "description": "Successful read, current cancellation state, or terminal idempotent replay",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/400"
+          },
+          "401": {
+            "$ref": "#/components/responses/401"
+          },
+          "403": {
+            "$ref": "#/components/responses/403"
+          },
+          "404": {
+            "$ref": "#/components/responses/404"
+          },
+          "409": {
+            "$ref": "#/components/responses/409"
+          },
+          "410": {
+            "$ref": "#/components/responses/410"
+          },
+          "413": {
+            "$ref": "#/components/responses/413"
+          },
+          "415": {
+            "$ref": "#/components/responses/415"
+          },
+          "422": {
+            "$ref": "#/components/responses/422"
+          },
+          "429": {
+            "$ref": "#/components/responses/429"
+          },
+          "500": {
+            "$ref": "#/components/responses/500"
+          },
+          "503": {
+            "$ref": "#/components/responses/503"
+          }
+        },
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/Origin"
+          },
+          {
+            "$ref": "#/components/parameters/CsrfToken"
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CancelRequest"
+              },
+              "example": {}
+            }
+          }
+        },
+        "x-idempotent-cancellation": true
+      },
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/JobId"
+        }
+      ]
+    },
+    "/api/v1/backups": {
+      "post": {
+        "operationId": "createBackup",
+        "summary": "createBackup",
+        "x-permission": "backup.create",
+        "responses": {
+          "200": {
+            "description": "Successful read, current cancellation state, or terminal idempotent replay",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobResponse"
+                }
+              }
+            }
+          },
+          "202": {
+            "description": "Durably admitted, or nonterminal idempotent replay; not operation success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobResponse"
+                }
+              }
+            },
+            "headers": {
+              "Location": {
+                "schema": {
+                  "type": "string",
+                  "pattern": "^/api/v1/jobs/[0-9a-f-]{36}$"
+                }
+              },
+              "Retry-After": {
+                "schema": {
+                  "type": "string",
+                  "const": "2"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/400"
+          },
+          "401": {
+            "$ref": "#/components/responses/401"
+          },
+          "403": {
+            "$ref": "#/components/responses/403"
+          },
+          "404": {
+            "$ref": "#/components/responses/404"
+          },
+          "409": {
+            "$ref": "#/components/responses/409"
+          },
+          "410": {
+            "$ref": "#/components/responses/410"
+          },
+          "413": {
+            "$ref": "#/components/responses/413"
+          },
+          "415": {
+            "$ref": "#/components/responses/415"
+          },
+          "422": {
+            "$ref": "#/components/responses/422"
+          },
+          "429": {
+            "$ref": "#/components/responses/429"
+          },
+          "500": {
+            "$ref": "#/components/responses/500"
+          },
+          "503": {
+            "$ref": "#/components/responses/503"
+          }
+        },
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/Origin"
+          },
+          {
+            "$ref": "#/components/parameters/CsrfToken"
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BackupRequest"
+              },
+              "example": {
+                "profile_id": null,
+                "confirm_synthetic": true
+              }
+            }
+          }
+        },
+        "x-durable-job": true
+      }
+    },
+    "/api/v1/inspections": {
+      "post": {
+        "operationId": "createInspection",
+        "summary": "createInspection",
+        "x-permission": "artifact.inspect",
+        "responses": {
+          "200": {
+            "description": "Successful read, current cancellation state, or terminal idempotent replay",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobResponse"
+                }
+              }
+            }
+          },
+          "202": {
+            "description": "Durably admitted, or nonterminal idempotent replay; not operation success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobResponse"
+                }
+              }
+            },
+            "headers": {
+              "Location": {
+                "schema": {
+                  "type": "string",
+                  "pattern": "^/api/v1/jobs/[0-9a-f-]{36}$"
+                }
+              },
+              "Retry-After": {
+                "schema": {
+                  "type": "string",
+                  "const": "2"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/400"
+          },
+          "401": {
+            "$ref": "#/components/responses/401"
+          },
+          "403": {
+            "$ref": "#/components/responses/403"
+          },
+          "404": {
+            "$ref": "#/components/responses/404"
+          },
+          "409": {
+            "$ref": "#/components/responses/409"
+          },
+          "410": {
+            "$ref": "#/components/responses/410"
+          },
+          "413": {
+            "$ref": "#/components/responses/413"
+          },
+          "415": {
+            "$ref": "#/components/responses/415"
+          },
+          "422": {
+            "$ref": "#/components/responses/422"
+          },
+          "429": {
+            "$ref": "#/components/responses/429"
+          },
+          "500": {
+            "$ref": "#/components/responses/500"
+          },
+          "503": {
+            "$ref": "#/components/responses/503"
+          }
+        },
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/Origin"
+          },
+          {
+            "$ref": "#/components/parameters/CsrfToken"
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ArtifactRequest"
+              },
+              "example": {
+                "artifact_id": "44444444-4444-4444-8444-444444444444"
+              }
+            }
+          }
+        },
+        "x-durable-job": true
+      }
+    },
+    "/api/v1/verifications": {
+      "post": {
+        "operationId": "createVerification",
+        "summary": "createVerification",
+        "x-permission": "artifact.verify",
+        "responses": {
+          "200": {
+            "description": "Successful read, current cancellation state, or terminal idempotent replay",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobResponse"
+                }
+              }
+            }
+          },
+          "202": {
+            "description": "Durably admitted, or nonterminal idempotent replay; not operation success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobResponse"
+                }
+              }
+            },
+            "headers": {
+              "Location": {
+                "schema": {
+                  "type": "string",
+                  "pattern": "^/api/v1/jobs/[0-9a-f-]{36}$"
+                }
+              },
+              "Retry-After": {
+                "schema": {
+                  "type": "string",
+                  "const": "2"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/400"
+          },
+          "401": {
+            "$ref": "#/components/responses/401"
+          },
+          "403": {
+            "$ref": "#/components/responses/403"
+          },
+          "404": {
+            "$ref": "#/components/responses/404"
+          },
+          "409": {
+            "$ref": "#/components/responses/409"
+          },
+          "410": {
+            "$ref": "#/components/responses/410"
+          },
+          "413": {
+            "$ref": "#/components/responses/413"
+          },
+          "415": {
+            "$ref": "#/components/responses/415"
+          },
+          "422": {
+            "$ref": "#/components/responses/422"
+          },
+          "429": {
+            "$ref": "#/components/responses/429"
+          },
+          "500": {
+            "$ref": "#/components/responses/500"
+          },
+          "503": {
+            "$ref": "#/components/responses/503"
+          }
+        },
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/Origin"
+          },
+          {
+            "$ref": "#/components/parameters/CsrfToken"
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/VerificationRequest"
+              },
+              "example": {
+                "artifact_id": "44444444-4444-4444-8444-444444444444",
+                "level": "archive"
+              }
+            }
+          }
+        },
+        "x-durable-job": true
+      }
+    },
+    "/api/v1/restore-plans": {
+      "post": {
+        "operationId": "createRestorePlan",
+        "summary": "createRestorePlan",
+        "x-permission": "restore.plan",
+        "responses": {
+          "200": {
+            "description": "Successful read, current cancellation state, or terminal idempotent replay",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobResponse"
+                }
+              }
+            }
+          },
+          "202": {
+            "description": "Durably admitted, or nonterminal idempotent replay; not operation success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobResponse"
+                }
+              }
+            },
+            "headers": {
+              "Location": {
+                "schema": {
+                  "type": "string",
+                  "pattern": "^/api/v1/jobs/[0-9a-f-]{36}$"
+                }
+              },
+              "Retry-After": {
+                "schema": {
+                  "type": "string",
+                  "const": "2"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/400"
+          },
+          "401": {
+            "$ref": "#/components/responses/401"
+          },
+          "403": {
+            "$ref": "#/components/responses/403"
+          },
+          "404": {
+            "$ref": "#/components/responses/404"
+          },
+          "409": {
+            "$ref": "#/components/responses/409"
+          },
+          "410": {
+            "$ref": "#/components/responses/410"
+          },
+          "413": {
+            "$ref": "#/components/responses/413"
+          },
+          "415": {
+            "$ref": "#/components/responses/415"
+          },
+          "422": {
+            "$ref": "#/components/responses/422"
+          },
+          "429": {
+            "$ref": "#/components/responses/429"
+          },
+          "500": {
+            "$ref": "#/components/responses/500"
+          },
+          "503": {
+            "$ref": "#/components/responses/503"
+          }
+        },
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/Origin"
+          },
+          {
+            "$ref": "#/components/parameters/CsrfToken"
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RestorePlanRequest"
+              },
+              "example": {
+                "artifact_id": "44444444-4444-4444-8444-444444444444",
+                "target_database": "backupctl_fixture_restored",
+                "security": "portable",
+                "sections": "full",
+                "acknowledge_older_snapshot": false,
+                "confirm_synthetic": true
+              }
+            }
+          }
+        },
+        "x-durable-job": true
+      }
+    },
+    "/api/v1/restores": {
+      "post": {
+        "operationId": "createRestore",
+        "summary": "createRestore",
+        "x-permission": "restore.run",
+        "responses": {
+          "200": {
+            "description": "Successful read, current cancellation state, or terminal idempotent replay",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobResponse"
+                }
+              }
+            }
+          },
+          "202": {
+            "description": "Durably admitted, or nonterminal idempotent replay; not operation success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobResponse"
+                }
+              }
+            },
+            "headers": {
+              "Location": {
+                "schema": {
+                  "type": "string",
+                  "pattern": "^/api/v1/jobs/[0-9a-f-]{36}$"
+                }
+              },
+              "Retry-After": {
+                "schema": {
+                  "type": "string",
+                  "const": "2"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/400"
+          },
+          "401": {
+            "$ref": "#/components/responses/401"
+          },
+          "403": {
+            "$ref": "#/components/responses/403"
+          },
+          "404": {
+            "$ref": "#/components/responses/404"
+          },
+          "409": {
+            "$ref": "#/components/responses/409"
+          },
+          "410": {
+            "$ref": "#/components/responses/410"
+          },
+          "413": {
+            "$ref": "#/components/responses/413"
+          },
+          "415": {
+            "$ref": "#/components/responses/415"
+          },
+          "422": {
+            "$ref": "#/components/responses/422"
+          },
+          "429": {
+            "$ref": "#/components/responses/429"
+          },
+          "500": {
+            "$ref": "#/components/responses/500"
+          },
+          "503": {
+            "$ref": "#/components/responses/503"
+          }
+        },
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/Origin"
+          },
+          {
+            "$ref": "#/components/parameters/CsrfToken"
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RestoreRequest"
+              },
+              "example": {
+                "intent_id": "11111111-1111-4111-8111-111111111111",
+                "confirm_digest": "545e9e2aac7b520e81a5da19f11afe619da15953fbcb043eac4f129515166bff",
+                "confirm_target": "backupctl_fixture_restored",
+                "confirm_synthetic": true
+              }
+            }
+          }
+        },
+        "x-durable-job": true
+      }
+    },
+    "/api/v1/retention-previews": {
+      "post": {
+        "operationId": "createRetentionPreview",
+        "summary": "createRetentionPreview",
+        "x-permission": "retention.preview",
+        "responses": {
+          "200": {
+            "description": "Successful read, current cancellation state, or terminal idempotent replay",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobResponse"
+                }
+              }
+            }
+          },
+          "202": {
+            "description": "Durably admitted, or nonterminal idempotent replay; not operation success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobResponse"
+                }
+              }
+            },
+            "headers": {
+              "Location": {
+                "schema": {
+                  "type": "string",
+                  "pattern": "^/api/v1/jobs/[0-9a-f-]{36}$"
+                }
+              },
+              "Retry-After": {
+                "schema": {
+                  "type": "string",
+                  "const": "2"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/400"
+          },
+          "401": {
+            "$ref": "#/components/responses/401"
+          },
+          "403": {
+            "$ref": "#/components/responses/403"
+          },
+          "404": {
+            "$ref": "#/components/responses/404"
+          },
+          "409": {
+            "$ref": "#/components/responses/409"
+          },
+          "410": {
+            "$ref": "#/components/responses/410"
+          },
+          "413": {
+            "$ref": "#/components/responses/413"
+          },
+          "415": {
+            "$ref": "#/components/responses/415"
+          },
+          "422": {
+            "$ref": "#/components/responses/422"
+          },
+          "429": {
+            "$ref": "#/components/responses/429"
+          },
+          "500": {
+            "$ref": "#/components/responses/500"
+          },
+          "503": {
+            "$ref": "#/components/responses/503"
+          }
+        },
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/Origin"
+          },
+          {
+            "$ref": "#/components/parameters/CsrfToken"
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RetentionPreviewRequest"
+              },
+              "example": {
+                "operation": "prune",
+                "profile_id": null,
+                "keep_last": 2
+              }
+            }
+          }
+        },
+        "x-durable-job": true
+      }
+    },
+    "/api/v1/retention-runs": {
+      "post": {
+        "operationId": "createRetentionRun",
+        "summary": "createRetentionRun",
+        "x-permission": "retention.run",
+        "responses": {
+          "200": {
+            "description": "Successful read, current cancellation state, or terminal idempotent replay",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobResponse"
+                }
+              }
+            }
+          },
+          "202": {
+            "description": "Durably admitted, or nonterminal idempotent replay; not operation success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobResponse"
+                }
+              }
+            },
+            "headers": {
+              "Location": {
+                "schema": {
+                  "type": "string",
+                  "pattern": "^/api/v1/jobs/[0-9a-f-]{36}$"
+                }
+              },
+              "Retry-After": {
+                "schema": {
+                  "type": "string",
+                  "const": "2"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/400"
+          },
+          "401": {
+            "$ref": "#/components/responses/401"
+          },
+          "403": {
+            "$ref": "#/components/responses/403"
+          },
+          "404": {
+            "$ref": "#/components/responses/404"
+          },
+          "409": {
+            "$ref": "#/components/responses/409"
+          },
+          "410": {
+            "$ref": "#/components/responses/410"
+          },
+          "413": {
+            "$ref": "#/components/responses/413"
+          },
+          "415": {
+            "$ref": "#/components/responses/415"
+          },
+          "422": {
+            "$ref": "#/components/responses/422"
+          },
+          "429": {
+            "$ref": "#/components/responses/429"
+          },
+          "500": {
+            "$ref": "#/components/responses/500"
+          },
+          "503": {
+            "$ref": "#/components/responses/503"
+          }
+        },
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/Origin"
+          },
+          {
+            "$ref": "#/components/parameters/CsrfToken"
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RetentionRunRequest"
+              },
+              "example": {
+                "intent_id": "11111111-1111-4111-8111-111111111111",
+                "confirm_digest": "35e72e273e916a25e6a4f64bdfa32b7db45db660897786b4ab210b3b2c471ac9"
+              }
+            }
+          }
+        },
+        "x-durable-job": true
+      }
+    },
+    "/api/v1/artifact-protections": {
+      "post": {
+        "operationId": "createArtifactProtection",
+        "summary": "createArtifactProtection",
+        "x-permission": "artifact.protect",
+        "responses": {
+          "200": {
+            "description": "Successful read, current cancellation state, or terminal idempotent replay",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobResponse"
+                }
+              }
+            }
+          },
+          "202": {
+            "description": "Durably admitted, or nonterminal idempotent replay; not operation success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JobResponse"
+                }
+              }
+            },
+            "headers": {
+              "Location": {
+                "schema": {
+                  "type": "string",
+                  "pattern": "^/api/v1/jobs/[0-9a-f-]{36}$"
+                }
+              },
+              "Retry-After": {
+                "schema": {
+                  "type": "string",
+                  "const": "2"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/400"
+          },
+          "401": {
+            "$ref": "#/components/responses/401"
+          },
+          "403": {
+            "$ref": "#/components/responses/403"
+          },
+          "404": {
+            "$ref": "#/components/responses/404"
+          },
+          "409": {
+            "$ref": "#/components/responses/409"
+          },
+          "410": {
+            "$ref": "#/components/responses/410"
+          },
+          "413": {
+            "$ref": "#/components/responses/413"
+          },
+          "415": {
+            "$ref": "#/components/responses/415"
+          },
+          "422": {
+            "$ref": "#/components/responses/422"
+          },
+          "429": {
+            "$ref": "#/components/responses/429"
+          },
+          "500": {
+            "$ref": "#/components/responses/500"
+          },
+          "503": {
+            "$ref": "#/components/responses/503"
+          }
+        },
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/Origin"
+          },
+          {
+            "$ref": "#/components/parameters/CsrfToken"
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ProtectionRequest"
+              },
+              "example": {
+                "artifact_id": "44444444-4444-4444-8444-444444444444",
+                "protected": false,
+                "reason": "Operator verified replacement snapshot"
+              }
+            }
+          }
+        },
+        "x-durable-job": true
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "bearerToken": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "opaque 256-bit token"
+      },
+      "sessionCookie": {
+        "type": "apiKey",
+        "in": "cookie",
+        "name": "__Host-backupctl",
+        "description": "Exclusive with bearer; cookie mutations require exact Origin + X-CSRF-Token. Local HTTP fixture development uses backupctl-dev instead."
+      }
+    },
+    "parameters": {
+      "IdempotencyKey": {
+        "name": "Idempotency-Key",
+        "in": "header",
+        "required": true,
+        "schema": {
+          "$ref": "#/components/schemas/Id"
+        },
+        "description": "Actor/method/route-scoped UUIDv4. Submission retries return the original job. Cancellation retries return the current state of the referenced job."
+      },
+      "CsrfToken": {
+        "name": "X-CSRF-Token",
+        "in": "header",
+        "required": false,
+        "schema": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_-]{43}$"
+        },
+        "description": "Required for cookie-authenticated mutations; bearer authentication is exclusive."
+      },
+      "Origin": {
+        "name": "Origin",
+        "in": "header",
+        "required": false,
+        "schema": {
+          "type": "string",
+          "maxLength": 256
+        },
+        "description": "Exact configured origin required for login and cookie mutations; reject a mismatched supplied origin on any call."
+      },
+      "Limit": {
+        "name": "limit",
+        "in": "query",
+        "schema": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 100,
+          "default": 50
+        }
+      },
+      "After": {
+        "name": "after",
+        "in": "query",
+        "schema": {
+          "$ref": "#/components/schemas/Id"
+        },
+        "description": "Exclusive UUID ascending keyset cursor; observational pagination."
+      },
+      "ArtifactId": {
+        "name": "artifact_id",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "$ref": "#/components/schemas/Id"
+        }
+      },
+      "JobId": {
+        "name": "job_id",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "$ref": "#/components/schemas/Id"
+        }
+      },
+      "IntentId": {
+        "name": "intent_id",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "$ref": "#/components/schemas/Id"
+        }
+      },
+      "LoginOrigin": {
+        "name": "Origin",
+        "in": "header",
+        "required": true,
+        "schema": {
+          "type": "string",
+          "maxLength": 256
+        },
+        "description": "Exact configured origin required for login and cookie mutations; reject a mismatched supplied origin on any call."
+      }
+    },
+    "responses": {
+      "400": {
+        "description": "Invalid closed input",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ErrorResponse"
+            }
+          }
+        }
+      },
+      "401": {
+        "description": "Authentication required",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ErrorResponse"
+            }
+          }
+        },
+        "headers": {
+          "WWW-Authenticate": {
+            "schema": {
+              "type": "string"
+            },
+            "description": "Bearer"
+          }
+        }
+      },
+      "403": {
+        "description": "Permission or Origin/CSRF refused",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ErrorResponse"
+            }
+          }
+        }
+      },
+      "404": {
+        "description": "Unknown or invisible resource",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ErrorResponse"
+            }
+          }
+        }
+      },
+      "409": {
+        "description": "Idempotency, state, config or confirmation conflict",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ErrorResponse"
+            }
+          }
+        }
+      },
+      "410": {
+        "description": "Expired saved intent",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ErrorResponse"
+            }
+          }
+        }
+      },
+      "413": {
+        "description": "Body too large",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ErrorResponse"
+            }
+          }
+        }
+      },
+      "415": {
+        "description": "Unsupported media or encoding",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ErrorResponse"
+            }
+          }
+        }
+      },
+      "422": {
+        "description": "Core policy refused",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ErrorResponse"
+            }
+          }
+        }
+      },
+      "429": {
+        "description": "Rate or queue limit; no admission",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ErrorResponse"
+            }
+          }
+        },
+        "headers": {
+          "Retry-After": {
+            "schema": {
+              "type": "string",
+              "const": "1"
+            }
+          }
+        }
+      },
+      "500": {
+        "description": "Safe unexpected failure",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ErrorResponse"
+            }
+          }
+        }
+      },
+      "503": {
+        "description": "Service, containment, discovery or capacity unavailable",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/ErrorResponse"
+            }
+          }
+        }
+      }
+    },
+    "schemas": {
+      "Id": {
+        "type": "string",
+        "format": "uuid",
+        "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+      },
+      "Digest": {
+        "type": "string",
+        "pattern": "^[0-9a-f]{64}$"
+      },
+      "Timestamp": {
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 9007199254740991
+      },
+      "ProfileId": {
+        "type": "string",
+        "pattern": "^[a-z][a-z0-9_-]{0,63}$"
+      },
+      "Target": {
+        "type": "string",
+        "pattern": "^backupctl_fixture_[a-z0-9_]+$",
+        "maxLength": 63
+      },
+      "Permission": {
+        "type": "string",
+        "enum": [
+          "session.self",
+          "artifact.list",
+          "profile.read",
+          "job.read_own",
+          "health.read",
+          "backup.create",
+          "artifact.inspect",
+          "artifact.verify",
+          "restore.plan",
+          "restore.run",
+          "retention.preview",
+          "retention.run",
+          "artifact.protect",
+          "job.cancel_own",
+          "job.read_all",
+          "job.cancel_all",
+          "metrics.read"
+        ]
+      },
+      "Security": {
+        "type": "string",
+        "enum": [
+          "portable",
+          "dr_full"
+        ]
+      },
+      "Sections": {
+        "type": "string",
+        "enum": [
+          "full",
+          "pre_data",
+          "pre_data_data"
+        ]
+      },
+      "Operation": {
+        "type": "string",
+        "enum": [
+          "backup",
+          "inspection",
+          "verification",
+          "restore_plan",
+          "restore",
+          "retention_preview",
+          "retention_run",
+          "artifact_protection"
+        ]
+      },
+      "JobState": {
+        "type": "string",
+        "enum": [
+          "queued",
+          "running",
+          "cancel_requested",
+          "succeeded",
+          "failed",
+          "partial",
+          "cancelled",
+          "interrupted"
+        ]
+      },
+      "Effects": {
+        "type": "string",
+        "enum": [
+          "none",
+          "preparation_only",
+          "artifact_may_be_published",
+          "database_may_be_modified",
+          "artifacts_may_be_deleted",
+          "inventory_may_be_modified",
+          "unknown"
+        ]
+      },
+      "SafeCode": {
+        "type": "string",
+        "enum": [
+          "INVALID_REQUEST",
+          "AUTH_REQUIRED",
+          "ACCESS_DENIED",
+          "NOT_FOUND",
+          "IDEMPOTENCY_CONFLICT",
+          "INTENT_CONFLICT",
+          "CONFIG_CHANGED",
+          "INTENT_EXPIRED",
+          "POLICY_REFUSED",
+          "BODY_TOO_LARGE",
+          "UNSUPPORTED_MEDIA",
+          "RATE_LIMIT",
+          "QUEUE_FULL",
+          "NOT_READY",
+          "CONTAINMENT_UNAVAILABLE",
+          "CONTROL_CAPACITY",
+          "DISCOVERY_LIMIT",
+          "OPERATION_CANCELLED",
+          "OPERATION_FAILED",
+          "OPERATION_INTERRUPTED",
+          "INTERNAL_ERROR"
+        ]
+      },
+      "SafeError": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "code": {
+            "$ref": "#/components/schemas/SafeCode"
+          },
+          "retryable": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "code",
+          "retryable"
+        ],
+        "examples": [
+          {
+            "code": "POLICY_REFUSED",
+            "retryable": false
+          }
+        ]
+      },
+      "ErrorResponse": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "api_version": {
+            "const": "backupctl-api-v1",
+            "type": "string"
+          },
+          "request_id": {
+            "$ref": "#/components/schemas/Id"
+          },
+          "error": {
+            "$ref": "#/components/schemas/SafeError"
+          }
+        },
+        "required": [
+          "api_version",
+          "request_id",
+          "error"
+        ],
+        "examples": [
+          {
+            "api_version": "backupctl-api-v1",
+            "request_id": "33333333-3333-4333-8333-333333333333",
+            "error": {
+              "code": "POLICY_REFUSED",
+              "retryable": false
+            }
+          }
+        ]
+      },
+      "LoginRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "token": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9_-]{43}$"
+          }
+        },
+        "required": [
+          "token"
+        ],
+        "examples": [
+          {
+            "token": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+          }
+        ]
+      },
+      "Session": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "actor_id": {
+            "$ref": "#/components/schemas/Id"
+          },
+          "permissions": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Permission"
+            },
+            "maxItems": 32
+          },
+          "expires_unix_ms": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Timestamp"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "csrf_token": {
+            "anyOf": [
+              {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9_-]{43}$"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "actor_id",
+          "permissions",
+          "expires_unix_ms",
+          "csrf_token"
+        ],
+        "examples": [
+          {
+            "actor_id": "22222222-2222-4222-8222-222222222222",
+            "permissions": [
+              "session.self",
+              "health.read"
+            ],
+            "expires_unix_ms": 1795017600000,
+            "csrf_token": "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
+          }
+        ]
+      },
+      "SessionRevoked": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "revoked": {
+            "const": true,
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "revoked"
+        ],
+        "examples": [
+          {
+            "revoked": true
+          }
+        ]
+      },
+      "Health": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "ready": {
+            "type": "boolean"
+          },
+          "mode": {
+            "const": "fixture",
+            "type": "string"
+          },
+          "production_enabled": {
+            "const": false,
+            "type": "boolean"
+          },
+          "job_admission": {
+            "type": "boolean"
+          },
+          "containment_verified": {
+            "type": "boolean"
+          },
+          "queue_depth": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 16
+          }
+        },
+        "required": [
+          "ready",
+          "mode",
+          "production_enabled",
+          "job_admission",
+          "containment_verified",
+          "queue_depth"
+        ],
+        "examples": [
+          {
+            "ready": true,
+            "mode": "fixture",
+            "production_enabled": false,
+            "job_admission": true,
+            "containment_verified": true,
+            "queue_depth": 0
+          }
+        ]
+      },
+      "Metrics": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "accepted_total": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "succeeded_total": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "failed_total": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "partial_total": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "cancelled_total": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "interrupted_total": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "rejected_total": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          }
+        },
+        "required": [
+          "accepted_total",
+          "succeeded_total",
+          "failed_total",
+          "partial_total",
+          "cancelled_total",
+          "interrupted_total",
+          "rejected_total"
+        ],
+        "examples": [
+          {
+            "accepted_total": 0,
+            "succeeded_total": 0,
+            "failed_total": 0,
+            "partial_total": 0,
+            "cancelled_total": 0,
+            "interrupted_total": 0,
+            "rejected_total": 0
+          }
+        ]
+      },
+      "Profile": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/ProfileId"
+          },
+          "display_name": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          },
+          "operations": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Operation"
+            },
+            "maxItems": 8
+          }
+        },
+        "required": [
+          "id",
+          "display_name",
+          "operations"
+        ],
+        "examples": [
+          {
+            "id": "daily",
+            "display_name": "Daily fixture",
+            "operations": [
+              "backup"
+            ]
+          }
+        ]
+      },
+      "Profiles": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Profile"
+            },
+            "maxItems": 256
+          }
+        },
+        "required": [
+          "items"
+        ],
+        "examples": [
+          {
+            "items": [
+              {
+                "id": "daily",
+                "display_name": "Daily fixture",
+                "operations": [
+                  "backup"
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "Artifact": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "artifact_id": {
+            "$ref": "#/components/schemas/Id"
+          },
+          "format": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          },
+          "header_status": {
+            "const": "unverified",
+            "type": "string"
+          }
+        },
+        "required": [
+          "artifact_id",
+          "format",
+          "header_status"
+        ],
+        "examples": [
+          {
+            "artifact_id": "44444444-4444-4444-8444-444444444444",
+            "format": "signed-artifact-v1",
+            "header_status": "unverified"
+          }
+        ]
+      },
+      "ArtifactPage": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Artifact"
+            },
+            "maxItems": 100
+          },
+          "next_after": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Id"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "items",
+          "next_after"
+        ],
+        "examples": [
+          {
+            "items": [
+              {
+                "artifact_id": "44444444-4444-4444-8444-444444444444",
+                "format": "signed-artifact-v1",
+                "header_status": "unverified"
+              }
+            ],
+            "next_after": null
+          }
+        ]
+      },
+      "BackupRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "profile_id": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ProfileId"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "confirm_synthetic": {
+            "const": true,
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "profile_id",
+          "confirm_synthetic"
+        ],
+        "examples": [
+          {
+            "profile_id": null,
+            "confirm_synthetic": true
+          }
+        ]
+      },
+      "ArtifactRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "artifact_id": {
+            "$ref": "#/components/schemas/Id"
+          }
+        },
+        "required": [
+          "artifact_id"
+        ],
+        "examples": [
+          {
+            "artifact_id": "44444444-4444-4444-8444-444444444444"
+          }
+        ]
+      },
+      "VerificationRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "artifact_id": {
+            "$ref": "#/components/schemas/Id"
+          },
+          "level": {
+            "type": "string",
+            "enum": [
+              "signature",
+              "checksum",
+              "archive"
+            ]
+          }
+        },
+        "required": [
+          "artifact_id",
+          "level"
+        ],
+        "examples": [
+          {
+            "artifact_id": "44444444-4444-4444-8444-444444444444",
+            "level": "archive"
+          }
+        ]
+      },
+      "RestorePlanRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "artifact_id": {
+            "$ref": "#/components/schemas/Id"
+          },
+          "target_database": {
+            "$ref": "#/components/schemas/Target"
+          },
+          "security": {
+            "$ref": "#/components/schemas/Security"
+          },
+          "sections": {
+            "$ref": "#/components/schemas/Sections"
+          },
+          "acknowledge_older_snapshot": {
+            "type": "boolean"
+          },
+          "confirm_synthetic": {
+            "const": true,
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "artifact_id",
+          "target_database",
+          "security",
+          "sections",
+          "acknowledge_older_snapshot",
+          "confirm_synthetic"
+        ],
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "sections": {
+                  "enum": [
+                    "pre_data",
+                    "pre_data_data"
+                  ]
+                }
+              }
+            },
+            "then": {
+              "properties": {
+                "security": {
+                  "const": "portable",
+                  "type": "string"
+                }
+              }
+            }
+          }
+        ],
+        "examples": [
+          {
+            "artifact_id": "44444444-4444-4444-8444-444444444444",
+            "target_database": "backupctl_fixture_restored",
+            "security": "portable",
+            "sections": "full",
+            "acknowledge_older_snapshot": false,
+            "confirm_synthetic": true
+          }
+        ]
+      },
+      "RetentionPreviewRequest": {
+        "oneOf": [
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "operation": {
+                "const": "prune",
+                "type": "string"
+              },
+              "profile_id": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/ProfileId"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "keep_last": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 4096
+              }
+            },
+            "required": [
+              "operation",
+              "profile_id",
+              "keep_last"
+            ]
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "operation": {
+                "const": "delete",
+                "type": "string"
+              },
+              "artifact_id": {
+                "$ref": "#/components/schemas/Id"
+              }
+            },
+            "required": [
+              "operation",
+              "artifact_id"
+            ]
+          }
+        ],
+        "examples": [
+          {
+            "operation": "prune",
+            "profile_id": null,
+            "keep_last": 2
+          }
+        ]
+      },
+      "RestoreRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "intent_id": {
+            "$ref": "#/components/schemas/Id"
+          },
+          "confirm_digest": {
+            "$ref": "#/components/schemas/Digest"
+          },
+          "confirm_target": {
+            "$ref": "#/components/schemas/Target"
+          },
+          "confirm_synthetic": {
+            "const": true,
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "intent_id",
+          "confirm_digest",
+          "confirm_target",
+          "confirm_synthetic"
+        ],
+        "examples": [
+          {
+            "intent_id": "11111111-1111-4111-8111-111111111111",
+            "confirm_digest": "545e9e2aac7b520e81a5da19f11afe619da15953fbcb043eac4f129515166bff",
+            "confirm_target": "backupctl_fixture_restored",
+            "confirm_synthetic": true
+          }
+        ]
+      },
+      "RetentionRunRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "intent_id": {
+            "$ref": "#/components/schemas/Id"
+          },
+          "confirm_digest": {
+            "$ref": "#/components/schemas/Digest"
+          }
+        },
+        "required": [
+          "intent_id",
+          "confirm_digest"
+        ],
+        "examples": [
+          {
+            "intent_id": "11111111-1111-4111-8111-111111111111",
+            "confirm_digest": "35e72e273e916a25e6a4f64bdfa32b7db45db660897786b4ab210b3b2c471ac9"
+          }
+        ]
+      },
+      "ProtectionRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "artifact_id": {
+            "$ref": "#/components/schemas/Id"
+          },
+          "protected": {
+            "type": "boolean"
+          },
+          "reason": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          }
+        },
+        "required": [
+          "artifact_id",
+          "protected",
+          "reason"
+        ],
+        "examples": [
+          {
+            "artifact_id": "44444444-4444-4444-8444-444444444444",
+            "protected": false,
+            "reason": "Operator verified replacement snapshot"
+          }
+        ]
+      },
+      "CancelRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {},
+        "required": [],
+        "examples": [
+          {}
+        ]
+      },
+      "RestoreConfirmation": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "target_database": {
+            "$ref": "#/components/schemas/Target"
+          },
+          "artifact_id": {
+            "$ref": "#/components/schemas/Id"
+          },
+          "security": {
+            "$ref": "#/components/schemas/Security"
+          },
+          "sections": {
+            "$ref": "#/components/schemas/Sections"
+          },
+          "acknowledge_older_snapshot": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "target_database",
+          "artifact_id",
+          "security",
+          "sections",
+          "acknowledge_older_snapshot"
+        ]
+      },
+      "RetentionConfirmation": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "candidates": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Id"
+            },
+            "maxItems": 4096
+          },
+          "retained": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Id"
+            },
+            "maxItems": 4096
+          }
+        },
+        "required": [
+          "candidates",
+          "retained"
+        ]
+      },
+      "RestoreIntent": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/Id"
+          },
+          "actor_id": {
+            "$ref": "#/components/schemas/Id"
+          },
+          "planning_job_id": {
+            "$ref": "#/components/schemas/Id"
+          },
+          "kind": {
+            "const": "restore",
+            "type": "string"
+          },
+          "store_instance_id": {
+            "$ref": "#/components/schemas/Id"
+          },
+          "config_revision": {
+            "$ref": "#/components/schemas/Digest"
+          },
+          "core_plan_id": {
+            "$ref": "#/components/schemas/Id"
+          },
+          "core_plan_digest": {
+            "$ref": "#/components/schemas/Digest"
+          },
+          "created_unix_ms": {
+            "$ref": "#/components/schemas/Timestamp"
+          },
+          "expires_unix_ms": {
+            "$ref": "#/components/schemas/Timestamp"
+          },
+          "confirmation": {
+            "$ref": "#/components/schemas/RestoreConfirmation"
+          },
+          "digest": {
+            "$ref": "#/components/schemas/Digest"
+          },
+          "consumed_by_job_id": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Id"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "actor_id",
+          "planning_job_id",
+          "kind",
+          "store_instance_id",
+          "config_revision",
+          "core_plan_id",
+          "core_plan_digest",
+          "created_unix_ms",
+          "expires_unix_ms",
+          "confirmation",
+          "digest",
+          "consumed_by_job_id"
+        ],
+        "examples": [
+          {
+            "id": "11111111-1111-4111-8111-111111111111",
+            "actor_id": "22222222-2222-4222-8222-222222222222",
+            "planning_job_id": "33333333-3333-4333-8333-333333333333",
+            "kind": "restore",
+            "store_instance_id": "44444444-4444-4444-8444-444444444444",
+            "config_revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "core_plan_id": "33333333-3333-4333-8333-333333333333",
+            "core_plan_digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "created_unix_ms": 1794988800000,
+            "expires_unix_ms": 1794989700000,
+            "confirmation": {
+              "target_database": "backupctl_fixture_restored",
+              "artifact_id": "44444444-4444-4444-8444-444444444444",
+              "security": "portable",
+              "sections": "full",
+              "acknowledge_older_snapshot": false
+            },
+            "digest": "545e9e2aac7b520e81a5da19f11afe619da15953fbcb043eac4f129515166bff",
+            "consumed_by_job_id": null
+          }
+        ]
+      },
+      "RetentionIntent": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/Id"
+          },
+          "actor_id": {
+            "$ref": "#/components/schemas/Id"
+          },
+          "planning_job_id": {
+            "$ref": "#/components/schemas/Id"
+          },
+          "kind": {
+            "const": "retention",
+            "type": "string"
+          },
+          "store_instance_id": {
+            "$ref": "#/components/schemas/Id"
+          },
+          "config_revision": {
+            "$ref": "#/components/schemas/Digest"
+          },
+          "core_plan_id": {
+            "$ref": "#/components/schemas/Id"
+          },
+          "core_plan_digest": {
+            "$ref": "#/components/schemas/Digest"
+          },
+          "created_unix_ms": {
+            "$ref": "#/components/schemas/Timestamp"
+          },
+          "expires_unix_ms": {
+            "$ref": "#/components/schemas/Timestamp"
+          },
+          "confirmation": {
+            "$ref": "#/components/schemas/RetentionConfirmation"
+          },
+          "digest": {
+            "$ref": "#/components/schemas/Digest"
+          },
+          "consumed_by_job_id": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Id"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "actor_id",
+          "planning_job_id",
+          "kind",
+          "store_instance_id",
+          "config_revision",
+          "core_plan_id",
+          "core_plan_digest",
+          "created_unix_ms",
+          "expires_unix_ms",
+          "confirmation",
+          "digest",
+          "consumed_by_job_id"
+        ],
+        "examples": [
+          {
+            "id": "11111111-1111-4111-8111-111111111111",
+            "actor_id": "22222222-2222-4222-8222-222222222222",
+            "planning_job_id": "33333333-3333-4333-8333-333333333333",
+            "kind": "retention",
+            "store_instance_id": "44444444-4444-4444-8444-444444444444",
+            "config_revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "core_plan_id": "33333333-3333-4333-8333-333333333333",
+            "core_plan_digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "created_unix_ms": 1794988800000,
+            "expires_unix_ms": 1794989700000,
+            "confirmation": {
+              "candidates": [
+                "44444444-4444-4444-8444-444444444444"
+              ],
+              "retained": [
+                "33333333-3333-4333-8333-333333333333"
+              ]
+            },
+            "digest": "35e72e273e916a25e6a4f64bdfa32b7db45db660897786b4ab210b3b2c471ac9",
+            "consumed_by_job_id": null
+          }
+        ]
+      },
+      "Intent": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/RestoreIntent"
+          },
+          {
+            "$ref": "#/components/schemas/RetentionIntent"
+          }
+        ],
+        "examples": [
+          {
+            "id": "11111111-1111-4111-8111-111111111111",
+            "actor_id": "22222222-2222-4222-8222-222222222222",
+            "planning_job_id": "33333333-3333-4333-8333-333333333333",
+            "kind": "restore",
+            "store_instance_id": "44444444-4444-4444-8444-444444444444",
+            "config_revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "core_plan_id": "33333333-3333-4333-8333-333333333333",
+            "core_plan_digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "created_unix_ms": 1794988800000,
+            "expires_unix_ms": 1794989700000,
+            "confirmation": {
+              "target_database": "backupctl_fixture_restored",
+              "artifact_id": "44444444-4444-4444-8444-444444444444",
+              "security": "portable",
+              "sections": "full",
+              "acknowledge_older_snapshot": false
+            },
+            "digest": "545e9e2aac7b520e81a5da19f11afe619da15953fbcb043eac4f129515166bff",
+            "consumed_by_job_id": null
+          }
+        ]
+      },
+      "BackupResult": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "kind": {
+            "const": "backup",
+            "type": "string"
+          },
+          "artifact_id": {
+            "$ref": "#/components/schemas/Id"
+          }
+        },
+        "required": [
+          "kind",
+          "artifact_id"
+        ],
+        "examples": [
+          {
+            "kind": "backup",
+            "artifact_id": "44444444-4444-4444-8444-444444444444"
+          }
+        ]
+      },
+      "InspectionResult": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "kind": {
+            "const": "inspection",
+            "type": "string"
+          },
+          "artifact_id": {
+            "$ref": "#/components/schemas/Id"
+          },
+          "database": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 63
+          },
+          "source_major": {
+            "type": "integer",
+            "enum": [
+              16,
+              17,
+              18
+            ]
+          },
+          "scope": {
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 128
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "created_unix_ms": {
+            "$ref": "#/components/schemas/Timestamp"
+          }
+        },
+        "required": [
+          "kind",
+          "artifact_id",
+          "database",
+          "source_major",
+          "scope",
+          "created_unix_ms"
+        ],
+        "examples": [
+          {
+            "kind": "inspection",
+            "artifact_id": "44444444-4444-4444-8444-444444444444",
+            "database": "backupctl_fixture_source",
+            "source_major": 18,
+            "scope": null,
+            "created_unix_ms": 1794988800000
+          }
+        ]
+      },
+      "VerificationResult": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "kind": {
+            "const": "verification",
+            "type": "string"
+          },
+          "artifact_id": {
+            "$ref": "#/components/schemas/Id"
+          },
+          "level": {
+            "type": "string",
+            "enum": [
+              "signature",
+              "checksum",
+              "archive"
+            ]
+          },
+          "passed": {
+            "type": "boolean"
+          },
+          "inventory_recorded": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "kind",
+          "artifact_id",
+          "level",
+          "passed",
+          "inventory_recorded"
+        ],
+        "examples": [
+          {
+            "kind": "verification",
+            "artifact_id": "44444444-4444-4444-8444-444444444444",
+            "level": "archive",
+            "passed": true,
+            "inventory_recorded": true
+          }
+        ]
+      },
+      "RestorePlanResult": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "kind": {
+            "const": "restore_plan",
+            "type": "string"
+          },
+          "intent": {
+            "$ref": "#/components/schemas/RestoreIntent"
+          }
+        },
+        "required": [
+          "kind",
+          "intent"
+        ],
+        "examples": [
+          {
+            "kind": "restore_plan",
+            "intent": {
+              "id": "11111111-1111-4111-8111-111111111111",
+              "actor_id": "22222222-2222-4222-8222-222222222222",
+              "planning_job_id": "33333333-3333-4333-8333-333333333333",
+              "kind": "restore",
+              "store_instance_id": "44444444-4444-4444-8444-444444444444",
+              "config_revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "core_plan_id": "33333333-3333-4333-8333-333333333333",
+              "core_plan_digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "created_unix_ms": 1794988800000,
+              "expires_unix_ms": 1794989700000,
+              "confirmation": {
+                "target_database": "backupctl_fixture_restored",
+                "artifact_id": "44444444-4444-4444-8444-444444444444",
+                "security": "portable",
+                "sections": "full",
+                "acknowledge_older_snapshot": false
+              },
+              "digest": "545e9e2aac7b520e81a5da19f11afe619da15953fbcb043eac4f129515166bff",
+              "consumed_by_job_id": null
+            }
+          }
+        ]
+      },
+      "RestoreResult": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "kind": {
+            "const": "restore",
+            "type": "string"
+          },
+          "artifact_id": {
+            "$ref": "#/components/schemas/Id"
+          },
+          "target_database": {
+            "$ref": "#/components/schemas/Target"
+          },
+          "verification_level": {
+            "type": "string",
+            "const": "none",
+            "description": "The signed artifact retains its recorded verification level. The completed restore is represented by the job state."
+          },
+          "recorded_in_artifact": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "kind",
+          "artifact_id",
+          "target_database",
+          "verification_level",
+          "recorded_in_artifact"
+        ],
+        "examples": [
+          {
+            "kind": "restore",
+            "artifact_id": "44444444-4444-4444-8444-444444444444",
+            "target_database": "backupctl_fixture_restored",
+            "verification_level": "none",
+            "recorded_in_artifact": false
+          }
+        ]
+      },
+      "RetentionExclusion": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "artifact_id": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Id"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "reasons": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 64
+            },
+            "maxItems": 32
+          }
+        },
+        "required": [
+          "artifact_id",
+          "reasons"
+        ]
+      },
+      "RetentionPreviewResult": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "kind": {
+            "const": "retention_preview",
+            "type": "string"
+          },
+          "intent": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/RetentionIntent"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "excluded": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RetentionExclusion"
+            },
+            "maxItems": 4096
+          }
+        },
+        "required": [
+          "kind",
+          "intent",
+          "excluded"
+        ],
+        "examples": [
+          {
+            "kind": "retention_preview",
+            "intent": {
+              "id": "11111111-1111-4111-8111-111111111111",
+              "actor_id": "22222222-2222-4222-8222-222222222222",
+              "planning_job_id": "33333333-3333-4333-8333-333333333333",
+              "kind": "retention",
+              "store_instance_id": "44444444-4444-4444-8444-444444444444",
+              "config_revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "core_plan_id": "33333333-3333-4333-8333-333333333333",
+              "core_plan_digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "created_unix_ms": 1794988800000,
+              "expires_unix_ms": 1794989700000,
+              "confirmation": {
+                "candidates": [
+                  "44444444-4444-4444-8444-444444444444"
+                ],
+                "retained": [
+                  "33333333-3333-4333-8333-333333333333"
+                ]
+              },
+              "digest": "35e72e273e916a25e6a4f64bdfa32b7db45db660897786b4ab210b3b2c471ac9",
+              "consumed_by_job_id": null
+            },
+            "excluded": []
+          }
+        ]
+      },
+      "RetentionRunResult": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "kind": {
+            "const": "retention_run",
+            "type": "string"
+          },
+          "completed": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Id"
+            },
+            "maxItems": 4096
+          },
+          "deleting": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Id"
+            },
+            "maxItems": 4096
+          },
+          "pending": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Id"
+            },
+            "maxItems": 4096
+          },
+          "audit_recorded": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "kind",
+          "completed",
+          "deleting",
+          "pending",
+          "audit_recorded"
+        ],
+        "examples": [
+          {
+            "kind": "retention_run",
+            "completed": [
+              "44444444-4444-4444-8444-444444444444"
+            ],
+            "deleting": [],
+            "pending": [],
+            "audit_recorded": true
+          }
+        ]
+      },
+      "ProtectionResult": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "kind": {
+            "const": "artifact_protection",
+            "type": "string"
+          },
+          "artifact_id": {
+            "$ref": "#/components/schemas/Id"
+          },
+          "protected": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "kind",
+          "artifact_id",
+          "protected"
+        ],
+        "examples": [
+          {
+            "kind": "artifact_protection",
+            "artifact_id": "44444444-4444-4444-8444-444444444444",
+            "protected": false
+          }
+        ]
+      },
+      "JobResult": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/BackupResult"
+          },
+          {
+            "$ref": "#/components/schemas/InspectionResult"
+          },
+          {
+            "$ref": "#/components/schemas/VerificationResult"
+          },
+          {
+            "$ref": "#/components/schemas/RestorePlanResult"
+          },
+          {
+            "$ref": "#/components/schemas/RestoreResult"
+          },
+          {
+            "$ref": "#/components/schemas/RetentionPreviewResult"
+          },
+          {
+            "$ref": "#/components/schemas/RetentionRunResult"
+          },
+          {
+            "$ref": "#/components/schemas/ProtectionResult"
+          }
+        ]
+      },
+      "Job": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/Id"
+          },
+          "actor_id": {
+            "$ref": "#/components/schemas/Id"
+          },
+          "operation": {
+            "$ref": "#/components/schemas/Operation"
+          },
+          "state": {
+            "$ref": "#/components/schemas/JobState"
+          },
+          "created_unix_ms": {
+            "$ref": "#/components/schemas/Timestamp"
+          },
+          "updated_unix_ms": {
+            "$ref": "#/components/schemas/Timestamp"
+          },
+          "core_job_id": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Id"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "effects": {
+            "$ref": "#/components/schemas/Effects"
+          },
+          "result": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/JobResult"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "error": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SafeError"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "url": {
+            "type": "string",
+            "pattern": "^/api/v1/jobs/[0-9a-f-]{36}$"
+          }
+        },
+        "required": [
+          "id",
+          "actor_id",
+          "operation",
+          "state",
+          "created_unix_ms",
+          "updated_unix_ms",
+          "core_job_id",
+          "effects",
+          "result",
+          "error",
+          "url"
+        ],
+        "examples": [
+          {
+            "id": "11111111-1111-4111-8111-111111111111",
+            "actor_id": "22222222-2222-4222-8222-222222222222",
+            "operation": "backup",
+            "state": "queued",
+            "created_unix_ms": 1794988800000,
+            "updated_unix_ms": 1794988800000,
+            "core_job_id": null,
+            "effects": "none",
+            "result": null,
+            "error": null,
+            "url": "/api/v1/jobs/11111111-1111-4111-8111-111111111111"
+          }
+        ],
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "operation": {
+                  "const": "backup"
+                }
+              }
+            },
+            "then": {
+              "properties": {
+                "result": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/BackupResult"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "operation": {
+                  "const": "inspection"
+                }
+              }
+            },
+            "then": {
+              "properties": {
+                "result": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/InspectionResult"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "operation": {
+                  "const": "verification"
+                }
+              }
+            },
+            "then": {
+              "properties": {
+                "result": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/VerificationResult"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "operation": {
+                  "const": "restore_plan"
+                }
+              }
+            },
+            "then": {
+              "properties": {
+                "result": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/RestorePlanResult"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "operation": {
+                  "const": "restore"
+                }
+              }
+            },
+            "then": {
+              "properties": {
+                "result": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/RestoreResult"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "operation": {
+                  "const": "retention_preview"
+                }
+              }
+            },
+            "then": {
+              "properties": {
+                "result": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/RetentionPreviewResult"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "operation": {
+                  "const": "retention_run"
+                }
+              }
+            },
+            "then": {
+              "properties": {
+                "result": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/RetentionRunResult"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "operation": {
+                  "const": "artifact_protection"
+                }
+              }
+            },
+            "then": {
+              "properties": {
+                "result": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/ProtectionResult"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "state": {
+                  "const": "succeeded"
+                }
+              }
+            },
+            "then": {
+              "properties": {
+                "result": {
+                  "$ref": "#/components/schemas/JobResult"
+                },
+                "error": {
+                  "type": "null"
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "state": {
+                  "const": "queued"
+                }
+              }
+            },
+            "then": {
+              "properties": {
+                "result": {
+                  "type": "null"
+                },
+                "error": {
+                  "type": "null"
+                },
+                "core_job_id": {
+                  "type": "null"
+                },
+                "effects": {
+                  "const": "none"
+                }
+              }
+            }
+          }
+        ]
+      },
+      "JobPage": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Job"
+            },
+            "maxItems": 100
+          },
+          "next_after": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Id"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "items",
+          "next_after"
+        ],
+        "examples": [
+          {
+            "items": [
+              {
+                "id": "11111111-1111-4111-8111-111111111111",
+                "actor_id": "22222222-2222-4222-8222-222222222222",
+                "operation": "backup",
+                "state": "queued",
+                "created_unix_ms": 1794988800000,
+                "updated_unix_ms": 1794988800000,
+                "core_job_id": null,
+                "effects": "none",
+                "result": null,
+                "error": null,
+                "url": "/api/v1/jobs/11111111-1111-4111-8111-111111111111"
+              }
+            ],
+            "next_after": null
+          }
+        ]
+      },
+      "SessionResponse": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "api_version": {
+            "const": "backupctl-api-v1",
+            "type": "string"
+          },
+          "request_id": {
+            "$ref": "#/components/schemas/Id"
+          },
+          "data": {
+            "$ref": "#/components/schemas/Session"
+          }
+        },
+        "required": [
+          "api_version",
+          "request_id",
+          "data"
+        ],
+        "examples": [
+          {
+            "api_version": "backupctl-api-v1",
+            "request_id": "33333333-3333-4333-8333-333333333333",
+            "data": {
+              "actor_id": "22222222-2222-4222-8222-222222222222",
+              "permissions": [
+                "session.self",
+                "health.read"
+              ],
+              "expires_unix_ms": 1795017600000,
+              "csrf_token": "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
+            }
+          }
+        ]
+      },
+      "SessionRevokedResponse": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "api_version": {
+            "const": "backupctl-api-v1",
+            "type": "string"
+          },
+          "request_id": {
+            "$ref": "#/components/schemas/Id"
+          },
+          "data": {
+            "$ref": "#/components/schemas/SessionRevoked"
+          }
+        },
+        "required": [
+          "api_version",
+          "request_id",
+          "data"
+        ],
+        "examples": [
+          {
+            "api_version": "backupctl-api-v1",
+            "request_id": "33333333-3333-4333-8333-333333333333",
+            "data": {
+              "revoked": true
+            }
+          }
+        ]
+      },
+      "HealthResponse": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "api_version": {
+            "const": "backupctl-api-v1",
+            "type": "string"
+          },
+          "request_id": {
+            "$ref": "#/components/schemas/Id"
+          },
+          "data": {
+            "$ref": "#/components/schemas/Health"
+          }
+        },
+        "required": [
+          "api_version",
+          "request_id",
+          "data"
+        ],
+        "examples": [
+          {
+            "api_version": "backupctl-api-v1",
+            "request_id": "33333333-3333-4333-8333-333333333333",
+            "data": {
+              "ready": true,
+              "mode": "fixture",
+              "production_enabled": false,
+              "job_admission": true,
+              "containment_verified": true,
+              "queue_depth": 0
+            }
+          }
+        ]
+      },
+      "MetricsResponse": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "api_version": {
+            "const": "backupctl-api-v1",
+            "type": "string"
+          },
+          "request_id": {
+            "$ref": "#/components/schemas/Id"
+          },
+          "data": {
+            "$ref": "#/components/schemas/Metrics"
+          }
+        },
+        "required": [
+          "api_version",
+          "request_id",
+          "data"
+        ],
+        "examples": [
+          {
+            "api_version": "backupctl-api-v1",
+            "request_id": "33333333-3333-4333-8333-333333333333",
+            "data": {
+              "accepted_total": 0,
+              "succeeded_total": 0,
+              "failed_total": 0,
+              "partial_total": 0,
+              "cancelled_total": 0,
+              "interrupted_total": 0,
+              "rejected_total": 0
+            }
+          }
+        ]
+      },
+      "ProfilesResponse": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "api_version": {
+            "const": "backupctl-api-v1",
+            "type": "string"
+          },
+          "request_id": {
+            "$ref": "#/components/schemas/Id"
+          },
+          "data": {
+            "$ref": "#/components/schemas/Profiles"
+          }
+        },
+        "required": [
+          "api_version",
+          "request_id",
+          "data"
+        ],
+        "examples": [
+          {
+            "api_version": "backupctl-api-v1",
+            "request_id": "33333333-3333-4333-8333-333333333333",
+            "data": {
+              "items": [
+                {
+                  "id": "daily",
+                  "display_name": "Daily fixture",
+                  "operations": [
+                    "backup"
+                  ]
+                }
+              ]
+            }
+          }
+        ]
+      },
+      "ArtifactResponse": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "api_version": {
+            "const": "backupctl-api-v1",
+            "type": "string"
+          },
+          "request_id": {
+            "$ref": "#/components/schemas/Id"
+          },
+          "data": {
+            "$ref": "#/components/schemas/Artifact"
+          }
+        },
+        "required": [
+          "api_version",
+          "request_id",
+          "data"
+        ],
+        "examples": [
+          {
+            "api_version": "backupctl-api-v1",
+            "request_id": "33333333-3333-4333-8333-333333333333",
+            "data": {
+              "artifact_id": "44444444-4444-4444-8444-444444444444",
+              "format": "signed-artifact-v1",
+              "header_status": "unverified"
+            }
+          }
+        ]
+      },
+      "ArtifactPageResponse": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "api_version": {
+            "const": "backupctl-api-v1",
+            "type": "string"
+          },
+          "request_id": {
+            "$ref": "#/components/schemas/Id"
+          },
+          "data": {
+            "$ref": "#/components/schemas/ArtifactPage"
+          }
+        },
+        "required": [
+          "api_version",
+          "request_id",
+          "data"
+        ],
+        "examples": [
+          {
+            "api_version": "backupctl-api-v1",
+            "request_id": "33333333-3333-4333-8333-333333333333",
+            "data": {
+              "items": [
+                {
+                  "artifact_id": "44444444-4444-4444-8444-444444444444",
+                  "format": "signed-artifact-v1",
+                  "header_status": "unverified"
+                }
+              ],
+              "next_after": null
+            }
+          }
+        ]
+      },
+      "JobResponse": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "api_version": {
+            "const": "backupctl-api-v1",
+            "type": "string"
+          },
+          "request_id": {
+            "$ref": "#/components/schemas/Id"
+          },
+          "data": {
+            "$ref": "#/components/schemas/Job"
+          }
+        },
+        "required": [
+          "api_version",
+          "request_id",
+          "data"
+        ],
+        "examples": [
+          {
+            "api_version": "backupctl-api-v1",
+            "request_id": "33333333-3333-4333-8333-333333333333",
+            "data": {
+              "id": "11111111-1111-4111-8111-111111111111",
+              "actor_id": "22222222-2222-4222-8222-222222222222",
+              "operation": "backup",
+              "state": "queued",
+              "created_unix_ms": 1794988800000,
+              "updated_unix_ms": 1794988800000,
+              "core_job_id": null,
+              "effects": "none",
+              "result": null,
+              "error": null,
+              "url": "/api/v1/jobs/11111111-1111-4111-8111-111111111111"
+            }
+          }
+        ]
+      },
+      "JobPageResponse": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "api_version": {
+            "const": "backupctl-api-v1",
+            "type": "string"
+          },
+          "request_id": {
+            "$ref": "#/components/schemas/Id"
+          },
+          "data": {
+            "$ref": "#/components/schemas/JobPage"
+          }
+        },
+        "required": [
+          "api_version",
+          "request_id",
+          "data"
+        ],
+        "examples": [
+          {
+            "api_version": "backupctl-api-v1",
+            "request_id": "33333333-3333-4333-8333-333333333333",
+            "data": {
+              "items": [
+                {
+                  "id": "11111111-1111-4111-8111-111111111111",
+                  "actor_id": "22222222-2222-4222-8222-222222222222",
+                  "operation": "backup",
+                  "state": "queued",
+                  "created_unix_ms": 1794988800000,
+                  "updated_unix_ms": 1794988800000,
+                  "core_job_id": null,
+                  "effects": "none",
+                  "result": null,
+                  "error": null,
+                  "url": "/api/v1/jobs/11111111-1111-4111-8111-111111111111"
+                }
+              ],
+              "next_after": null
+            }
+          }
+        ]
+      },
+      "IntentResponse": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "api_version": {
+            "const": "backupctl-api-v1",
+            "type": "string"
+          },
+          "request_id": {
+            "$ref": "#/components/schemas/Id"
+          },
+          "data": {
+            "$ref": "#/components/schemas/Intent"
+          }
+        },
+        "required": [
+          "api_version",
+          "request_id",
+          "data"
+        ],
+        "examples": [
+          {
+            "api_version": "backupctl-api-v1",
+            "request_id": "33333333-3333-4333-8333-333333333333",
+            "data": {
+              "id": "11111111-1111-4111-8111-111111111111",
+              "actor_id": "22222222-2222-4222-8222-222222222222",
+              "planning_job_id": "33333333-3333-4333-8333-333333333333",
+              "kind": "restore",
+              "store_instance_id": "44444444-4444-4444-8444-444444444444",
+              "config_revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "core_plan_id": "33333333-3333-4333-8333-333333333333",
+              "core_plan_digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+              "created_unix_ms": 1794988800000,
+              "expires_unix_ms": 1794989700000,
+              "confirmation": {
+                "target_database": "backupctl_fixture_restored",
+                "artifact_id": "44444444-4444-4444-8444-444444444444",
+                "security": "portable",
+                "sections": "full",
+                "acknowledge_older_snapshot": false
+              },
+              "digest": "545e9e2aac7b520e81a5da19f11afe619da15953fbcb043eac4f129515166bff",
+              "consumed_by_job_id": null
+            }
+          }
+        ]
+      }
+    }
+  }
+}
