@@ -69,6 +69,7 @@ Chosen compatibility policy: PostgreSQL 16, 17 and 18 source servers, absolute s
 | Signatures | `ed25519-dalek` 2.2 line and `ml-dsa` 0.1.1 or reviewed compatible update | Required zeroization features; both signature legs verify. |
 | CLI | `clap` derive | Existing human/JSON modes; parsing/presentation only. |
 | API adapter | Axum = 0.8.9, Tokio = 1.54.1, static OpenAPI 3.1.2 | HTTP dependencies are confined to `backup-api`. The core is synchronous. The adapter uses isolated operation processes and a private control DB (§59–§60). |
+| UI console | React and React DOM 19.3.1, TypeScript 5.9.3, Vite 8.3.8, plain CSS, openapi-typescript 7.13.0 | Node 22.23.2, npm 10.9.8, Playwright 1.65.1 for the browser drill. Static assets share the API's HTTPS origin (§62–§63). |
 | Local coordination | Unix `flock` through `libc` | Kernel ownership; nonblocking scope acquisition; never unlink live lock files. |
 
 Approved direct workspace libraries: `anyhow`, `clap`, `serde`, `serde_json`, `sha2`, `toml`, `uuid`, `age`, `age-core`, `base64`, `hkdf`, `libc`, `hpke`, `ml-kem`, `rand`, `sha3`, `typenum`, `x25519-dalek`, `rusqlite`, `ed25519-dalek`, `ml-dsa`, `zeroize`. [Cargo.toml](Cargo.toml) is the declaration and [Cargo.lock](Cargo.lock) records resolved versions and transitive dependencies. Preserve feature flags and exact pins unless a named task requires a reviewed upgrade.
@@ -387,12 +388,12 @@ A new model should be able to resume from status plus contracts without trusting
 | 10 | B — M5b retention/protection/deletion | ✅ Done | B01–B06 accepted; eight PG16/17/18 matrices and destructive/race/crash gates pass (§40). |
 | 11 | H — M6 hardened CLI/systemd/Debian | ✅ Fixture scope | H01–H05 fixture foundations accepted (§41–§50); H05 committed 046c22e. Production compatibility remains a V gate. |
 | 12 | V — production validation/release | ✅ W1/W2 bounded handoff | W1 in §56 and W2 in §57 accepted. Remaining V01, V02/V03 join integrated validation after UI; production stays disabled. |
-| 13 | P — M7 API/asynchronous service | ✅ Fixture scope | P03 is committed as 251d782. P04 fixture acceptance passed in §61. |
-| 14 | U — M8 API-backed UI | 🔄 U01 next | Choose the UI framework and client approach for the verified OpenAPI contract. |
+| 13 | P — M7 API/asynchronous service | ✅ Fixture scope | P04 accepted in §61 and committed as 86e96c5. |
+| 14 | U — M8 API-backed UI | 🔄 U02 first screens implemented | Sign-in, overview, artifacts, jobs and restore use the fixture API (§63). U03 adds profiles and backup. |
 | 15 | F — platform validation/release | ⬜ Todo | After API/UI: integrate remaining V01, V02/V03 and F01–F03; one shared release evidence set. |
 
-### ➡️ Current: #14 - U01 — UI framework and client design (P04 API accepted)
-### ⏭️ Next: U01–U04 UI → integrated V/F release validation
+### ➡️ Current: #14 - U02 — first console checkpoint
+### ⏭️ Next: U03 profiles and backup → U04 browser acceptance → integrated V/F release validation
 
 Task IDs below remain stable even if a phase is split into several commits. The operator-approved §55 sequence governs remaining work: V01-W1/W2 → P → U → integrated V/F. V01-W1/W2 are bounded sub-gates of the existing V01 task. Full CLI release no longer blocks API development. Independent documentation can proceed alongside its owning task; dependent implementation waits for its stated prerequisites.
 
@@ -2464,3 +2465,51 @@ on PostgreSQL 17. Package and TLS proxy installation remain in integrated
 release validation. Checkpoint review found no blocking issues and matched
 the retained fast and fixture drill evidence to the reviewed inputs. U01 uses
 the locally committed API contract.
+
+## 62. U01 operator console design — 2026-11-18
+
+P04 is locally committed as **86e96c5030d58b3e81f060a1dc6d668428c3b1fe**.
+The [U01 design](docs/development/u01-ui-design.md) selects a static React,
+TypeScript and Vite console built against the committed fixture OpenAPI contract.
+The browser uses same-origin requests, cookie sessions and generated API types.
+The team will pin and verify the actual UI package graph in U02.
+
+U02 covers sign-in, health, paginated artifacts and jobs, verification and a
+deliberate restore confirmation. The design keeps accepted, partial and
+interrupted receipts distinct and treats the API as the authority for each
+operation. U03 adds profile and backup views. U04 verifies the browser workflow
+and accessibility. Retention and protection remain on the API in this increment.
+Schedule and key controls depend on delivered API capabilities.
+
+U01 checked the design's operation identifiers against all 20 operations in
+OpenAPI and verified documentation references. Fixture HTTP and release
+deployment boundaries follow P03/P04. U02 is the next implementation task.
+
+## 63. U02 first fixture console — 2026-11-18
+
+The console lives in [ui](ui). Its static build uses generated types from the
+committed OpenAPI contract. It offers sign-in, API readiness, paginated artifact
+and job screens, inspection and verification, cancellation, and restore
+planning and confirmation. The confirmation screen reads the saved intent,
+shows its target and options, and requires the exact target before submitting.
+The browser keeps the session cookie with the browser and holds CSRF and pending
+submissions in memory. Job receipts show state and effects. An explicit retry
+of an ambiguous submission uses the original key and body.
+
+The [npm lockfile](ui/package-lock.json) fixes the package graph. React, React
+DOM and scheduler are the browser dependencies, all MIT. The runtime audit
+reported zero findings. The full npm audit reported one high-severity
+advisory in the build-time Vite dependency chain, through picomatch 4.0.7,
+with no patched version available at this checkpoint. Build from trusted
+repository inputs and serve the static output. Carry a fresh full-graph audit
+into V03. [Picomatch advisory](https://github.com/advisories/GHSA-fc5q-39xc-vjpf).
+
+A clean npm install, generated types, strict TypeScript, and the static build
+passed. The [browser drill](tests/u02_console_drill.py) used Chrome 157,
+loopback HTTPS, the supervised API and PostgreSQL 17. It exercised secure
+sign-in and logout, viewer capability gating, cancellation, an interrupted
+request retried with the same key and body, inspection, archive verification,
+exact-target confirmation, and reloading the consumed plan and restore
+receipt. The database returned the seeded value 42 from the restored table.
+A narrow-screen overview check passed. U03 implements profiles and starting
+a backup. U04 owns broader browser and accessibility acceptance.

@@ -93,3 +93,28 @@ environment. Run `python3 tests/p04_api_acceptance.py` to check live responses
 against OpenAPI, compare API and core results, and exercise revocation, expiry,
 queue, cancellation, partial effects and restart. See the
 [API v1 threat review](../security/api-v1-review.md) for scope and limitations.
+
+### Fixture operator console
+
+Build the static console from the repository root using Node 22.23.2 and
+npm 10.9.8. The build checks generated types against the committed OpenAPI
+file before packaging the assets.
+
+```bash
+npm --prefix ui ci
+npm --prefix ui run build
+```
+
+Serve `ui/dist` at the root of the configured HTTPS origin. Forward
+`/api/v1/` to the loopback API with the public Host, Origin and session
+headers intact. Preserve the upstream response status, cookie, Location
+and Retry-After headers. Serve static assets directly and disable proxy
+caching for API traffic. Keep sign-in request bodies and credential headers
+out of proxy logs. The Node toolchain is used to build and test the console.
+
+The [browser drill](../../tests/u02_console_drill.py) uses the built assets,
+the P03 fixture requirements, OpenSSL and Chromium. Install the browser with
+`cd ui && npx playwright install chromium`, or set `PARSBACKUP_BROWSER` to a
+local Chromium or Chrome binary. From the repository root run
+`python3 tests/u02_console_drill.py`. It starts its own HTTPS proxy, creates
+disposable accounts and a backup, and checks the restored PostgreSQL row.

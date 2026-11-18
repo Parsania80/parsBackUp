@@ -1,0 +1,26 @@
+{
+  "name": "parsbackup-console",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "npm@10.9.8",
+  "engines": {"node": "22.23.2"},
+  "scripts": {
+    "generate": "openapi-typescript ../docs/api/openapi-v1.json -o src/openapi.ts",
+    "check:contract": "openapi-typescript ../docs/api/openapi-v1.json -o src/openapi.ts --check",
+    "check": "npm run check:contract && tsc --noEmit",
+    "build": "npm run check && vite build"
+  },
+  "dependencies": {
+    "react": "19.3.1",
+    "react-dom": "19.3.1"
+  },
+  "devDependencies": {
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
+    "openapi-typescript": "7.13.0",
+    "playwright": "1.65.1",
+    "typescript": "5.9.3",
+    "vite": "8.3.8"
+  }
+}

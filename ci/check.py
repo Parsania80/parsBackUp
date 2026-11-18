@@ -35,6 +35,7 @@ files += [Path('docs/development/v01-validation.md'), Path('docs/security/v01-re
 files += [Path('docs/backup-format/manifest-v2-family.md'), Path('docs/development/v01-w1-offline-dispatch.md')]
 files += [Path('docs/development/v01-w2-restore-plan-compatibility.md')]
 files += [Path('docs/development/p01-api-contract.md')]
+files += [Path('docs/development/u01-ui-design.md')]
 files += [Path('docs/security/api-v1-review.md')]
 subprocess.run(['python3', 'ci/check_api.py'], check=True)
 links = 0
@@ -70,6 +71,7 @@ for file in sorted(Path('ci').glob('*.py')) + [
     Path('tests/p02_worker_drill.py'),
     Path('tests/p03_http_drill.py'),
     Path('tests/p04_api_acceptance.py'),
+    Path('tests/u02_console_drill.py'),
 ]:
     code = file.read_text()
     compile(code, str(file), 'exec')

@@ -370,3 +370,14 @@ the evidence. **Next is U01, the UI framework and client design.**
 
 The P04 checkpoint review matched the acceptance evidence to the source and
 test inputs. Git history records the local checkpoint for the API that U01 uses.
+
+P04 is committed as **86e96c5**. The [U01 console design](docs/development/u01-ui-design.md)
+chooses React, TypeScript and Vite and defines how operators sign in, inspect
+backups, confirm a restore and follow the job. **Next is U02**, which builds
+those screens against the verified API.
+
+The U02 fixture console can sign in, browse artifacts and jobs, inspect and
+verify backups, and run a restore after you review the plan and type the exact
+target. Build and exercise it locally using the
+[console guide](docs/operations/http-api.md#fixture-operator-console).
+**U03 adds the profile and backup screens.**
