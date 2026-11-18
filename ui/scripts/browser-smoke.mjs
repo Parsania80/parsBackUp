@@ -2,7 +2,8 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { chromium } from "playwright";
 
-const { origin, token, viewer, artifact, target, cancellable, screenshot } = JSON.parse(readFileSync(0, "utf8"));
+const { origin, token, viewer, backupToken, artifact, target, cancellable, screenshot, profileScreenshot } =
+  JSON.parse(readFileSync(0, "utf8"));
 const browser = await chromium.launch({ executablePath: process.env.PARSBACKUP_BROWSER });
 let page;
 try {
@@ -103,6 +104,11 @@ try {
 
   await signIn(viewer);
   await visible(heading("Jobs"));
+  await link("Profiles").click();
+  const daily = page.getByRole("row", { name: /Daily fixture/ });
+  await visible(daily.getByRole("cell", { name: "None", exact: true }));
+  await visible(page.getByText("Your session cannot start backups."));
+  assert.equal(await button("Start backup").count(), 0);
   await artifactDetails();
   await visible(page.getByText("Job actions are unavailable for this artifact or session."));
   assert.equal(await button("Inspect artifact").count(), 0);
@@ -110,9 +116,72 @@ try {
   await link("Overview").click();
   await visible(heading("Overview"));
   assert(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth));
+  await button("Sign out").click();
+
+  await signIn(backupToken);
+  await link("Profiles").click();
+  await visible(daily.getByText("Backup", { exact: true }));
+  await visible(page.getByRole("row", { name: /Prune fixture/ }).getByRole("cell", { name: "None", exact: true }));
+  const profile = page.getByLabel("Backup profile");
+  const synthetic = page.getByLabel("I confirm this is a synthetic fixture");
+  const startBackup = button("Start backup");
+  await visible(startBackup);
+  assert(await startBackup.isDisabled());
+  assert.deepEqual(await profile.locator("option").evaluateAll(options => options.map(option => option.value)),
+    ["", "daily", "default"]);
+  assert(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth));
+  await profile.selectOption("default");
+  await synthetic.check();
+  await profile.selectOption("daily");
+  assert(!await synthetic.isChecked());
+  assert(await startBackup.isDisabled());
+  await synthetic.check();
+  if (profileScreenshot) {
+    await page.setViewportSize({ width: 1160, height: 800 });
+    await page.screenshot({ path: profileScreenshot });
+  }
+
+  const backupUrl = origin + "/api/v1/backups";
+  let accepted;
+  await page.route(backupUrl, async route => {
+    const response = await route.fetch();
+    accepted = {
+      status: response.status(), job: (await response.json()).data?.id,
+      key: route.request().headers()["idempotency-key"], body: route.request().postDataJSON(),
+    };
+    await route.abort();
+  }, { times: 1 });
+  await startBackup.click();
+  await visible(button("Retry same submission"));
+  assert.equal(accepted?.status, 202);
+  assert(accepted.job && accepted.key);
+  assert.deepEqual(accepted.body, { profile_id: "daily", confirm_synthetic: true });
+  assert(await profile.isDisabled());
+  const replay = page.waitForRequest(request => request.url() === backupUrl);
+  await button("Retry same submission").click();
+  const replayRequest = await replay;
+  assert.equal(replayRequest.headers()["idempotency-key"], accepted.key);
+  assert.deepEqual(replayRequest.postDataJSON(), accepted.body);
+  const result = page.getByRole("heading", { name: "Backup result", exact: true });
+  await visible(result);
+  assert.equal(new URL(page.url()).hash, "#/jobs/" + accepted.job);
+  await page.locator("section").filter({ has: result }).getByRole("link").click();
+  await button("Inspect artifact").click();
+  await visible(heading("Inspection result"));
+  await visible(page.getByText("sample-only", { exact: true }));
+
+  await link("Profiles").click();
+  await profile.selectOption("default");
+  await synthetic.check();
+  const defaultBackup = page.waitForRequest(request => request.url() === backupUrl);
+  await startBackup.click();
+  assert.deepEqual((await defaultBackup).postDataJSON(), { profile_id: null, confirm_synthetic: true });
+  await visible(result);
+  await visible(page.getByText("Succeeded", { exact: true }));
   assert.deepEqual(errors, []);
   assert.deepEqual(external, []);
   console.log("Browser passed sign-in, cancellation, same-key retry, archive checks, exact restore confirmation, receipts, logout and viewer gating");
+  console.log("Browser passed named and default backups, profile filtering, scoped artifact inspection and replay after a lost receipt");
 } catch (error) {
   if (page) console.error("Console alerts:", await page.getByRole("alert").allTextContents());
   throw error;

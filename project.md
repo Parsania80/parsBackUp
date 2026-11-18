@@ -389,11 +389,11 @@ A new model should be able to resume from status plus contracts without trusting
 | 11 | H — M6 hardened CLI/systemd/Debian | ✅ Fixture scope | H01–H05 fixture foundations accepted (§41–§50); H05 committed 046c22e. Production compatibility remains a V gate. |
 | 12 | V — production validation/release | ✅ W1/W2 bounded handoff | W1 in §56 and W2 in §57 accepted. Remaining V01, V02/V03 join integrated validation after UI; production stays disabled. |
 | 13 | P — M7 API/asynchronous service | ✅ Fixture scope | P04 accepted in §61 and committed as 86e96c5. |
-| 14 | U — M8 API-backed UI | 🔄 U02 first screens implemented | Sign-in, overview, artifacts, jobs and restore use the fixture API (§63). U03 adds profiles and backup. |
+| 14 | U — M8 API-backed UI | 🔄 U03 profiles and backup implemented | U01/U02 are committed as 40f73d2. U03 adds profiles and backup (§64). U04 browser acceptance follows. |
 | 15 | F — platform validation/release | ⬜ Todo | After API/UI: integrate remaining V01, V02/V03 and F01–F03; one shared release evidence set. |
 
-### ➡️ Current: #14 - U02 — first console checkpoint
-### ⏭️ Next: U03 profiles and backup → U04 browser acceptance → integrated V/F release validation
+### ➡️ Current: #14 - U03 — profiles and backup submission
+### ⏭️ Next: U04 browser acceptance → integrated V/F release validation
 
 Task IDs below remain stable even if a phase is split into several commits. The operator-approved §55 sequence governs remaining work: V01-W1/W2 → P → U → integrated V/F. V01-W1/W2 are bounded sub-gates of the existing V01 task. Full CLI release no longer blocks API development. Independent documentation can proceed alongside its owning task; dependent implementation waits for its stated prerequisites.
 
@@ -2513,3 +2513,23 @@ exact-target confirmation, and reloading the consumed plan and restore
 receipt. The database returned the seeded value 42 from the restored table.
 A narrow-screen overview check passed. U03 implements profiles and starting
 a backup. U04 owns broader browser and accessibility acceptance.
+
+## 64. U03 profiles and backup submission — 2026-11-18
+
+U01/U02 were reviewed against P04 and committed locally as **40f73d2**.
+The [Profiles screen](ui/src/profiles.tsx) displays the server's profile IDs,
+names and operations for the signed-in operator. Starting a backup requires
+job admission, a session with backup permission, a profile that allows
+backup, and explicit synthetic-data confirmation for the selected profile.
+Default selection sends a null profile ID. Named selection sends the exact
+API profile ID and uses the server-owned core configuration. Both use the
+existing idempotent submission and job receipt path. Success links to the
+published artifact.
+
+The HTTPS browser drill passed with Chrome 157, the supervised API and
+PostgreSQL 17. A viewer could read profiles. A backup operator could submit
+default and named jobs after confirmation, and the named artifact's inspection
+reported the configured `sample-only` scope. The drill dropped an accepted
+backup response and retried the same body and key, recovering the original
+job ID. The U02 restore, cancellation and session checks passed in the same
+run. The generated contract and package locks match the U01/U02 checkpoint.

@@ -118,3 +118,10 @@ the P03 fixture requirements, OpenSSL and Chromium. Install the browser with
 local Chromium or Chrome binary. From the repository root run
 `python3 tests/u02_console_drill.py`. It starts its own HTTPS proxy, creates
 disposable accounts and a backup, and checks the restored PostgreSQL row.
+
+Open **Profiles** to see the configured profiles and the operations the API
+allows for your session. To start a backup, select an eligible profile and
+confirm that the data is synthetic. The console opens the job receipt when
+the API accepts it. A successful receipt links to the new artifact. If a
+submission loses its response, use **Retry same submission** to recover the
+receipt with the original profile and idempotency key.

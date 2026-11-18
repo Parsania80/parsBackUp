@@ -1,4 +1,4 @@
-"""Drive the built U02 console through the real, supervised fixture API."""
+"""Drive the built fixture console through the real, supervised API."""
 
 from contextlib import contextmanager
 from http.client import HTTPConnection
@@ -13,7 +13,7 @@ from urllib.parse import urlsplit
 import uuid
 
 sys.dont_write_bytecode = True
-from p02_worker_drill import ROOT, TARGET, eventually, private, run
+from p02_worker_drill import ROOT, SOURCE, TARGET, eventually, private, run
 from p03_http_drill import http_fixture, start_supervised
 
 DIST = (ROOT / "ui/dist").resolve()
@@ -89,19 +89,22 @@ def https_console(base, api_port):
 
 def main():
     assert (DIST / "index.html").is_file(), "Build ui/dist before running the drill"
-    roles = ("admin-setup", "admin", "viewer")
+    roles = ("admin-setup", "admin", "viewer", "backup")
     with http_fixture(".parsbackup-u02-", roles=roles) as (base, client, unit, container, actors):
         with https_console(base, client.port) as origin:
             config = base / "api.toml"
             private(config, config.read_text().replace(f'public_origin = "{client.origin}"',
                                                       f'public_origin = "{origin}"')
                     .replace("development_http = true", "development_http = false"))
+            configure_profiles(base)
             start_supervised(unit, config)
             artifact, cancellable = prepare_jobs(base, client, urlsplit(origin).netloc, actors["admin-setup"][0])
             result = run("node", str(ROOT / "ui/scripts/browser-smoke.mjs"), content=json.dumps({
                 "origin": origin, "token": actors["admin"][0], "viewer": actors["viewer"][0],
                 "artifact": artifact, "target": TARGET, "cancellable": cancellable,
                 "screenshot": os.environ.get("PARSBACKUP_U02_SCREENSHOT"),
+                "backupToken": actors["backup"][0],
+                "profileScreenshot": os.environ.get("PARSBACKUP_U03_SCREENSHOT"),
             }), timeout=120, check=False)
             print(result.stdout, end="")
             assert result.returncode == 0, result.stderr
@@ -109,6 +112,35 @@ def main():
                            "-Atc", "SELECT n FROM sample")
             assert restored.stdout.strip() == "42"
             print("PostgreSQL fixture confirmed the restored row")
+
+
+def configure_profiles(base):
+    core_profile = f'''
+[[profile]]
+name = "sample-only"
+database = "{SOURCE}"
+tables = ["public.sample"]
+'''
+    for name in ("writer.toml", "reader.toml"):
+        path = base / name
+        private(path, path.read_text() + core_profile)
+    config = base / "api.toml"
+    private(config, config.read_text() + f'''
+[[profiles]]
+id = "daily"
+display_name = "Daily fixture"
+reader_config = "{base}/reader.toml"
+writer_config = "{base}/writer.toml"
+core_profile = "sample-only"
+operations = ["backup"]
+
+[[profiles]]
+id = "prune-only"
+display_name = "Prune fixture"
+reader_config = "{base}/reader.toml"
+core_profile = "sample-only"
+operations = ["retention_preview"]
+''')
 
 
 def prepare_jobs(base, client, host, token):
@@ -138,9 +170,12 @@ def prepare_jobs(base, client, host, token):
 
     eventually(done)
     assert job["state"] == "succeeded", job["error"]
-    private(base / "tool-mode", "cancel")
+    mode = base / "tool-mode"
+    private(mode, "cancel")
     cancellable = backup()
     eventually((base / "native-started").is_file)
+    # pg_dump has already read the mode and signalled its pause.
+    mode.unlink()
     return job["result"]["artifact_id"], cancellable["id"]
 
 

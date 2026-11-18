@@ -4,6 +4,7 @@ import { createRoot } from "react-dom/client";
 import { Api, ApiError, permissions } from "./api";
 import type { Controls, Operation, Session, Submission } from "./api";
 import { Failure, Heading, Mark, Message } from "./components";
+import { Profiles } from "./profiles";
 import { PlanRestore } from "./restore";
 import { publicError, useResource, useRoute } from "./state";
 import type { Accepted, Route } from "./state";
@@ -99,8 +100,8 @@ function Console({ session, onSignOut }: { session: Session; onSignOut: () => vo
   const health = useResource(useCallback((signal: AbortSignal) => api.health(signal), [api]), revision);
   const profiles = useResource(useCallback((signal: AbortSignal) => api.profiles(signal), [api]), revision);
   const [now, setNow] = useState(Date.now);
-  const can = (operation: Operation) => !!health.value?.job_admission &&
-    !!profiles.value?.find(profile => profile.id === "default")?.operations.includes(operation) &&
+  const can = (operation: Operation, profileId = "default") => !!health.value?.job_admission &&
+    !!profiles.value?.find(profile => profile.id === profileId)?.operations.includes(operation) &&
     session.permissions.includes(permissions[operation]);
 
   useEffect(() => () => scope.abort(), [scope]);
@@ -171,7 +172,8 @@ function Console({ session, onSignOut }: { session: Session; onSignOut: () => vo
     busy: !!pending || loggingOut,
     submit: input => {
       if (pending || loggingOut || scope.signal.aborted) return;
-      if (input.operation !== "cancel" && !can(input.operation)) return;
+      const profileId = input.operation === "backup" ? input.body.profile_id ?? "default" : "default";
+      if (input.operation !== "cancel" && !can(input.operation, profileId)) return;
       void send({ input, key: crypto.randomUUID(), retryAt: 0 });
     },
   };
@@ -188,7 +190,8 @@ function Console({ session, onSignOut }: { session: Session; onSignOut: () => vo
         </button>
       </div>
       <nav aria-label="Console" className="nav">
-        {([["overview", "#/", "Overview"], ["artifacts", "#/artifacts", "Artifacts"], ["jobs", "#/jobs", "Jobs"]] as const)
+        {([["overview", "#/", "Overview"], ["artifacts", "#/artifacts", "Artifacts"],
+          ["jobs", "#/jobs", "Jobs"], ["profiles", "#/profiles", "Profiles"]] as const)
           .map(([view, path, title]) => <a key={view} href={path} aria-current={currentNav === view ? "page" : undefined}>{title}</a>)}
       </nav>
     </header>
@@ -218,6 +221,9 @@ function Console({ session, onSignOut }: { session: Session; onSignOut: () => vo
           accepted={accepted?.job.id === route.id ? accepted : undefined} controls={controls}
           session={session} admission={!!health.value?.job_admission} />}
         {route.view === "restore" && <PlanRestore api={api} artifactId={route.id} controls={controls} />}
+        {route.view === "profiles" && <Profiles profiles={profiles} health={health}
+          backupPermission={session.permissions.includes(permissions.backup)} controls={controls}
+          refresh={() => refresh(n => n + 1)} />}
         {route.view === "missing" && <><Heading title="Page unavailable" /><a href="#/">Return to overview</a></>}
       </div>
     </main>
@@ -225,6 +231,7 @@ function Console({ session, onSignOut }: { session: Session; onSignOut: () => vo
 }
 
 function navigation(route: Route) {
+  if (route.view === "profiles") return "profiles";
   if (route.view === "job" || route.view === "jobs") return "jobs";
   if (route.view === "artifact" || route.view === "artifacts" || route.view === "restore") return "artifacts";
   return "overview";

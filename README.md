@@ -380,4 +380,7 @@ The U02 fixture console can sign in, browse artifacts and jobs, inspect and
 verify backups, and run a restore after you review the plan and type the exact
 target. Build and exercise it locally using the
 [console guide](docs/operations/http-api.md#fixture-operator-console).
-**U03 adds the profile and backup screens.**
+
+Open **Profiles** to see which operations your operator account can use.
+Choose a backup profile, confirm the data is synthetic, and open the resulting
+job receipt to find the new artifact. **Next is U04 browser acceptance.**

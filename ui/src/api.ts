@@ -42,6 +42,7 @@ export const permissions = {
 } satisfies Record<Operation, Permission>;
 
 export type Submission =
+  | { operation: "backup"; body: Schema["BackupRequest"] }
   | { operation: "inspection"; body: Schema["ArtifactRequest"] }
   | { operation: "verification"; body: Schema["VerificationRequest"] }
   | { operation: "restore_plan"; body: RestoreDraft }
@@ -50,12 +51,13 @@ export type Submission =
 
 export type Controls = {
   busy: boolean;
-  can: (operation: Operation) => boolean;
+  can: (operation: Operation, profileId?: string) => boolean;
   invalidIntent?: string;
   submit: (input: Submission) => void;
 };
 
 const paths = {
+  backup: "/backups",
   inspection: "/inspections", verification: "/verifications",
   restore_plan: "/restore-plans", restore: "/restores",
 } as const;
@@ -85,10 +87,13 @@ const health = (x: unknown): x is Health => object(x) && typeof x.ready === "boo
   x.mode === "fixture" && x.production_enabled === false && typeof x.job_admission === "boolean" &&
   typeof x.containment_verified === "boolean" && Number.isInteger(x.queue_depth) &&
   typeof x.queue_depth === "number" && x.queue_depth >= 0 && x.queue_depth <= 16;
-const profiles = (x: unknown): x is { items: Profile[] } => object(x) && Array.isArray(x.items) &&
-  x.items.every(row => object(row) && typeof row.id === "string" &&
-    typeof row.display_name === "string" && Array.isArray(row.operations) &&
-    row.operations.every(op => has(op, operations)));
+const profile = (x: unknown): x is Profile => object(x) && typeof x.id === "string" &&
+  /^[a-z][a-z0-9_-]{0,63}$/.test(x.id) &&
+  typeof x.display_name === "string" && x.display_name.length > 0 && Array.from(x.display_name).length <= 128 &&
+  Array.isArray(x.operations) && x.operations.length <= 8 && x.operations.every(op => has(op, operations));
+const profiles = (x: unknown): x is Schema["Profiles"] => object(x) && Array.isArray(x.items) &&
+  x.items.length <= 256 && x.items.every(profile) &&
+  new Set(x.items.map(item => item.id)).size === x.items.length;
 const safeError = (x: unknown) => object(x) && typeof x.code === "string" && typeof x.retryable === "boolean";
 
 function restoreIntent(x: unknown): x is Intent {

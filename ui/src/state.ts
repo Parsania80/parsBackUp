@@ -3,7 +3,7 @@ import { ApiError, terminal, uuid } from "./api";
 import type { Api, Job, Page } from "./api";
 
 export type Route =
-  | { view: "overview" | "artifacts" | "jobs" | "missing" }
+  | { view: "overview" | "artifacts" | "jobs" | "profiles" | "missing" }
   | { view: "artifact" | "job" | "restore"; id: string };
 
 export function readRoute(): Route {
@@ -11,6 +11,7 @@ export function readRoute(): Route {
   if (!hash || hash === "#/") return { view: "overview" };
   if (hash === "#/artifacts") return { view: "artifacts" };
   if (hash === "#/jobs") return { view: "jobs" };
+  if (hash === "#/profiles") return { view: "profiles" };
   if (!hash.startsWith("#/")) return { view: "missing" };
   const [, segment, id, extra] = hash.split("/");
   if (extra !== undefined || !uuid(id)) return { view: "missing" };
@@ -32,7 +33,7 @@ export function useRoute() {
   return route;
 }
 
-type Resource<T> = { value?: T; error?: ApiError; loading: boolean };
+export type Resource<T> = { value?: T; error?: ApiError; loading: boolean };
 export const publicError = (error: unknown) => error instanceof ApiError
   ? error : new ApiError(0, "UNAVAILABLE", undefined, undefined, "The console could not complete this request.");
 
