@@ -38,6 +38,8 @@ pub struct Capture {
     created: RefCell<Vec<String>>,
     pub target_exists: std::cell::Cell<bool>,
     pub globals_applied: std::cell::Cell<usize>,
+    pub restore_preflights: std::cell::Cell<usize>,
+    pub native_context: RefCell<Option<backup_domain::NativeRestoreContext>>,
     /// Optional catalog observations for selective-backup/re-resolution tests.
     pub selections: RefCell<Vec<ResolvedSelection>>,
     /// Fired once, from the first byte a dump's stream is actually read.
@@ -101,6 +103,22 @@ pub struct StubEngine<'a> {
 }
 
 impl DatabaseAdapter for StubEngine<'_> {
+    fn restore_context(&self) -> Option<backup_domain::NativeRestoreContext> {
+        self.capture.native_context.borrow().clone()
+    }
+
+    fn restore_preflight(
+        &self,
+        source: &Source,
+        _target: &str,
+        timeout: Duration,
+    ) -> Result<EngineInfo> {
+        self.capture
+            .restore_preflights
+            .set(self.capture.restore_preflights.get() + 1);
+        self.preflight(source, timeout)
+    }
+
     fn preflight(&self, _source: &Source, _timeout: Duration) -> Result<EngineInfo> {
         Ok(EngineInfo {
             source_major: 16,

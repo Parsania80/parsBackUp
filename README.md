@@ -314,3 +314,18 @@ See [W1 acceptance](project.md#w1-implementation-and-acceptance--2026-11-17).
 
 The operator requested a local checkpoint of all current W1 and web-first roadmap
 changes. Git history records the commit identity; pushing remains operator-owned.
+
+W1 is committed as 1b51013. W2 is now defining [restore-plan compatibility](docs/development/v01-w2-restore-plan-compatibility.md): preserve historical fixture plans, specify a distinct future production format, and verify existing fixture context/refusal behavior. No production writer is enabled. After this bounded proof, API design is next.
+
+W2 restore-plan compatibility is now verified. Existing fixture plans and runtime
+behavior stay unchanged; a separate future production format is documented and
+still refused by this build. **324 tests**, strict Clippy and the actual PG16–18
+native context/authentication/recovery drill pass. Both bounded backend gates are
+accepted. **Next: P01 API design, then API → UI → integrated release validation.**
+The W2 checkpoint is uncommitted; production remains disabled. See
+[W2 acceptance](project.md#w2-acceptance-and-api-handoff--2026-11-18).
+
+W2 checkpoint review found no blocking issues; the operator requested its local
+commit before P01 API design. Retained 324-test/all-major context-recovery evidence
+was rechecked against unchanged test and contract inputs. Git history records the
+commit identity; pushing remains operator-owned.

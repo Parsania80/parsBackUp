@@ -59,9 +59,12 @@ cryptographic assurance or a constant-time proof. A clean advisory scan is time-
 V01 reports acceptance separately from blockers. Versioned writable offline reads and
 retention dispatch are implemented and verified by [V01-W1](v01-w1-offline-dispatch.md)
 with acceptance in [project §56](../../project.md#56-v01-w1-writable-offline-dispatch--2026-11-17).
-Production plan canonical bytes/context still require W2 definition/fixture proof
-before dependent writers. Production operations remain disabled; W1 certifies only
-its stated fixture command paths. Resolve any
+[W2](v01-w2-restore-plan-compatibility.md) now defines future production plan canonical
+bytes/context and verifies the existing fixture producer/consumer. Its acceptance is
+in [project §57](../../project.md#57-v01-w2-restore-plan-compatibility--2026-11-18).
+Both bounded backend gates are accepted; P01 API design is next. The proposed v4 is
+not implemented; production operations remain disabled. W1/W2 certify only their
+stated fixture and compatibility promises. Resolve any
 new content/security failures before V01 acceptance; do not mark the entire phase done
 while required behavior remains unvalidated. V02 measurements, V03 license/security/
 support/release decision, T03 off-host replay limitation and hosted CI execution remain

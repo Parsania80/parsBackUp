@@ -1,6 +1,6 @@
 # PostgreSQL Backup Platform — Implementation Roadmap
 
-Latest direction: §55 (operator-approved web-first sequence, 2026-11-17): W1 is verified (§56), W2 is next, then API → UI → integrated release validation. Signed-family checkpoint a0ab1d4 is committed locally; its acceptance is in §54. V01 checkpoint is `5a1834b`; SQLite checkpoint `d90a3b4` is committed and remote push verified. Cryptography checkpoint `c13f593` is committed locally. H05 is committed as `046c22e`; H04 as `6a547e9`, H03 as `cb34f5e` and H02 fixture hardening as `3cc9326`. H fixture foundations are locally accepted; production compatibility/content/security validation and V02/V03 remain required. The historical 2026-10-03 rewrite was operator-authorized; historical results are distinct from current verification.
+Latest handoff: §57 (W2 restore-plan compatibility verified, 2026-11-18). Both bounded backend gates are accepted; P01 API contract is next under the web-first sequence (§55), then API → UI → integrated release validation. W1 is committed as 1b51013. Signed-family checkpoint a0ab1d4 is committed locally; its acceptance is in §54. V01 checkpoint is `5a1834b`; SQLite checkpoint `d90a3b4` is committed and remote push verified. Cryptography checkpoint `c13f593` is committed locally. H05 is committed as `046c22e`; H04 as `6a547e9`, H03 as `cb34f5e` and H02 fixture hardening as `3cc9326`. H fixture foundations are locally accepted; production compatibility/content/security validation and V02/V03 remain required. The historical 2026-10-03 rewrite was operator-authorized; historical results are distinct from current verification.
 
 ## 1. Project vision and how to use this document
 
@@ -385,13 +385,13 @@ A new model should be able to resume from status plus contracts without trusting
 | 9 | A — complete M5a inventory/jobs/recovery | ✅ Done | A01–A08 accepted 2026-11-13, including separate JobLock hardening; evidence in §34.7. |
 | 10 | B — M5b retention/protection/deletion | ✅ Done | B01–B06 accepted; eight PG16/17/18 matrices and destructive/race/crash gates pass (§40). |
 | 11 | H — M6 hardened CLI/systemd/Debian | ✅ Fixture scope | H01–H05 fixture foundations accepted (§41–§50); H05 committed 046c22e. Production compatibility remains a V gate. |
-| 12 | V — production validation/release | 🔄 W1 verified; W2 next | W1 acceptance in §56; W2 compatibility contract/fixture proof completes the bounded API handoff (§55). Remaining V01, V02/V03 join integrated validation after UI; production disabled. |
-| 13 | P — M7 API/asynchronous service | ⏭️ Next | P01–P04 follow V01-W1/W2; full CLI release is not a prerequisite. Runtime/auth/worker decisions remain P01. |
+| 12 | V — production validation/release | ✅ W1/W2 bounded handoff | W1 in §56 and W2 in §57 accepted. Remaining V01, V02/V03 join integrated validation after UI; production stays disabled. |
+| 13 | P — M7 API/asynchronous service | 🔄 Current: P01 next | W1/W2 handoff accepted; define runtime/auth/OpenAPI/worker decisions before P02–P04. Full CLI release is not a prerequisite. |
 | 14 | U — M8 API-backed UI | ⬜ Todo | Requires stable API. |
 | 15 | F — platform validation/release | ⬜ Todo | After API/UI: integrate remaining V01, V02/V03 and F01–F03; one shared release evidence set. |
 
-### ➡️ Current: #12 - V01-W2 — shared restore-plan compatibility contract and fixture proof
-### ⏭️ Next: #13 - P01 API contract → P02–P04 API → U01–U04 UI → integrated V/F release validation
+### ➡️ Current: #13 - P01 — API design contract (W1/W2 backend handoff accepted)
+### ⏭️ Next: P01 decisions → P02–P04 API → U01–U04 UI → integrated V/F release validation
 
 Task IDs below remain stable even if a phase is split into several commits. The operator-approved §55 sequence governs remaining work: V01-W1/W2 → P → U → integrated V/F. V01-W1/W2 are bounded sub-gates of the existing V01 task. Full CLI release no longer blocks API development. Independent documentation can proceed alongside its owning task; dependent implementation waits for its stated prerequisites.
 
@@ -2062,9 +2062,9 @@ release exemption. T03 remains an explicit off-host/root-loss limitation; implem
 an independent-copy/replay system is outside the initial web product unless separately
 authorized, and no host-loss guarantee may be advertised without it.
 
-**Current handoff:** W1 is implemented and verified in §56; W2 compatibility
-contract/fixture proof is next. Then P01 API contract → P02–P04 → U01–U04 → integrated
-V/F. API/UI remain unimplemented; the production guard is unchanged.
+**Current handoff:** W1 and W2 are verified in §56–§57. Next P01 API contract →
+P02–P04 → U01–U04 → integrated V/F. No third general backend gate precedes P01.
+API/UI remain unimplemented; the production guard is unchanged.
 
 | File Path | Change Type | Description |
 |---|---|---|
@@ -2169,3 +2169,93 @@ controlled-flow/deployment boundaries, source-bound gate records, retained packa
 and append-only archive/log hashes, and scoped cleanup. Only README/project/log and
 the three operation/validation handoff docs changed after native acceptance. Evidence:
 /tmp/parsbackup-w1-audit.py/.log. W1 is verified/uncommitted; W2 is next.
+
+## 57. V01-W2 restore-plan compatibility — 2026-11-18
+
+W1 checkpoint **1b51013** is committed locally with exact20 blobs/tree/parenta0ab1d4
+and clean checkout verified; operator owns push. W2 inspection confirms frozen
+v1/v2/v3 plan bytes and v3's explicit fixture context. Selected a documentation-only
+future production-restore-plan-v4 contract, with no new runtime format/writer or
+production guard change; retain actual fixture producer/consumer and add focused
+compatibility/context-before-mutation proof. See the [W2 contract](docs/development/v01-w2-restore-plan-compatibility.md),
+recorded before tests. P01 owns API actors/auth/idempotency; production writing and
+remaining V/F release work stay deferred. Fast plus actual all-major native context/
+maintenance recovery gates follow; W2 is not accepted yet. No commit/push requested.
+
+### W2 acceptance and API handoff — 2026-11-18
+
+**W2 is verified, uncommitted for review. Both bounded backend gates are accepted;
+P01 API design is next.** Runtime implementations, historical plan validators/bytes/
+digests, artifact formats, crypto, schema, configuration and production guards are
+unchanged. The new contract defines future production-restore-plan-v4 with exact
+ordered typed JSON/SHA-256, required rollback/native context, mode/source/maintenance/
+acting-user/auth/tool/passfile-path/target/security/sections/TTL/confirmation and
+revalidation boundaries. It is specification-only: current readers reject it and
+production-in-v3. Future implementation requires actual isolated producer/consumer
+acceptance; no dormant production writer/parser/format constant is introduced now.
+
+The contract maps each production promise to current fixture behavior or the explicit
+integrated-release obligation. Plan digests are content IDs, not authorization/MACs;
+CLI confirmation remains UUID plus target. P01 must specify server-owned intent bound
+to actor/request/digest/context/expiry before dependent API routes/workers. Passfile
+bytes are excluded (same-path credential rotation remains allowed); tool patch-string
+identity is not promised; authenticated manifest digest already binds scope/family
+facts. Signed-manifest fixture-name guards still need explicit production resolution
+later. No API, production enablement or independent security assurance is claimed.
+
+Added composed real LocalStore/RestoreService evidence: fixture v3 producer/save/load/
+canonical digest roundtrip; changed mode/host/port/user/maintenance/auth/tools/passfile
+and legacy/new cross-execution refuse before restore preflight, jobs or mutation;
+source/target/time/future-format/production-context controls preserve inventory and
+cluster state. Ciphertext change correctly refuses after preflight and a failed job,
+before cluster mutation; restored original bytes then execute the unchanged plan.
+Both ordinary signed scope v1 and expanded-family scope v2 use the existing v3 plan
+path; authenticated header/manifest facts remain unchanged on successful restore.
+Frozen v1/v2/v3 canonical vectors and existing security/sections/rollback refusals
+remain exercised by the workspace suite. No test failure required a product fix.
+
+Verification passes **324 workspace tests**, strict locked/offline Clippy, fmt,
+workflow/actionlint, syntax/reference/TOML/JSON and actual CLI envelopes. Existing
+native authentication/maintenance/context/downgrade/recovery drill passes **PG16/17/18**
+with matching clients: SCRAM fallback refusal, peer identity, protected tools/custody/
+resources, changed-context no-job/no-target controls and actual portable/DR recovery
+with the original database absent. Both final wrappers preserved the same **179 inputs**.
+No runtime/test/contract edits follow acceptance; only README/project/log and V01
+status handoff docs are updated. Final scope/protected-source/evidence/log/cleanup
+audit follows these edits. No package/benchmark/unrelated destructive matrix/hosted
+rerun or fresh dependency scan; prior evidence/maintenance advisories remain visible.
+
+Evidence: target/ci-logs/{fast,native-h02_native_auth_recovery}{.log,-inputs.json},
+w2-freeze-inputs.json, /tmp/parsbackup-w2-{focused,fast,native}.log and final
+/tmp/parsbackup-w2-audit.py/.log. Previous W1 fast/native records remain under
+checkpoint-w1 before canonical paths were reused; W1's other native records and
+prior packages are unchanged. HEAD remains 1b51013 with empty index; no commit/push
+requested in this increment. Operator retains Desktop push responsibility.
+
+| File Path | Change Type | Description |
+|---|---|---|
+| [W2 compatibility contract](docs/development/v01-w2-restore-plan-compatibility.md) | Added | Production version/canonical/context design, exact fixture mapping, authorization limits and P01 handoff. |
+| [common/mod.rs](crates/backup-local/tests/common/mod.rs) | Tests modified | Optional native context and restore-preflight counter; unchanged default adapter behavior. |
+| [signed_write_path.rs](crates/backup-local/tests/signed_write_path.rs) | Tests modified | Actual saved-plan roundtrip, drift/refusal ordering, tamper/failed-job/control restore and family scope v3 reuse. |
+| [ci/check.py](ci/check.py) | Modified | Include W2 contract in reference checks. |
+| [V01 status](docs/development/v01-validation.md), [README.md](README.md), [project.md](project.md), [session-log.md](session-log.md) | Surgical edits/appended | Record acceptance and move the active roadmap to P01 without another general backend phase. |
+
+Next logical step: review/commit this bounded W2 checkpoint, then **P01 API contract**
+(runtime/framework, OpenAPI, actors/permissions, safe errors, server-owned intent and
+idempotency, token custody, deployment, queue/restart/cancellation). No new dependency
+is selected or installed in W2. API → UI → integrated V/F remains the authorized path.
+
+Final W2 audit passes **509 local reference targets/fragments**, 52 embedded Python
+blocks plus standalone/shell/maintainer syntax, CLI examples, fmt/diff, exact8-file
+scope/HEAD1b51013/empty index, unchanged runtime/frozen vectors/formats/schema/
+dependencies/controlled docs/deployment, both179-input evidence records, append-only
+log/archive and retained package hashes plus scoped cleanup. Only the four declared
+handoff docs changed after gates. Evidence: /tmp/parsbackup-w2-audit.py/.log. W2 is
+verified/uncommitted; P01 API design is the next task, production remains disabled.
+
+W2 checkpoint review (2026-11-18): no blocking findings. The future production
+format remains a specification, historical/runtime bytes and validators are unchanged,
+and actual-store refusal-order/control tests plus retained 324-test/native evidence
+match the reviewed inputs. Preparing the operator-authorized exact eight-file local
+commit with parent/tree/blob and clean-checkout verification; Git history supplies
+its identity. No push. P01 design follows this checkpoint.

@@ -106,6 +106,26 @@ fn family_publication_uses_v2_and_observed_scope_change_publishes_nothing() {
             rebuild_fixture(&fixture);
             let opened = fixture.reader().open_signed(header.backup_id).unwrap();
             assert_eq!(opened.manifest().format_version, 2);
+            drop(opened);
+            *capture.native_context.borrow_mut() = Some(w2_context(&config));
+            let restore = RestoreService::new(StubEngine { capture: &capture }, fixture.reader());
+            let plan = restore
+                .plan(
+                    &config,
+                    header.backup_id,
+                    DR_TARGET,
+                    RestoreSecurityPolicy::portable(),
+                    RestoreSections::full(),
+                )
+                .unwrap();
+            assert_eq!(plan.format, backup_domain::RESTORE_PLAN_V3);
+            assert_eq!(
+                plan.rollback.as_ref().unwrap().manifest_sha256,
+                header.manifest_sha256
+            );
+            restore.run(&config, plan.id, DR_TARGET).unwrap();
+            assert_eq!(capture.created(), [DR_TARGET]);
+            drop(restore);
         }
         fixture.remove();
     }
@@ -612,6 +632,166 @@ fn verification_events_enrich_only_after_authenticated_manifest_and_can_be_read_
     assert_eq!(events[2].payload_sha256, None);
     drop(inventory);
     drop(service);
+    fixture.remove();
+}
+
+fn w2_context(config: &Config) -> backup_domain::NativeRestoreContext {
+    backup_domain::NativeRestoreContext {
+        mode: backup_domain::ConfigMode::Fixture,
+        host: config.source.host.clone(),
+        port: config.source.port,
+        user: config.source.user.clone(),
+        maintenance_database: "postgres".into(),
+        auth: backup_domain::LocalAuth::ScramPassfile,
+        client_bin_dir: config.source.client_bin_dir.clone(),
+        password_file: Some("/private/synthetic-passfile".into()),
+    }
+}
+
+#[test]
+fn w2_saved_fixture_plan_refuses_drift_before_preflight_jobs_or_target_mutation() {
+    let capture = Capture::default();
+    let fixture = write_signed(&capture);
+    let context = w2_context(&fixture.config);
+    *capture.native_context.borrow_mut() = Some(context.clone());
+    let store = fixture.reader();
+    let restore = RestoreService::new(StubEngine { capture: &capture }, fixture.reader());
+    let plan = restore
+        .plan(
+            &fixture.config,
+            fixture.id,
+            DR_TARGET,
+            RestoreSecurityPolicy::portable(),
+            RestoreSections::full(),
+        )
+        .unwrap();
+    assert_eq!(plan.format, backup_domain::RESTORE_PLAN_V3);
+    let loaded = store.load_plan(plan.id).unwrap().unwrap();
+    assert_eq!(
+        serde_json::to_vec(&loaded).unwrap(),
+        serde_json::to_vec(&plan).unwrap()
+    );
+    assert_eq!(loaded.digest(), plan.digest());
+    let inventory_path = fixture.store_root.join(INVENTORY_FILE);
+    let before = fs::read(&inventory_path).unwrap();
+    let preflights = capture.restore_preflights.get();
+    let artifact_before: Vec<_> = files_under(&fixture.artifact_dir())
+        .into_iter()
+        .map(|p| {
+            let bytes = fs::read(&p).unwrap();
+            (p, bytes)
+        })
+        .collect();
+    let assert_untouched = || {
+        assert_eq!(capture.restore_preflights.get(), preflights);
+        assert_eq!(fs::read(&inventory_path).unwrap(), before);
+        assert!(capture.created().is_empty());
+        assert_eq!(capture.globals_applied.get(), 0);
+    };
+    let changes: Vec<fn(&mut backup_domain::NativeRestoreContext)> = vec![
+        |c| c.mode = backup_domain::ConfigMode::Production,
+        |c| c.host = "::1".into(),
+        |c| c.port = 5433,
+        |c| c.user = "different_role".into(),
+        |c| c.maintenance_database = "missing_maintenance".into(),
+        |c| {
+            c.auth = backup_domain::LocalAuth::Peer;
+            c.host = "/missing-socket".into();
+            c.password_file = None;
+        },
+        |c| c.client_bin_dir = "/missing-tools".into(),
+        |c| c.password_file = Some("/missing-passfile".into()),
+    ];
+    for (index, change) in changes.into_iter().enumerate() {
+        let mut changed = context.clone();
+        change(&mut changed);
+        *capture.native_context.borrow_mut() = Some(changed);
+        let error = failure(restore.run(&fixture.config, plan.id, DR_TARGET));
+        assert!(
+            error.contains("NATIVE_CONTEXT_MISMATCH"),
+            "case {index}: {error}"
+        );
+        assert_untouched();
+    }
+    *capture.native_context.borrow_mut() = None;
+    assert!(
+        failure(restore.run(&fixture.config, plan.id, DR_TARGET))
+            .contains("NATIVE_CONTEXT_MISMATCH")
+    );
+    assert_untouched();
+    *capture.native_context.borrow_mut() = Some(context.clone());
+    assert!(
+        failure(restore.run(&fixture.config, plan.id, "backupctl_fixture_other"))
+            .contains("confirmation target")
+    );
+    assert_untouched();
+    let mut wrong_source = fixture.config.clone();
+    wrong_source.source.database = "backupctl_fixture_other".into();
+    assert!(failure(restore.run(&wrong_source, plan.id, DR_TARGET)).contains("source database"));
+    assert_untouched();
+    // Save real variants through the actual store, rather than mocking load_plan.
+    let mut variants = Vec::new();
+    let mut legacy = plan.clone();
+    legacy.format = backup_domain::RESTORE_PLAN_V2.into();
+    legacy.native_context = None;
+    variants.push((legacy, "NATIVE_CONTEXT_MISMATCH"));
+    let mut future = plan.clone();
+    future.format = "production-restore-plan-v4".into();
+    future.native_context.as_mut().unwrap().mode = backup_domain::ConfigMode::Production;
+    variants.push((future, "unrecognized restore plan format"));
+    let mut production = plan.clone();
+    production.native_context.as_mut().unwrap().mode = backup_domain::ConfigMode::Production;
+    variants.push((production, "invalid native restore context"));
+    let mut expired = plan.clone();
+    expired.created_unix_ms = 1;
+    expired.expires_unix_ms = 900001;
+    variants.push((expired, "expired"));
+    let mut future_time = plan.clone();
+    future_time.created_unix_ms = backup_application::now_unix_ms().unwrap() + 60_000;
+    future_time.expires_unix_ms = future_time.created_unix_ms + 900_000;
+    variants.push((future_time, "invalid restore plan time window"));
+    for (mut variant, expected) in variants {
+        variant.id = Uuid::new_v4();
+        store.save_plan(&variant).unwrap();
+        let error = failure(restore.run(&fixture.config, variant.id, DR_TARGET));
+        assert!(error.contains(expected), "{expected}: {error}");
+        assert_untouched();
+    }
+    // Ciphertext drift is detected after preflight/job creation but still before
+    // cluster mutation. Do not confuse that refusal with a no-job guarantee.
+    let payload_path = fixture.artifact_dir().join("payload.age");
+    let payload = fs::read(&payload_path).unwrap();
+    let mut changed_payload = payload.clone();
+    changed_payload.push(0);
+    fs::write(&payload_path, changed_payload).unwrap();
+    let error = failure(restore.run(&fixture.config, plan.id, DR_TARGET));
+    assert!(
+        error.contains("payload.age is not the ciphertext"),
+        "{error}"
+    );
+    assert!(capture.created().is_empty());
+    assert_eq!(capture.globals_applied.get(), 0);
+    let inventory = backup_inventory::Inventory::open_read_only_bound(&inventory_path).unwrap();
+    assert_eq!(
+        inventory
+            .jobs()
+            .unwrap()
+            .iter()
+            .filter(|j| j.state == JobState::Failed)
+            .count(),
+        1
+    );
+    drop(inventory);
+    fs::write(&payload_path, payload).unwrap();
+    let result = restore.run(&fixture.config, plan.id, DR_TARGET).unwrap();
+    assert_eq!(result.plan.digest(), plan.digest());
+    assert_eq!(capture.created(), [DR_TARGET]);
+    assert_eq!(capture.restore_preflights.get(), preflights + 2);
+    for (path, bytes) in artifact_before {
+        assert_eq!(fs::read(path).unwrap(), bytes);
+    }
+    drop(restore);
+    drop(store);
     fixture.remove();
 }
 
