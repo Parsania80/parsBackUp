@@ -383,4 +383,7 @@ target. Build and exercise it locally using the
 
 Open **Profiles** to see which operations your operator account can use.
 Choose a backup profile, confirm the data is synthetic, and open the resulting
-job receipt to find the new artifact. **Next is U04 browser acceptance.**
+job receipt to find the new artifact. The U04 checkpoint records verification
+of the fixture backup and restore workflow in Chrome, including keyboard
+operation and narrow layouts.
+**Next is integrated release validation.**

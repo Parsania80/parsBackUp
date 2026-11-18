@@ -114,7 +114,7 @@ def main():
             print("PostgreSQL fixture confirmed the restored row")
 
 
-def configure_profiles(base):
+def configure_profiles(base, daily_name="Daily fixture"):
     core_profile = f'''
 [[profile]]
 name = "sample-only"
@@ -128,7 +128,7 @@ tables = ["public.sample"]
     private(config, config.read_text() + f'''
 [[profiles]]
 id = "daily"
-display_name = "Daily fixture"
+display_name = {json.dumps(daily_name)}
 reader_config = "{base}/reader.toml"
 writer_config = "{base}/writer.toml"
 core_profile = "sample-only"

@@ -44,9 +44,9 @@ export function date(ms: number) {
 
 export function Pager({ number, canBack, canNext, previous, next }:
   { number: number; canBack: boolean; canNext: boolean; previous: () => void; next: () => void }) {
-  return <div className="pager" aria-label="Pagination">
+  return <nav className="pager" aria-label="Pagination">
     <span className="metadata">Page {number}</span>
     <button className="secondary" disabled={!canBack} onClick={previous}>Previous</button>
     <button className="secondary" disabled={!canNext} onClick={next}>Next page</button>
-  </div>;
+  </nav>;
 }

@@ -69,7 +69,7 @@ Chosen compatibility policy: PostgreSQL 16, 17 and 18 source servers, absolute s
 | Signatures | `ed25519-dalek` 2.2 line and `ml-dsa` 0.1.1 or reviewed compatible update | Required zeroization features; both signature legs verify. |
 | CLI | `clap` derive | Existing human/JSON modes; parsing/presentation only. |
 | API adapter | Axum = 0.8.9, Tokio = 1.54.1, static OpenAPI 3.1.2 | HTTP dependencies are confined to `backup-api`. The core is synchronous. The adapter uses isolated operation processes and a private control DB (§59–§60). |
-| UI console | React and React DOM 19.3.1, TypeScript 5.9.3, Vite 8.3.8, plain CSS, openapi-typescript 7.13.0 | Node 22.23.2, npm 10.9.8, Playwright 1.65.1 for the browser drill. Static assets share the API's HTTPS origin (§62–§63). |
+| UI console | React and React DOM 19.3.1, TypeScript 5.9.3, Vite 8.3.8, plain CSS, openapi-typescript 7.13.0 | Node 22.23.2, npm 10.9.8. Playwright 1.65.1 and axe-core 4.14.1 are test tools. Static assets share the API's HTTPS origin (§62–§65). |
 | Local coordination | Unix `flock` through `libc` | Kernel ownership; nonblocking scope acquisition; never unlink live lock files. |
 
 Approved direct workspace libraries: `anyhow`, `clap`, `serde`, `serde_json`, `sha2`, `toml`, `uuid`, `age`, `age-core`, `base64`, `hkdf`, `libc`, `hpke`, `ml-kem`, `rand`, `sha3`, `typenum`, `x25519-dalek`, `rusqlite`, `ed25519-dalek`, `ml-dsa`, `zeroize`. [Cargo.toml](Cargo.toml) is the declaration and [Cargo.lock](Cargo.lock) records resolved versions and transitive dependencies. Preserve feature flags and exact pins unless a named task requires a reviewed upgrade.
@@ -389,11 +389,11 @@ A new model should be able to resume from status plus contracts without trusting
 | 11 | H — M6 hardened CLI/systemd/Debian | ✅ Fixture scope | H01–H05 fixture foundations accepted (§41–§50); H05 committed 046c22e. Production compatibility remains a V gate. |
 | 12 | V — production validation/release | ✅ W1/W2 bounded handoff | W1 in §56 and W2 in §57 accepted. Remaining V01, V02/V03 join integrated validation after UI; production stays disabled. |
 | 13 | P — M7 API/asynchronous service | ✅ Fixture scope | P04 accepted in §61 and committed as 86e96c5. |
-| 14 | U — M8 API-backed UI | 🔄 U03 profiles and backup implemented | U01/U02 are committed as 40f73d2. U03 adds profiles and backup (§64). U04 browser acceptance follows. |
+| 14 | U — M8 API-backed UI | ✅ Fixture scope | U03 is committed as 205586d. U04 verified browser and accessibility acceptance in Chrome (§65). |
 | 15 | F — platform validation/release | ⬜ Todo | After API/UI: integrate remaining V01, V02/V03 and F01–F03; one shared release evidence set. |
 
-### ➡️ Current: #14 - U03 — profiles and backup submission
-### ⏭️ Next: U04 browser acceptance → integrated V/F release validation
+### ➡️ Current: #14 - U04 — verified fixture console checkpoint
+### ⏭️ Next: #15 - F01/V01 integrated compatibility and release validation
 
 Task IDs below remain stable even if a phase is split into several commits. The operator-approved §55 sequence governs remaining work: V01-W1/W2 → P → U → integrated V/F. V01-W1/W2 are bounded sub-gates of the existing V01 task. Full CLI release no longer blocks API development. Independent documentation can proceed alongside its owning task; dependent implementation waits for its stated prerequisites.
 
@@ -2533,3 +2533,37 @@ reported the configured `sample-only` scope. The drill dropped an accepted
 backup response and retried the same body and key, recovering the original
 job ID. The U02 restore, cancellation and session checks passed in the same
 run. The generated contract and package locks match the U01/U02 checkpoint.
+
+## 65. U04 browser and accessibility acceptance — 2026-11-18
+
+U03 was reviewed and committed locally as **205586d**. U04 ran the static
+console over loopback HTTPS with a real user-systemd API, PostgreSQL 17 and
+Chrome 157. The [acceptance drill](tests/u04_browser_acceptance.py) verified
+keyboard sign-in, navigation, backup and exact-target restore, with the
+expected row 42 in the restored table. A disconnected artifact read
+recovered on refresh. A real expired session was refused at the API, and
+advancing the browser clock to the returned session deadline cleared private
+views. A changed fixture configuration disabled backup submission.
+
+A controlled post-create failure left a real partial restore, and a
+supervisor restart left an interrupted job. The console showed each state
+and its reported effects after loading the stored receipt. The drill also
+checked literal rendering of markup-shaped profile text. The U02/U03
+regression proved an accepted backup with a dropped response returned the
+same job on retry, before the restore and cancellation checks completed.
+
+Axe-core 4.14.1 (MPL-2.0, test-only) reported zero violations in 13 scanned
+states with WCAG 2.0–2.2 A/AA rules, including target size. Its two decorative
+arrow contrast checks were reviewed at 8.23:1. Keyboard focus and 320-pixel
+reflow were exercised in the live workflow. U04 fixed narrow profile layout,
+restore field focus after validation, the skip link and pagination semantics.
+Pagination now reuses the existing abortable loader. These results cover the
+tested fixture workflow and automated checks. [WCAG 2.2](https://www.w3.org/TR/WCAG22/).
+
+Exploratory Firefox 159 runs reached the 320-pixel Profiles scan before the
+headless content process crashed. Cross-browser acceptance remains open for
+integrated release validation.
+
+The Rust runtime, Cargo.lock and OpenAPI bytes remain the verified P04
+baseline. The console runtime npm audit reported zero vulnerabilities. The
+existing build-time picomatch advisory stays in the V03 dependency review.

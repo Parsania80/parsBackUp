@@ -125,3 +125,20 @@ confirm that the data is synthetic. The console opens the job receipt when
 the API accepts it. A successful receipt links to the new artifact. If a
 submission loses its response, use **Retry same submission** to recover the
 receipt with the original profile and idempotency key.
+
+### Browser and accessibility acceptance
+
+Run the [U04 fixture acceptance](../../tests/u04_browser_acceptance.py) from
+the repository root after building the console. It uses the P04 verification
+dependencies, a supervised API, PostgreSQL 17 and Chromium. Set
+`PARSBACKUP_BROWSER` to a local Chrome binary or install Playwright's Chromium.
+
+```bash
+python3 tests/u04_browser_acceptance.py
+```
+
+The drill creates and restores a synthetic backup by keyboard, checks
+partial and interrupted job receipts and session expiry, and scans desktop
+and 320-pixel layouts with axe-core. It also verifies that a changed fixture
+configuration disables new jobs. Automated accessibility results apply to the
+tested views and states. [WCAG 2.2](https://www.w3.org/TR/WCAG22/).

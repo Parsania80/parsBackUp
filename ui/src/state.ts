@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { ApiError, terminal, uuid } from "./api";
 import type { Api, Job, Page } from "./api";
 
@@ -55,16 +55,8 @@ export function usePage<T>(load: (signal: AbortSignal, after?: string) => Promis
   const [cursors, setCursors] = useState<(string | undefined)[]>([undefined]);
   const [revision, refresh] = useState(0);
   const after = cursors.at(-1);
-  const [resource, setResource] = useState<Resource<Page<T>>>({ loading: true });
-  useEffect(() => {
-    const controller = new AbortController();
-    setResource({ loading: true });
-    void load(controller.signal, after).then(
-      value => { if (!controller.signal.aborted) setResource({ value, loading: false }); },
-      error => { if (!controller.signal.aborted) setResource({ error: publicError(error), loading: false }); },
-    );
-    return () => controller.abort();
-  }, [load, after, revision]);
+  const loadPage = useCallback((signal: AbortSignal) => load(signal, after), [load, after]);
+  const resource = useResource(loadPage, revision);
   return {
     ...resource, number: cursors.length, canBack: cursors.length > 1,
     previous: () => setCursors(list => list.length > 1 ? list.slice(0, -1) : list),

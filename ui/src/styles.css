@@ -43,8 +43,8 @@ button.secondary:hover:not(:disabled) { background: #edf3ee; }
 button.danger { background: #9b3527; }
 button.danger:hover:not(:disabled) { background: #78291e; }
 code, .code-link { font-family: ui-monospace, monospace; overflow-wrap: anywhere; font-size: .88em; }
-.skip { position: fixed; top: .5rem; left: .5rem; z-index: 1; background: white; padding: .5rem .75rem; transform: translateY(-170%); }
-.skip:focus { transform: none; }
+.skip { position: fixed; top: .5rem; left: .5rem; z-index: 1; background: white; padding: .5rem .75rem; opacity: 0; pointer-events: none; }
+.skip:focus { opacity: 1; pointer-events: auto; }
 .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
 
 .top { background: var(--forest); color: white; }
@@ -153,7 +153,7 @@ form .metadata, .field-error { margin-top: -.25rem; }
 .backup-panel .message { margin-bottom: .75rem; }
 
 @media (max-width: 760px) {
-  .profile-layout { grid-template-columns: 1fr; }
+  .profile-layout { grid-template-columns: minmax(0, 1fr); }
 }
 @media (max-width: 600px) {
   .header-inner, .nav, .shell { width: calc(100% - 2rem); }
@@ -166,4 +166,7 @@ form .metadata, .field-error { margin-top: -.25rem; }
   .field-grid { grid-template-columns: 1fr; }
   .facts > div { grid-template-columns: 1fr; }
   .nav { flex-wrap: wrap; gap: 0 .85rem; }
+  .header-inner { gap: .5rem; }
+  .top .identity { font-size: 1.15rem; }
+  .sign-out { white-space: nowrap; padding-inline: .5rem; }
 }

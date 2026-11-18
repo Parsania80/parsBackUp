@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type { FormEvent } from "react";
 import type { Api, Controls, Intent, RestoreDraft, Session } from "./api";
 import { targetName } from "./api";
@@ -22,8 +22,12 @@ export function PlanRestore({ artifactId, api, controls }:
   const [older, setOlder] = useState(false);
   const [synthetic, setSynthetic] = useState(false);
   const [error, setError] = useState(false);
+  const targetField = useRef<HTMLInputElement>(null);
   const signed = !!resource.value?.format.match(/^signed-artifact-v[12]$/);
   const allowed = signed && controls.can("restore_plan");
+  useEffect(() => {
+    if (error) targetField.current?.focus();
+  }, [error]);
 
   function plan(event: FormEvent) {
     event.preventDefault();
@@ -44,7 +48,7 @@ export function PlanRestore({ artifactId, api, controls }:
       <Facts rows={[["Artifact", <code>{artifactId}</code>], ["Format", resource.value.format]]} />
       <form onSubmit={plan} noValidate>
         <label htmlFor="target">Target database</label>
-        <input id="target" value={target} autoComplete="off" spellCheck={false} maxLength={63}
+        <input id="target" ref={targetField} value={target} autoComplete="off" spellCheck={false} maxLength={63}
           placeholder="backupctl_fixture_" aria-describedby="target-help" aria-invalid={error}
           onChange={e => { setTarget(e.target.value); setError(false); }} />
         <p id="target-help" className={error ? "field-error" : "metadata"}>

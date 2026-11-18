@@ -72,6 +72,7 @@ for file in sorted(Path('ci').glob('*.py')) + [
     Path('tests/p03_http_drill.py'),
     Path('tests/p04_api_acceptance.py'),
     Path('tests/u02_console_drill.py'),
+    Path('tests/u04_browser_acceptance.py'),
 ]:
     code = file.read_text()
     compile(code, str(file), 'exec')
