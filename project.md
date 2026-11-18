@@ -389,11 +389,11 @@ A new model should be able to resume from status plus contracts without trusting
 | 11 | H — M6 hardened CLI/systemd/Debian | ✅ Fixture scope | H01–H05 fixture foundations accepted (§41–§50); H05 committed 046c22e. Production compatibility remains a V gate. |
 | 12 | V — production validation/release | ✅ W1/W2 bounded handoff | W1 in §56 and W2 in §57 accepted. Remaining V01, V02/V03 join integrated validation after UI; production stays disabled. |
 | 13 | P — M7 API/asynchronous service | ✅ Fixture scope | P04 accepted in §61 and committed as 86e96c5. |
-| 14 | U — M8 API-backed UI | ✅ Fixture scope | U03 is committed as 205586d. U04 verified browser and accessibility acceptance in Chrome (§65). |
-| 15 | F — platform validation/release | ⬜ Todo | After API/UI: integrate remaining V01, V02/V03 and F01–F03; one shared release evidence set. |
+| 14 | U — M8 API-backed UI | ✅ Fixture scope | U04 Chrome browser and accessibility acceptance (§65) is committed as 6723381. |
+| 15 | F — platform validation/release | 🔄 Current | F01 fixture validation passed (§66), including Debian web upgrade and release-build artifact compatibility. F02/V02, production V01 and F03/V03 remain open. |
 
-### ➡️ Current: #14 - U04 — verified fixture console checkpoint
-### ⏭️ Next: #15 - F01/V01 integrated compatibility and release validation
+### ➡️ Current: #15 - F01 fixture checkpoint verified
+### ⏭️ Next: #15 - F02/V02 measured recovery and worker concurrency
 
 Task IDs below remain stable even if a phase is split into several commits. The operator-approved §55 sequence governs remaining work: V01-W1/W2 → P → U → integrated V/F. V01-W1/W2 are bounded sub-gates of the existing V01 task. Full CLI release no longer blocks API development. Independent documentation can proceed alongside its owning task; dependent implementation waits for its stated prerequisites.
 
@@ -2567,3 +2567,106 @@ integrated release validation.
 The Rust runtime, Cargo.lock and OpenAPI bytes remain the verified P04
 baseline. The console runtime npm audit reported zero vulnerabilities. The
 existing build-time picomatch advisory stays in the V03 dependency review.
+
+## 66. F01/V01 integrated release validation — 2026-11-18
+
+**In progress.** The first integrated validation started from U04 commit
+`6723381be819d1e929ae160a474b898348b2720c`. All 220 source input hashes matched
+at the end of the baseline runs. The fixture CLI, API and console share the
+same artifact and recovery path. Production remains disabled.
+
+| Check | Evidence from this increment |
+|---|---|
+| Locked source and contracts | 324 workspace tests passed and one pre-existing test remained ignored. Formatting, strict Clippy, workflow lint and report/reference checks passed. The console built after a clean locked install with Node 22.23.2/npm 10.9.8 and its generated types matched OpenAPI. |
+| V01 PostgreSQL content and privileges | Matching server and client versions 16.15, 17.11 and 18.6 passed full and selective signed recovery, privilege/RLS no-publication controls, signed family scope, public-schema and occupied-target refusals, the tested optional content and reader-only recovery with the source unavailable. W1 writable offline verification and retention controls passed on all three. |
+| HTTP API and browser | [P04](tests/p04_api_acceptance.py) passed 22 live route/method/status combinations, CLI/API inspection and verification agreement, confirmation/expiry/replay checks, partial effects and interrupted job receipts. [U04](tests/u04_browser_acceptance.py) passed the Chrome 157 keyboard backup and restore, expiry/unavailable cases and 13 axe scans with zero automated violations. Both used real user systemd and PostgreSQL 17. |
+| Fixture CLI package | The initial archive accidentally shipped `backup-api.service` without its executable because the packaging script copied every unit. The corrected package ships only the CLI backup service and timer. The [package drill](tests/h03_package_drill.sh) checks the installed unit list and verifies identical package bytes on Ubuntu 24.04/PG16 and Debian 13/PG17. Both passed lifecycle/custody, v7 inventory migration, reader-only lost-source restore and containment. All 222 package-run inputs were unchanged; the package manager retains its existing diversion/staging warnings. |
+| Same artifact through all three interfaces | [F01](tests/f01_release_acceptance.py) checks the corrected package hash, extracts its CLI without host installation, creates a signed fixture, verifies that same artifact over the supervised HTTP API and restores it through the static console over loopback HTTPS. A mismatched target keeps confirmation disabled and sends no restore request. Independent SQL returned row 42 in the new PostgreSQL 17 database. |
+
+The corrected fixture package SHA256 is `811abb836609e62845d06788ba21a7834da5ca570ef543d77d4b91a639d703e0`. Its local archive
+and checksum are in `target/packages/`. Baseline and corrected run logs,
+input hashes and dependency audit reports are retained locally under
+`target/f01-v01/6723381/`. Repeating archive assembly verifies those package
+bytes using the same build. It does not establish independent Rust build
+reproducibility.
+
+| Remaining release gate | Disposition |
+|---|---|
+| F01 web delivery and upgrade | Closed for the Debian 13 fixture target. See [F01 web install and upgrade](#f01-web-install-and-upgrade) for the separate web package and preservation evidence. |
+| F01 compatibility and browser support | Closed for the tested fixture artifacts. [Release-build evidence](#f01-release-build-compatibility-and-browser-scope) records same-major v1 compatibility, old-reader v2 refusal, and the Chrome-only browser scope. |
+| V01 supported content and production path | Retain exclusions for security label providers, arbitrary extensions/locales and external services, database-level settings/ACLs, tablespaces and global parameter grants, host/WAL files, cross-major restore, and data-only fresh-target restore. Optional hstore/publication/FDW fixture results apply to the tested cases. The production writer and distinct production plan path still need implementation and validation under H01/W2. Keep production disabled until the separately reviewed V03 enablement. |
+| V03 dependency review | `cargo-audit` 0.22.2 at RustSec revision `472a4c9a785030434f15d7da84964d60fbe789ab` reported zero vulnerabilities and two maintenance warnings: `basic-toml` 0.1.10 and `proc-macro-error2` 2.0.1. The latter still emits a future Rust warning. The npm runtime audit reported zero findings. The full npm audit reported one underlying high build-time picomatch advisory and three dependent-package entries. No dependency changes or release exemptions. |
+
+F02/V02 measured recovery and concurrency and F03/V03 release and support
+policy remain separate. Hosted CI execution is unverified. T03 remains an
+explicit off-host replay limitation. No production or hosted release was
+performed.
+
+To rerun the cross-interface acceptance after the package and static console
+builds, use the existing P03/P04 fixture dependencies and a local Chromium:
+
+```bash
+RUSTUP_TOOLCHAIN=1.97.1 cargo build -p backupctl -p backup-api --locked --offline
+PARSBACKUP_BROWSER=/absolute/path/to/chrome python3 tests/f01_release_acceptance.py
+```
+
+### F01 web install and upgrade
+
+The chosen delivery path is an optional `backupctl-web` amd64 Debian package
+for Debian 13. It depends on the CLI package for the unprivileged service
+identity and on Nginx for HTTPS and static files. Its executable, systemd unit
+and console assets upgrade together. The packaged Nginx example stays outside
+the served directory, including on slim Debian installations that omit
+documentation. Site configuration, TLS files, API configuration and registry
+remain operator owned; package installation does not enable or start the API.
+
+[The upgrade drill](tests/f01_web_upgrade.py) ran on Debian 13.7, Nginx 1.26.3,
+PostgreSQL 17, real systemd and Chrome 157. It used the existing verified CLI
+package and two versions of the web package. Both used the same locked API
+binary built on Ubuntu 24.04 (glibc dependency 2.39); the console changed from
+U03 `205586d` to U04 `6723381`. This verified a delivery upgrade with
+existing control schema v2; it did not rehearse a new schema migration.
+
+| Gate | Verified observation |
+|---|---|
+| Clean install | Neither API service nor site was activated by package install. After fixture config and explicit startup, Nginx served installed assets over HTTPS and the systemd API admitted fixture jobs. It created and verified a signed archive and restored row 42. |
+| Upgrade preservation | With the API stopped, package replacement preserved bytes, owners and modes of the operator configuration, TLS files, control SQLite state, and backup store including inventory and keys. After restart, the pre-upgrade backup submission returned the original job for the same idempotency key. The completed restore job and consumed intent remained visible; a new submission with that intent was refused. The old browser session cookie was invalidated as designed. |
+| Upgrade recovery | The new index served the new asset hashes. Old assets returned 404. A fresh Chrome sign-in restored the pre-upgrade archive to a second database; independent SQL verified row 42 in both targets. |
+
+The corrected web packages are retained under `target/f01-web/packages/`
+with `SHA256SUMS`. The `0.1.0~fixture.1` hash is `0274d53bf74b30d30fb8de097c7df8a2b8bdef6f86df7d50de0cd41f90458775`;
+the `0.1.0~fixture.2` hash is `d1d8079ddde45a54cda5bb6031f631abc5c2ffe1944ef544d105d3901ff6b660`. Repeated assembly of
+`fixture.2` matched byte for byte using the same built inputs. Logs are
+retained under `target/f01-web/`. To repeat the upgrade drill, build
+[the Debian fixture image](tests/f01-web.Dockerfile) from the prepared H03
+Debian 13 image, then pass the CLI, older web and newer web packages from
+one directory to `python3 tests/f01_web_upgrade.py` with Chromium available.
+
+This closes the F01 web delivery gate for the tested fixture target only.
+See the [operator package notes](docs/operations/http-api.md#debian-fixture-web-package).
+The [release-build gate below](#f01-release-build-compatibility-and-browser-scope) records the compatibility and browser decisions. Production operations remain disabled.
+
+### F01 release build compatibility and browser scope
+
+The final fixture check used the **exact CLI binary extracted from the
+candidate package** (package SHA256 `811abb836609e62845d06788ba21a7834da5ca570ef543d77d4b91a639d703e0`)
+and the CLI extracted from the archived c13f593 cryptography checkpoint package
+(SHA256 `87b09cdafcaa3a9f7071b119c5538ee41cb82f65acbf6394212c9610d7d7f35e`).
+Package checksums were verified before extraction. The programs ran through
+the V01 harness's host loader in isolated PostgreSQL fixtures; package
+installation was verified separately. The [V01 harness](tests/v01_content_privileges.sh)
+accepts these two binary paths explicitly. The full native run passed with
+227 unchanged source inputs. Its input and binary hashes are recorded with
+the output under `target/f01-compat/`.
+
+| Gate | Disposition |
+|---|---|
+| Signed v1 on PG16.15, 17.11 and 18.6 | Same-major recovery in both directions. Each executable created an artifact the other could verify and restore. Manifest facts agreed, restored rows matched, and artifact bytes remained unchanged. |
+| Signed v2 on PG16.15, 17.11 and 18.6 | The candidate's family artifacts verified and restored with the candidate. The historical reader refused both signature verification and inspection without changing the artifact. Use the newer reader for v2. |
+| Google Chrome 157.0.8103.50 | Qualified for the first fixture console release. Passed the installed web upgrade restore and the full U04 backup, keyboard, recovery, failure and session scenarios, with zero automated violations across 13 scanned states. |
+| Playwright Firefox 159.0 | Outside initial support. The installed console restored the pre-upgrade backup after sign-in and exact-target confirmation, with row 42 independently verified. The full U04 run crashed in a content process (signal 11) just after the narrow Profiles accessibility scan, before reaching the backup profile control. The same failure occurred headless and headed on an isolated Xvfb display. This records the tested browser and harness, with no claim about all Firefox installations. Add support only after the complete workflow passes. |
+
+F01 is verified for the fixture delivery and support scope above. V01's
+production writer and production restore plan path remain open, and production
+stays disabled. Next shared V/F increment is F02/V02 measured recovery and
+worker concurrency.

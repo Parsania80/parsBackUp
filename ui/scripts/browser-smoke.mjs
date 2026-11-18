@@ -1,10 +1,10 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { chromium } from "playwright";
+import { launchTestBrowser } from "./test-browser.mjs";
 
 const { origin, token, viewer, backupToken, artifact, target, cancellable, screenshot, profileScreenshot } =
   JSON.parse(readFileSync(0, "utf8"));
-const browser = await chromium.launch({ executablePath: process.env.PARSBACKUP_BROWSER });
+const browser = await launchTestBrowser();
 let page;
 try {
   // The ephemeral loopback fixture uses a locally generated certificate.

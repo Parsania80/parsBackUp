@@ -59,7 +59,7 @@ for file in Path('config').glob('*.toml'):
     tomllib.loads(file.read_text())
 tomllib.loads(Path('deploy/writer.example.toml').read_text())
 blocks = 0
-for file in sorted(Path('tests').glob('*.sh')) + [Path('ci/run.sh'), Path('deploy/build-deb.sh')]:
+for file in sorted(Path('tests').glob('*.sh')) + sorted(Path('deploy').glob('build-*.sh')) + [Path('ci/run.sh')]:
     subprocess.run(['bash', '-n', str(file)], check=True)
     for index, code in enumerate(re.findall(r"<<'PY'[^\n]*\n(.*?)^PY$", file.read_text(), re.S | re.M)):
         compile(code, f'{file}:python-{index}', 'exec')
@@ -68,6 +68,8 @@ for file in Path('deploy/debian').iterdir():
     subprocess.run(['sh', '-n', str(file)], check=True)
 for file in sorted(Path('ci').glob('*.py')) + [
     Path('tests/h03/package_drill.py'),
+    Path('tests/f01_release_acceptance.py'),
+    Path('tests/f01_web_upgrade.py'),
     Path('tests/p02_worker_drill.py'),
     Path('tests/p03_http_drill.py'),
     Path('tests/p04_api_acceptance.py'),

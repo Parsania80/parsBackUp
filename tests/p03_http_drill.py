@@ -29,6 +29,9 @@ class Client:
         self.origin = f"http://127.0.0.1:{port}"
         self.check_response = None
 
+    def connect(self):
+        return HTTPConnection("127.0.0.1", self.port, timeout=8)
+
     def request(self, method, path, expected, *, actor=None, body=None, headers=None,
                 code=None, retry=False):
         fields = {}
@@ -41,7 +44,7 @@ class Client:
         fields.update(headers or {})
         statuses = (expected,) if isinstance(expected, int) else expected
         for _ in range(30):
-            conn = HTTPConnection("127.0.0.1", self.port, timeout=8)
+            conn = self.connect()
             try:
                 conn.request(method, API + path, body=body, headers=fields)
                 res = conn.getresponse()

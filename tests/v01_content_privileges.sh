@@ -3,14 +3,19 @@
 set -euo pipefail
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$repo_root"
-cargo build -p backupctl --locked --offline
+if [[ -z ${BACKUPCTL_COMPAT_CURRENT_BINARY:-} ]]; then
+    cargo build -p backupctl --locked --offline
+fi
 python3 - "$repo_root" <<'PY'
 import hashlib, json, os, pathlib, secrets, sqlite3, subprocess, sys, tempfile, time
 root = pathlib.Path(sys.argv[1]).resolve()
-binary = root/'target/debug/backupctl'
+binary = pathlib.Path(os.environ.get('BACKUPCTL_COMPAT_CURRENT_BINARY') or
+                      root/'target/debug/backupctl').resolve(strict=True)
 old_binary = os.environ.get('BACKUPCTL_COMPAT_OLD_BINARY')
 if old_binary:
     old_binary = pathlib.Path(old_binary).resolve(strict=True)
+    assert hashlib.sha256(binary.read_bytes()).digest() != hashlib.sha256(old_binary.read_bytes()).digest(), 'cross-build inputs must differ'
+    print('Cross-build current CLI SHA256 '+hashlib.sha256(binary.read_bytes()).hexdigest(),flush=True)
     print('Cross-build baseline CLI SHA256 '+hashlib.sha256(old_binary.read_bytes()).hexdigest(),flush=True)
 libdir = pathlib.Path('/lib/x86_64-linux-gnu').resolve()
 source = 'backupctl_fixture_m1'

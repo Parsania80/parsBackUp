@@ -45,7 +45,8 @@ Description: Synthetic PostgreSQL backup and recovery CLI
  Production operations remain disabled pending release acceptance.
 EOF
 install -m 755 "$binary" "$stage/root/usr/bin/backupctl"
-install -m 644 "$repo_root"/deploy/systemd/* "$stage/root/usr/lib/systemd/system/"
+install -m 644 "$repo_root/deploy/systemd/backupctl-backup@.service" \
+    "$repo_root/deploy/systemd/backupctl-backup@.timer" "$stage/root/usr/lib/systemd/system/"
 install -m 755 "$repo_root"/deploy/debian/* "$stage/root/DEBIAN/"
 install -m 644 "$repo_root/deploy/writer.example.toml" "$stage/root/usr/share/doc/backupctl/examples/"
 install -m 644 "$repo_root/docs/development/h03-systemd-package.md" "$stage/root/usr/share/doc/backupctl/"

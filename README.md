@@ -386,4 +386,15 @@ Choose a backup profile, confirm the data is synthetic, and open the resulting
 job receipt to find the new artifact. The U04 checkpoint records verification
 of the fixture backup and restore workflow in Chrome, including keyboard
 operation and narrow layouts.
-**Next is integrated release validation.**
+Integrated release validation has started. On a synthetic PostgreSQL 17
+fixture, the CLI from the Debian package created a backup, the API verified
+the same archive, and the console restored the expected row. Both CLI fixture
+package targets passed. The optional `backupctl-web` package passed a clean
+install and upgrade on Debian 13 with Nginx. It kept backup and job history,
+and the upgraded console restored a backup created before the upgrade.
+The packaged CLI and the older CLI can recover each other's signed v1 backups.
+The older CLI refuses signed v2. Use Google Chrome for the first fixture console
+release. Firefox passed a restore but did not pass full keyboard acceptance.
+Production operations remain disabled. See the
+[fixture web package](docs/operations/http-api.md#debian-fixture-web-package)
+and [F01/V01 evidence](project.md#f01-web-install-and-upgrade).

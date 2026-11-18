@@ -12,7 +12,8 @@ mutations with `503 CONTAINMENT_UNAVAILABLE`. The
 [systemd service](../../deploy/systemd/backup-api.service) runs
 `backup-api --supervise /etc/backupctl/api.toml` and admits jobs once it verifies
 containment. A system deployment requires a service-owned configuration and state
-directory. P03 validation used a transient service on a fixture host.
+directory. The optional `backupctl-web` Debian package delivers the API executable,
+unit, and static console together. The CLI package remains separate.
 
 An example API configuration is below. Point `reader_config` and `writer_config`
 at existing writable fixture configurations with `access = "reader"` and
@@ -54,6 +55,37 @@ public origin. The reverse proxy terminates TLS and preserves the public Host wh
 forwarding to the loopback backend. Forwarding headers do not confer identity or
 affect rate limits. Login limits use the proxy's direct peer address. The browser
 cookie uses `__Host-backupctl` and the Secure attribute in this mode.
+
+### Debian fixture web package
+
+The web delivery target is Debian 13 amd64 with Nginx. The
+[web package builder](../../deploy/build-web-deb.sh) assembles a supplied
+locked release `backup-api` executable and the console's locked `ui/dist`
+build. Build the binary against the designated target-compatible runtime,
+not a newer workstation libc. The package requires `backupctl`, Nginx
+and systemd. Installing the web package does not create an API config,
+install a TLS site, provision credentials or enable the API unit.
+
+Use the packaged `/usr/share/backupctl-web/examples/backupctl-web.conf`
+as the basis for a reviewed Nginx site. The example listens on loopback
+with TLS and proxies `/api/v1/` to the loopback API. Point the certificate
+paths at files you manage, set the exact HTTPS URL as `public_origin`,
+and set `development_http = false`. Use `/etc/backupctl/api.toml` for
+the unit and `/var/lib/backup-api/control.sqlite` for API state. Systemd
+creates the private control directory on service start. The CLI package
+owns the shared service identity and the backup state directory. Validate
+the Nginx config with `nginx -t` before activating it. Reload systemd and
+start the API explicitly after configuring the fixture profiles and
+operator registry.
+
+Upgrade during a maintenance window after API jobs finish. Stop the API
+before replacing the web package, then reload systemd and start the API
+again. Keep the operator-owned Nginx and API configuration, registry, TLS
+files, control database, and backup store. Refresh open console tabs and
+sign in again. API restart invalidates browser sessions. Completed jobs,
+idempotency receipts and consumed restore intents remain in the control
+database. Verify job admission and a recovery before ending maintenance.
+This package still permits fixture operations only.
 
 Use authenticated `GET /api/v1/health` to distinguish reads from job admission.
 Readiness checks the protected API configuration and its default profile binding.
@@ -128,15 +160,23 @@ receipt with the original profile and idempotency key.
 
 ### Browser and accessibility acceptance
 
+Google Chrome is the qualified browser for the first fixture console release.
+Chrome 157 passed the installed package restore and the full keyboard and
+accessibility drill. Playwright Firefox 159 restored a pre-upgrade archive, but
+its content process crashed during the Profiles keyboard test both headless
+and headed. Firefox is outside the initial support scope.
+
 Run the [U04 fixture acceptance](../../tests/u04_browser_acceptance.py) from
 the repository root after building the console. It uses the P04 verification
 dependencies, a supervised API, PostgreSQL 17 and Chromium. Set
 `PARSBACKUP_BROWSER` to a local Chrome binary or install Playwright's Chromium.
 
 ```bash
-python3 tests/u04_browser_acceptance.py
+PARSBACKUP_BROWSER=/absolute/path/to/google-chrome python3 tests/u04_browser_acceptance.py
 ```
 
+For Firefox investigation, use `PARSBACKUP_BROWSER_ENGINE=firefox` with the
+[Firefox build bundled by Playwright](https://playwright.dev/docs/browsers#firefox).
 The drill creates and restores a synthetic backup by keyboard, checks
 partial and interrupted job receipts and session expiry, and scans desktop
 and 320-pixel layouts with axe-core. It also verifies that a changed fixture

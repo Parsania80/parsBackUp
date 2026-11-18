@@ -108,6 +108,10 @@ def main():
             assert ex('cat', '/proc/1/cgroup').stdout.strip() in ('0::/', '0::/init.scope')
             print(tag, ex('systemctl', '--version').stdout.splitlines()[0], ex('ldd', '--version').stdout.splitlines()[0], flush=True)
             ex('dpkg', '-i', f'/work/packages/{package}')
+            units = {path for path in ex('dpkg-query', '-L', 'backupctl').stdout.splitlines()
+                     if path.startswith('/usr/lib/systemd/system/')}
+            assert units == {'/usr/lib/systemd/system/backupctl-backup@.service',
+                             '/usr/lib/systemd/system/backupctl-backup@.timer'}, units
             ex('systemd-analyze', 'verify', '/usr/lib/systemd/system/backupctl-backup@.service', '/usr/lib/systemd/system/backupctl-backup@.timer')
             unit = 'backupctl-backup@daily.service'
             timer = 'backupctl-backup@daily.timer'

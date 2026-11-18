@@ -2,10 +2,10 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import axe from "axe-core";
-import { chromium } from "playwright";
+import { launchTestBrowser } from "./test-browser.mjs";
 
 const fixture = JSON.parse(readFileSync(0, "utf8"));
-const browser = await chromium.launch({ executablePath: process.env.PARSBACKUP_BROWSER });
+const browser = await launchTestBrowser();
 let page;
 try {
   const context = await browser.newContext({ ignoreHTTPSErrors: true, viewport: { width: 1160, height: 800 } });
