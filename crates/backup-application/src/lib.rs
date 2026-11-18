@@ -919,6 +919,24 @@ pub struct VerifyService<E, S> {
     store: S,
 }
 
+/// The core attempted an inventory write while reporting verification.
+#[derive(Debug)]
+pub enum VerificationObservation {
+    FailureRecorded,
+    WriteFailed(String),
+}
+
+impl std::fmt::Display for VerificationObservation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::FailureRecorded => {
+                f.write_str("verification failed; failure observation recorded")
+            }
+            Self::WriteFailed(message) => f.write_str(message),
+        }
+    }
+}
+
 impl<E: DatabaseAdapter, S: ArtifactStore> VerifyService<E, S> {
     pub fn new(engine: E, store: S) -> Self {
         Self { engine, store }
@@ -950,7 +968,9 @@ impl<E: DatabaseAdapter, S: ArtifactStore> VerifyService<E, S> {
                     report.audit_recorded = self
                         .store
                         .record_verification(id, level, Some(&report))
-                        .context("verification succeeded but recording its observation failed")?;
+                        .context(VerificationObservation::WriteFailed(
+                            "verification succeeded but recording its observation failed".into(),
+                        ))?;
                 }
                 Ok(report)
             }
@@ -962,14 +982,14 @@ impl<E: DatabaseAdapter, S: ArtifactStore> VerifyService<E, S> {
                 }
                 match self.store.record_verification(id, level, None) {
                     Ok(true) => {
-                        Err(error.context("verification failed; failure observation recorded"))
+                        Err(error.context(VerificationObservation::FailureRecorded))
                     }
                     Ok(false) => {
                         Err(error.context("verification failed; no inventory observation recorded"))
                     }
-                    Err(record_error) => Err(error.context(format!(
+                    Err(record_error) => Err(error.context(VerificationObservation::WriteFailed(format!(
                         "verification failed; recording its failure also failed: {record_error:#}"
-                    ))),
+                    )))),
                 }
             }
         }

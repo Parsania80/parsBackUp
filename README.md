@@ -361,3 +361,12 @@ The P03 checkpoint review verified that health reports degraded readiness when
 the default profile configuration changes. The HTTP drill confirmed that the
 same change blocks new work and that restoring the configuration restores
 readiness. Git history records the local checkpoint.
+
+P04 fixture API acceptance passed. The drill checked restore and deletion
+confirmations, partial effects, revocation, queue limits and restart without
+replay. The [API guide](docs/operations/http-api.md) explains job recovery.
+See [P04 acceptance](project.md#61-p04-fixture-api-acceptance--2026-11-18) for
+the evidence. **Next is U01, the UI framework and client design.**
+
+The P04 checkpoint review matched the acceptance evidence to the source and
+test inputs. Git history records the local checkpoint for the API that U01 uses.

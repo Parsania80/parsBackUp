@@ -387,12 +387,12 @@ A new model should be able to resume from status plus contracts without trusting
 | 10 | B — M5b retention/protection/deletion | ✅ Done | B01–B06 accepted; eight PG16/17/18 matrices and destructive/race/crash gates pass (§40). |
 | 11 | H — M6 hardened CLI/systemd/Debian | ✅ Fixture scope | H01–H05 fixture foundations accepted (§41–§50); H05 committed 046c22e. Production compatibility remains a V gate. |
 | 12 | V — production validation/release | ✅ W1/W2 bounded handoff | W1 in §56 and W2 in §57 accepted. Remaining V01, V02/V03 join integrated validation after UI; production stays disabled. |
-| 13 | P — M7 API/asynchronous service | 🔄 P03 verified; P04 next | The P01/P02 checkpoint is a2920ff. P03 fixture HTTP routes and authentication are verified in §60. P04 API acceptance precedes UI. |
-| 14 | U — M8 API-backed UI | ⬜ Todo | Requires stable API. |
+| 13 | P — M7 API/asynchronous service | ✅ Fixture scope | P03 is committed as 251d782. P04 fixture acceptance passed in §61. |
+| 14 | U — M8 API-backed UI | 🔄 U01 next | Choose the UI framework and client approach for the verified OpenAPI contract. |
 | 15 | F — platform validation/release | ⬜ Todo | After API/UI: integrate remaining V01, V02/V03 and F01–F03; one shared release evidence set. |
 
-### ➡️ Current: #13 - P04 — API verification and cleanup (P03 HTTP verified)
-### ⏭️ Next: P04 API verification → U01–U04 UI → integrated V/F release validation
+### ➡️ Current: #14 - U01 — UI framework and client design (P04 API accepted)
+### ⏭️ Next: U01–U04 UI → integrated V/F release validation
 
 Task IDs below remain stable even if a phase is split into several commits. The operator-approved §55 sequence governs remaining work: V01-W1/W2 → P → U → integrated V/F. V01-W1/W2 are bounded sub-gates of the existing V01 task. Full CLI release no longer blocks API development. Independent documentation can proceed alongside its owning task; dependent implementation waits for its stated prerequisites.
 
@@ -528,7 +528,7 @@ Prerequisites: accepted H/core baseline and V01-W1/W2 (§55), followed by P01 de
 1. **P01 — design contract.** Defined in §58 and [the API contract](docs/development/p01-api-contract.md), with [OpenAPI](docs/api/openapi-v1.json). Runtime/auth/permissions, safe errors, receipts, token custody, TLS and actor/request/expiry-bound intent are specified; no handlers are implemented yet.
 2. **P02 — worker adapter.** Implemented and verified in §59. One isolated operation process invokes core services directly. Private SQLite owns the bounded queue, receipts and intents. The systemd unit owns containment after an uncertain worker exit.
 3. **P03 — routes and observability.** Implemented and verified in §60. The fixture listener exposes all 20 operations, including authenticated reads, job submission and cancellation, and strict input handling.
-4. **P04 — verification and cleanup.** Authz/replay/rate/queue/cancel/restart/redaction tests, API-to-core equivalence and full destructive confirmation scenes. Apply C1 readability rules to new code, publish versioned API guide and threat review.
+4. **P04 — verification and cleanup.** Accepted for fixtures in §61. Tests cover permissions, replay, rate and queue bounds, cancellation, restart, redaction, API-to-core equivalence and destructive confirmations.
 
 Acceptance: retries do not duplicate operations, no unauthenticated destructive access, cancellation accurately reports partial restore/deletion, and API behavior is the same core policy as CLI.
 
@@ -2426,3 +2426,41 @@ confirmed degraded readiness and request refusal after drift, followed by
 recovery after restoring the original binding. The fresh 324-test fast gate,
 strict Clippy and OpenAPI checks passed. The dependency lock and retained P02
 containment evidence still apply.
+
+## 61. P04 fixture API acceptance — 2026-11-18
+
+The [P04 acceptance drill](tests/p04_api_acceptance.py) ran against the real
+loopback listener, PostgreSQL 17 and a transient systemd service. It compares
+API inspection and archive verification to CLI/core results and checks the
+restored fixture row. It validates 22 distinct live route, method and
+status combinations against the OpenAPI response schemas. Foreign actor,
+incorrect target/digest and expired confirmations are refused before effects.
+Terminal retries return the original receipt, and a new key cannot reuse a
+consumed intent.
+
+The drill covers native failure and cancellation after target creation, and a
+deletion audit fault after unlink. PostgreSQL and inventory state match the
+partial receipts. A failed verification now reports its inventory observation
+through typed core context, with the existing CLI error text. The wire error
+contains no native detail. P04 also verifies queue saturation, queued cancellation,
+credential and cookie revocation, and a supervisor crash with running and
+queued work. Restart invalidates the session and preserves interrupted jobs,
+the original replay receipt and the consumed restore intent.
+
+C1 review keeps request parsing and authentication in HTTP, admission and
+receipts in control, and process ownership in the supervisor. The worker
+dispatch uses named backup and verification methods to keep each core call
+and its effect mapping together. The [API v1 guide](docs/operations/http-api.md)
+and [threat review](docs/security/api-v1-review.md) record the operating contract
+and remaining deployment assumptions. The OpenAPI file and dependency lock
+match P03.
+
+The fast gate passed 324 workspace tests, formatting, strict Clippy, CLI
+examples, reference checks and workflow lint. The P02 supervisor and P03 HTTP
+drills passed again. Official OpenAPI validation passed 53 positive and 14
+negative examples. Local evidence is in `target/ci-logs/fast{,-inputs.json}`
+and `/tmp/parsbackup-p04-{acceptance,p02,p03}.log`. This is fixture acceptance
+on PostgreSQL 17. Package and TLS proxy installation remain in integrated
+release validation. Checkpoint review found no blocking issues and matched
+the retained fast and fixture drill evidence to the reviewed inputs. U01 uses
+the locally committed API contract.

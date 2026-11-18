@@ -15,6 +15,9 @@ ROOT = Path(__file__).resolve().parents[1]
 IMAGE = "docker.arvancloud.ir/library/postgres:17-bookworm"
 SOURCE = "backupctl_fixture_p02"
 TARGET = "backupctl_fixture_p02_restore"
+PARTIAL_TARGET = "backupctl_fixture_p04_partial"
+CANCEL_TARGET = "backupctl_fixture_p04_cancel"
+CRASH_TARGET = "backupctl_fixture_p04_crash"
 
 
 # Protected native adapters require ELF tools and clear the environment.
@@ -34,13 +37,28 @@ int main(int argc, char **argv) {
         fclose(file);
     }
     int version = argc == 2 && !strcmp(argv[1], "--version");
-    if (!version && !strcmp(mode, "cancel")) {
+    if (!strcmp(TOOL, "pg_restore")) {
+        for (int i = 1; i < argc; ++i) {
+            if (strncmp(argv[i], "--dbname=", 9)) continue;
+            if (!strcmp(mode, "restore-fail")) {
+                fputs("P04_NATIVE_PRIVATE_DIAGNOSTIC\n", stderr);
+                return 13;
+            }
+            if (!strcmp(mode, "restore-cancel")) {
+                int started = open(BASE "/native-started", O_WRONLY | O_CREAT, 0600);
+                if (started < 0) return 14;
+                close(started);
+                sleep(60);
+            }
+        }
+    }
+    if (!strcmp(TOOL, "pg_dump") && !version && !strcmp(mode, "cancel")) {
         int started = open(BASE "/native-started", O_WRONLY | O_CREAT, 0600);
         if (started < 0) return 5;
         close(started);
         sleep(60);
     }
-    if (!version && !strcmp(mode, "orphan")) {
+    if (!strcmp(TOOL, "pg_dump") && !version && !strcmp(mode, "orphan")) {
         int ready[2];
         if (pipe(ready)) return 6;
         pid_t pid = fork();
@@ -61,7 +79,7 @@ int main(int argc, char **argv) {
         if (read(ready[0], &byte, 1) != 1) return 11;
         close(ready[0]);
     }
-    argv[0] = TOOL_ROOT "/pg_dump.real";
+    argv[0] = TOOL_ROOT "/" TOOL ".real";
     execv(argv[0], argv);
     return 12;
 }
@@ -100,21 +118,23 @@ def setup(base, container, installed_tools):
         "-v", "ON_ERROR_STOP=1", content="CREATE TABLE sample (n int); INSERT INTO sample VALUES (42);")
     private(base / "passfile", "".join(
         f"127.0.0.1:{port}:{database}:postgres:{password}\n"
-        for database in [SOURCE, TARGET, "postgres"]))
+        for database in [SOURCE, TARGET, PARTIAL_TARGET, CANCEL_TARGET, CRASH_TARGET, "postgres"]))
     tools = base / "tools"
     tools.mkdir(mode=0o755)
     for tool in ["psql", "pg_dump", "pg_dumpall", "pg_restore", "createdb"]:
         run("docker", "cp", f"{container}:/usr/lib/postgresql/17/bin/{tool}", str(tools / tool))
         run(str(tools / tool), "--version")
-    dump = tools / "pg_dump"
-    dump.rename(tools / "pg_dump.real")
     # Both readiness markers are written by the actual native invocation. The
     # orphan closes the inherited pipes so the worker can finish before checking.
     wrapper = base / "native-fixture.c"
-    wrapper.write_text(f"#define BASE {json.dumps(str(base))}\n"
-                       f"#define TOOL_ROOT {json.dumps(str(installed_tools))}\n" + NATIVE_FIXTURE)
-    run("cc", "-Wall", "-Wextra", "-Werror", "-O2", str(wrapper), "-o", str(dump))
-    dump.chmod(0o755)
+    for tool in ["pg_dump", "pg_restore"]:
+        binary = tools / tool
+        binary.rename(tools / f"{tool}.real")
+        wrapper.write_text(f"#define BASE {json.dumps(str(base))}\n"
+                           f"#define TOOL_ROOT {json.dumps(str(installed_tools))}\n"
+                           f"#define TOOL {json.dumps(tool)}\n" + NATIVE_FIXTURE)
+        run("cc", "-Wall", "-Wextra", "-Werror", "-O2", str(wrapper), "-o", str(binary))
+        binary.chmod(0o755)
     # The protected core requires root-owned native tools and ancestors.
     tool_host("install", installed_tools, tools)
     for name in ["keys", "state"]:
@@ -170,7 +190,8 @@ operations = ["backup", "inspection", "verification", "restore_plan", "restore",
 """)
 
 
-TOOL_NAMES = ("psql", "pg_dump", "pg_dumpall", "pg_restore", "createdb", "pg_dump.real")
+TOOL_NAMES = ("psql", "pg_dump", "pg_dumpall", "pg_restore", "createdb", "pg_dump.real",
+              "pg_restore.real")
 
 
 def tool_host(action, destination, source=None):

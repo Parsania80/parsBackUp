@@ -70,3 +70,26 @@ running user systemd manager and a C compiler. Build the two binaries with
 `cargo build --locked --offline -p backup-api -p backupctl`, then run
 `python3 tests/p03_http_drill.py`. The drill starts its own loopback listeners and
 disposable PostgreSQL 17 fixture.
+
+### API v1 acceptance and recovery
+
+Follow `Location` until the job reaches a terminal state. Keep the original
+`Idempotency-Key` and request body when retrying a submission after a timeout
+or restart. A new key is a new attempt. Restore and retention intents are
+consumed at job admission. An interrupted job's consumed intent cannot be
+submitted again with a new key.
+
+Use the terminal state, `effects` and `core_job_id` together when reviewing a job.
+A partial restore can leave a target that needs operator inspection. A partial
+retention receipt separates completed, deleting and pending candidates. The core
+recovery command handles started deletion work. Pending candidates need a new
+preview and confirmation. An interrupted job with unknown effects needs
+inspection before a new attempt. A failed verification can record a failure
+observation in inventory, which is reported in its effects.
+
+The [acceptance drill](../../tests/p04_api_acceptance.py) uses the built binaries,
+the P03 fixture requirements and Python's `jsonschema` in the verification
+environment. Run `python3 tests/p04_api_acceptance.py` to check live responses
+against OpenAPI, compare API and core results, and exercise revocation, expiry,
+queue, cancellation, partial effects and restart. See the
+[API v1 threat review](../security/api-v1-review.md) for scope and limitations.

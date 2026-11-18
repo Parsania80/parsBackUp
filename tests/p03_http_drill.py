@@ -27,6 +27,7 @@ class Client:
     def __init__(self, port):
         self.port = port
         self.origin = f"http://127.0.0.1:{port}"
+        self.check_response = None
 
     def request(self, method, path, expected, *, actor=None, body=None, headers=None,
                 code=None, retry=False):
@@ -60,6 +61,8 @@ class Client:
                 assert "data" not in response
             else:
                 assert "error" not in response
+            if self.check_response:
+                self.check_response(method, API + path, status, response)
             return response.get("data"), response_headers
         raise AssertionError("actor rate limit never cleared")
 
@@ -82,10 +85,11 @@ class Client:
         return job
 
 
-def credentials(base):
+def credentials(base, roles=("admin", "viewer", "backup")):
     registry = {"format": "api-credentials-v1", "credentials": []}
     actors = {}
-    for role in ["admin", "viewer", "backup"]:
+    for name in roles:
+        role = name.split("-", 1)[0]
         secret = secrets.token_bytes(32)
         actor = str(uuid.uuid4())
         token = base64.urlsafe_b64encode(secret).decode().rstrip("=")
@@ -93,7 +97,7 @@ def credentials(base):
             "actor_id": actor, "credential_id": str(uuid.uuid4()), "revision": 1,
             "active": True, "roles": [role], "token_sha256": hashlib.sha256(secret).hexdigest(),
         })
-        actors[role] = (token, actor)
+        actors[name] = (token, actor)
     private(base / "registry.json", json.dumps(registry))
     return actors
 
@@ -315,12 +319,23 @@ def supervised_drill(client, admin, viewer, backup, base):
     print("Supervised HTTP job submission, permissions, paging, restore, retention and CSRF cancellation passed")
 
 
-def main():
+def start_supervised(unit, config):
+    settings = {"Type", "UMask", "TimeoutStopSec", "KillMode", "KillSignal", "FinalKillSignal",
+                "SendSIGKILL", "Delegate", "Restart", "NoNewPrivileges", "TasksMax", "MemoryMax"}
+    properties = [f"--property={line}" for line in (ROOT / "deploy/systemd/backup-api.service")
+                  .read_text().splitlines() if line.partition("=")[0] in settings]
+    assert len(settings) == len(properties)
+    run("systemd-run", "--user", "--collect", f"--unit={unit}", *properties,
+        str(BINARY), "--supervise", str(config))
+
+
+@contextmanager
+def http_fixture(prefix, roles=("admin", "viewer", "backup")):
     unit = f"parsbackup-p02-{os.getpid()}.service"
     container = unit.removesuffix(".service")
     tools = Path("/opt") / f"{container}-{uuid.uuid4().hex}"
     assert not tools.exists()
-    with tempfile.TemporaryDirectory(prefix=".parsbackup-p03-", dir=Path.home()) as directory:
+    with tempfile.TemporaryDirectory(prefix=prefix, dir=Path.home()) as directory:
         base = Path(directory)
         try:
             setup(base, container, tools)
@@ -330,37 +345,36 @@ def main():
             client = Client(port)
             config = base / "api.toml"
             private(config, config.read_text().replace("127.0.0.1:8090", f"127.0.0.1:{port}"))
-            actors = credentials(base)
-            admin, viewer, backup = (actors[role][0] for role in ["admin", "viewer", "backup"])
-            read_only_drill(base, client, admin, viewer)
-            proxy_cookie_drill(base, client, viewer)
-            settings = {"Type", "UMask", "TimeoutStopSec", "KillMode", "KillSignal", "FinalKillSignal",
-                        "SendSIGKILL", "Delegate", "Restart", "NoNewPrivileges", "TasksMax", "MemoryMax"}
-            properties = [f"--property={line}" for line in (ROOT / "deploy/systemd/backup-api.service")
-                          .read_text().splitlines() if line.partition("=")[0] in settings]
-            assert len(settings) == len(properties)
-            run("systemd-run", "--user", "--collect", f"--unit={unit}", *properties,
-                str(BINARY), "--supervise", str(config))
-            listening(client, admin)
-            supervised_drill(client, admin, viewer, backup, base)
-            result = run("docker", "exec", container, "psql", "-U", "postgres", "-d", TARGET,
-                         "-Atc", "SELECT n FROM sample")
-            assert result.stdout.strip() == "42"
-            run("systemctl", "--user", "stop", unit)
-            # Recreate the v1 layout around real P02-compatible job and intent rows.
-            with sqlite3.connect(base / "state/control.sqlite") as db:
-                db.executescript("DROP TABLE sessions; DROP INDEX jobs_actor_page; PRAGMA user_version=1;")
-            with local_process(base):
-                listening(client, admin)
-                metrics, _ = client.request("GET", "/metrics", 200, actor=admin)
-                assert metrics["accepted_total"] == 11 and metrics["cancelled_total"] == 1
-                with sqlite3.connect(base / "state/control.sqlite") as db:
-                    assert db.execute("PRAGMA user_version").fetchone() == (2,)
-            print("Control schema migration preserved existing jobs")
+            actors = credentials(base, roles)
+            yield base, client, unit, container, actors
         finally:
             run("systemctl", "--user", "stop", unit, check=False)
             run("docker", "rm", "-f", "-v", container, check=False)
             tool_host("cleanup", tools)
+
+
+def main():
+    with http_fixture(".parsbackup-p03-") as (base, client, unit, container, actors):
+        admin, viewer, backup = (actors[role][0] for role in ["admin", "viewer", "backup"])
+        read_only_drill(base, client, admin, viewer)
+        proxy_cookie_drill(base, client, viewer)
+        start_supervised(unit, base / "api.toml")
+        listening(client, admin)
+        supervised_drill(client, admin, viewer, backup, base)
+        result = run("docker", "exec", container, "psql", "-U", "postgres", "-d", TARGET,
+                     "-Atc", "SELECT n FROM sample")
+        assert result.stdout.strip() == "42"
+        run("systemctl", "--user", "stop", unit)
+        # Recreate the v1 layout around real P02-compatible job and intent rows.
+        with sqlite3.connect(base / "state/control.sqlite") as db:
+            db.executescript("DROP TABLE sessions; DROP INDEX jobs_actor_page; PRAGMA user_version=1;")
+        with local_process(base):
+            listening(client, admin)
+            metrics, _ = client.request("GET", "/metrics", 200, actor=admin)
+            assert metrics["accepted_total"] == 11 and metrics["cancelled_total"] == 1
+            with sqlite3.connect(base / "state/control.sqlite") as db:
+                assert db.execute("PRAGMA user_version").fetchone() == (2,)
+        print("Control schema migration preserved existing jobs")
 
 
 if __name__ == "__main__":

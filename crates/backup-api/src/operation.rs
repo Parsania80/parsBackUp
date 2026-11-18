@@ -8,7 +8,7 @@ use crate::{
 use anyhow::{Context, Result, ensure};
 use backup_application::{
     ArtifactStore, BackupService, InventoryService, Record, RestoreService, SignedArtifactHandle,
-    VerifyService,
+    VerificationObservation, VerifyService,
     control::{self as core_control, ExecutionFailure},
     execute_deletion, preview_retention,
 };
@@ -201,50 +201,7 @@ impl Execution {
         let config = &self.selected.config;
         let completed = |result| Ok(Outcome::success(result, None, Effects::None));
         match &self.work.request {
-            Request::Backup { .. } => {
-                let source = service_config(config, true, true)?;
-                let engine = PostgresAdapter::configured(config)?;
-                let store = open_protected_store(config, KeyUse::Writer)?;
-                let recovery = match store.recover() {
-                    Ok(recovery) => recovery,
-                    // Recovery can have already finalized a deletion or
-                    // changed inventory before the error ended the pass.
-                    Err(_) => {
-                        return Ok(Outcome::error(
-                            State::Interrupted,
-                            ErrorCode::OperationInterrupted,
-                            Effects::Unknown,
-                        ));
-                    }
-                };
-                let (created, job_id) = match BackupService::new(engine, store)
-                    .create_with_job(&source, self.selected.core_profile.as_deref())
-                {
-                    Ok(result) => result,
-                    Err(error) => {
-                        let mut outcome = failure(&error);
-                        if matches!(outcome.effects, Effects::None | Effects::PreparationOnly) {
-                            if !recovery.deleted.is_empty() {
-                                outcome.effects = Effects::ArtifactsMayBeDeleted;
-                                outcome.state = State::Partial;
-                            } else if !recovery.interrupted.is_empty() {
-                                outcome.effects = Effects::InventoryMayBeModified;
-                                outcome.state = State::Partial;
-                            } else if !recovery.removed.is_empty() {
-                                outcome.effects = Effects::PreparationOnly;
-                            }
-                        }
-                        return Ok(outcome);
-                    }
-                };
-                Ok(Outcome::success(
-                    JobResult::Backup {
-                        artifact_id: created.id(),
-                    },
-                    job_id,
-                    Effects::ArtifactMayBePublished,
-                ))
-            }
+            Request::Backup { .. } => self.backup(),
             Request::Inspection { artifact_id } => {
                 let store = open_protected_store(config, KeyUse::Reader)?;
                 let Record::Signed(manifest) =
@@ -261,47 +218,7 @@ impl Execution {
                     created_unix_ms: timestamp(&manifest.started_at_utc)?,
                 })
             }
-            Request::Verification { artifact_id, level } => {
-                let usage = if *level == VerifyLevel::Signature {
-                    KeyUse::Signature
-                } else {
-                    KeyUse::Reader
-                };
-                let store = open_protected_store(config, usage)?;
-                let engine = if *level == VerifyLevel::Archive {
-                    let major = store
-                        .open_signed(*artifact_id)?
-                        .manifest()
-                        .source_server_major;
-                    let tools = config.tools.as_ref().context(ErrorCode::PolicyRefused)?;
-                    PostgresAdapter::offline_for_major(
-                        &tools.client_bin_dir,
-                        major,
-                        Duration::from_secs(config.timeout_seconds),
-                    )?
-                } else {
-                    PostgresAdapter
-                };
-                let result = VerifyService::new(engine, store).verify(
-                    &service_config(config, false, false)?,
-                    *artifact_id,
-                    level.as_str(),
-                )?;
-                Ok(Outcome::success(
-                    JobResult::Verification {
-                        artifact_id: *artifact_id,
-                        level: *level,
-                        passed: true,
-                        inventory_recorded: result.audit_recorded,
-                    },
-                    None,
-                    if result.audit_recorded {
-                        Effects::InventoryMayBeModified
-                    } else {
-                        Effects::None
-                    },
-                ))
-            }
+            Request::Verification { artifact_id, level } => self.verify(*artifact_id, *level),
             Request::RestorePlan {
                 artifact_id,
                 target_database,
@@ -395,6 +312,95 @@ impl Execution {
                 ))
             }
         }
+    }
+
+    fn backup(&self) -> Result<Outcome> {
+        let config = &self.selected.config;
+        let source = service_config(config, true, true)?;
+        let engine = PostgresAdapter::configured(config)?;
+        let store = open_protected_store(config, KeyUse::Writer)?;
+        let recovery = match store.recover() {
+            Ok(recovery) => recovery,
+            // Recovery can have already finalized a deletion or
+            // changed inventory before the error ended the pass.
+            Err(_) => {
+                return Ok(Outcome::error(
+                    State::Interrupted,
+                    ErrorCode::OperationInterrupted,
+                    Effects::Unknown,
+                ));
+            }
+        };
+        let (created, job_id) = match BackupService::new(engine, store)
+            .create_with_job(&source, self.selected.core_profile.as_deref())
+        {
+            Ok(result) => result,
+            Err(error) => {
+                let mut outcome = failure(&error);
+                if matches!(outcome.effects, Effects::None | Effects::PreparationOnly) {
+                    if !recovery.deleted.is_empty() {
+                        outcome.effects = Effects::ArtifactsMayBeDeleted;
+                        outcome.state = State::Partial;
+                    } else if !recovery.interrupted.is_empty() {
+                        outcome.effects = Effects::InventoryMayBeModified;
+                        outcome.state = State::Partial;
+                    } else if !recovery.removed.is_empty() {
+                        outcome.effects = Effects::PreparationOnly;
+                    }
+                }
+                return Ok(outcome);
+            }
+        };
+        Ok(Outcome::success(
+            JobResult::Backup {
+                artifact_id: created.id(),
+            },
+            job_id,
+            Effects::ArtifactMayBePublished,
+        ))
+    }
+
+    fn verify(&self, artifact_id: Uuid, level: VerifyLevel) -> Result<Outcome> {
+        let config = &self.selected.config;
+        let usage = if level == VerifyLevel::Signature {
+            KeyUse::Signature
+        } else {
+            KeyUse::Reader
+        };
+        let store = open_protected_store(config, usage)?;
+        let engine = if level == VerifyLevel::Archive {
+            let major = store
+                .open_signed(artifact_id)?
+                .manifest()
+                .source_server_major;
+            let tools = config.tools.as_ref().context(ErrorCode::PolicyRefused)?;
+            PostgresAdapter::offline_for_major(
+                &tools.client_bin_dir,
+                major,
+                Duration::from_secs(config.timeout_seconds),
+            )?
+        } else {
+            PostgresAdapter
+        };
+        let result = VerifyService::new(engine, store).verify(
+            &service_config(config, false, false)?,
+            artifact_id,
+            level.as_str(),
+        )?;
+        Ok(Outcome::success(
+            JobResult::Verification {
+                artifact_id,
+                level,
+                passed: true,
+                inventory_recorded: result.audit_recorded,
+            },
+            None,
+            if result.audit_recorded {
+                Effects::InventoryMayBeModified
+            } else {
+                Effects::None
+            },
+        ))
     }
 
     fn preview(&self, selection: &RetentionSelection) -> Result<Outcome> {
@@ -532,7 +538,9 @@ pub(crate) fn run(config: &Config, id: Uuid) -> Outcome {
 
 fn failure(error: &anyhow::Error) -> Outcome {
     let receipt = error.downcast_ref::<ExecutionFailure>();
+    let observation = error.downcast_ref::<VerificationObservation>();
     let effects = match receipt.map(|e| e.effects) {
+        None if observation.is_some() => Effects::InventoryMayBeModified,
         None => Effects::None,
         Some("preparation_only") => Effects::PreparationOnly,
         Some("artifact_may_be_published") => Effects::ArtifactMayBePublished,
@@ -546,6 +554,12 @@ fn failure(error: &anyhow::Error) -> Outcome {
     let state = match effects {
         Effects::Unknown => State::Interrupted,
         Effects::ArtifactMayBePublished | Effects::DatabaseMayBeModified => State::Partial,
+        Effects::InventoryMayBeModified
+            if cancelled
+                || matches!(observation, Some(VerificationObservation::WriteFailed(_))) =>
+        {
+            State::Partial
+        }
         _ if cancelled => State::Cancelled,
         _ => State::Failed,
     };
